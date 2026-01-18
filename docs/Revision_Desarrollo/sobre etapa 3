@@ -1,0 +1,26 @@
+diagnóstico técnico-metodológico basado en los 4 fragmentos que me mostraste:
+1. El Problema Crítico: "Datos Sucios" (Ruido en la Ingesta)
+Mira el Fragmento 3 (Score 0.655):
+"Transcripción: Entrevista DOM1a parte... Speakers detectados: 1 Duración: 20m 0s..."
+Diagnóstico: Tu chunker está "mordiendo" los metadatos y encabezados del archivo y tratándolos como si fueran parte del discurso del entrevistado.
+Impacto Metodológico: Cuando hagas búsquedas semánticas o codificación automática, el sistema encontrará relaciones falsas basadas en palabras técnicas como "Modelo", "gpt-4o", o "Duración", en lugar de los conceptos sociológicos.
+Solución: Debes implementar una regla de limpieza pre-chunking. Si usas Python/Pandas, elimina las primeras N líneas si detectas patrones de encabezado, o usa Regex para limpiar todo lo que parezca metadata técnica antes de vectorizar.
+2. El Problema de Contexto: "Cortes a ciegas"
+Mira el Fragmento 1 (Score 0.817):
+"complementando aún cuando es mala recortado claramente ciertos accesos a la red de Un segundito a la red de alcantarillado..."
+Diagnóstico:
+Interrupciones: La frase "Un segundito" quedó incrustada en medio de una idea técnica sobre alcantarillado. Esto es natural en el habla, pero para el análisis puede confundir al modelo de embedding.
+Inicio "In Media Res": El fragmento empieza con "complementando aún cuando...". Al leer esto meses después, no sabrás qué se estaba complementando.
+Solución: Necesitas un "Sliding Window" (Ventana deslizante) con solapamiento (overlap).
+Si tu chunk es de 500 caracteres, asegúrate de que el siguiente chunk repita los últimos 100 caracteres del anterior. Esto garantiza que el contexto de "qué se complementa" no se pierda en el corte.
+3. La Ausencia del "Quién" (Diarización)
+En los fragmentos de texto (1, 2 y 4), no veo la etiqueta del hablante (ej. [SPEAKER_01]).
+Por qué es grave para la Teoría Fundamentada:
+En el enfoque Constructivista, importa quién construye el discurso. ¿La frase sobre "mujeres de lila" (Fragmento 2) la dijo la entrevistada (Silvia) o la sugirió el entrevistador?
+Si el chunk no lleva el ID del speaker dentro del texto vectorizado, pierdes la trazabilidad de la voz.
+Recomendación: Tu texto a procesar debería verse así:"[SPEAKER_01]: son fundamentalmente las mujeres de lila, las mujeres de amarillo..."
+Plan de Acción Inmediato para tu Etapa 1 (Ingesta)
+Antes de pasar a la codificación, ajusta tu script de ingesta con estas 3 reglas:
+Filtro de Cabeceras: Si el párrafo empieza con "Transcripción:" o "Modelo:", descártalo. No lo guardes en la base de datos de análisis.
+Inyección de Speaker: Asegúrate de que cada fragmento de texto inicie con el nombre o código de la persona que habla.
+Limpieza de "Stop Words" conversacionales (Opcional): Evalúa si limpiar muletillas como "Un segundito", "ehh", "mmm" ayuda a la claridad, o si prefieres mantenerlas por fidelidad (esto depende de qué tan "interpretativa" quieras que sea la IA).

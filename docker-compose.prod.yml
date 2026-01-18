@@ -1,0 +1,83 @@
+# =============================================================================
+# docker-compose.prod.yml - Producción Full Cloud
+# =============================================================================
+# Solo Backend y Frontend como contenedores
+# Todos los servicios de datos en Cloud (PostgreSQL, Redis, Neo4j, Qdrant)
+# =============================================================================
+# Uso: docker-compose -f docker-compose.prod.yml up -d
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # BACKEND API (Production)
+  # ===========================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.production
+    environment:
+      - ENVIRONMENT=production
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/healthz" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ===========================================================================
+  # FRONTEND (Production con Nginx)
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    ports:
+      - "80:80"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ===========================================================================
+  # CELERY WORKER (Production)
+  # ===========================================================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A backend.celery_worker worker --loglevel=warning --concurrency=4
+    env_file:
+      - .env.production
+    depends_on:
+      - backend
+    restart: unless-stopped
+    profiles:
+      - workers
+
+networks:
+  default:
+    name: qualitative-prod-network

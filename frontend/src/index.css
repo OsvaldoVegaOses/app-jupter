@@ -1,0 +1,24 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", Roboto, sans-serif;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #14213d;
+  background-color: #f8fafc;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+}
+
+button {
+  font: inherit;
+}

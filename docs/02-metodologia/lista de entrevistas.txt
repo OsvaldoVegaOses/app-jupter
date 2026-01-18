@@ -1,0 +1,7 @@
+data\interviews\Guillermo Orestes.docx
+data\interviews\Natalia Molina.docx
+data\interviews\Pablo_Fabrega.docx
+data\interviews\Trancripción_Camilo_Colegio_Cayenel.docx
+data\interviews\Trancripción_Elba.docx
+data\interviews\Trancripción_Patricio_Yañez.docx
+

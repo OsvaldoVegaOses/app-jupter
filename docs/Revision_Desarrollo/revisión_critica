@@ -1,0 +1,30 @@
+Construimos una arquitectura muy profesional y escalable. Tenemos un proceso sólido: gestión de proyectos (Dashboard), procesamiento de audio (Transcripción) y preparación de datos (Ingesta).
+Sin embargo, al revisar nuestro flujo "Ingesta (Etapa 1) Codificación Abierta (Etapa 3)", detecto un riesgo metodológico y técnico importante.
+Aquí tienes mi revisión crítica de tu desarrollo actual:
+1. El Misterio de la Etapa 2: ¿Dónde quedó la "Limpieza y Familiarización"?
+Si saltas directamente de la Ingesta Técnica (cortar texto por caracteres) a la Codificación Abierta (análisis semántico), te estás saltando un paso vital en investigación cualitativa: La Lectura Flotante o Sanitización.
+El Problema: Las transcripciones automáticas (incluso con Whisper/Diarización) tienen errores (alucinaciones, puntuación incorrecta, palabras mal entendidas).
+El Riesgo: Si pasas directo a codificar, podrías terminar creando códigos sobre errores de transcripción o frases cortadas.
+Sugerencia: Tu Etapa 2 debería ser "Revisión y Segmentación Semántica".
+Acción: El usuario ve el texto ingestad y corrige errores graves o confirma que los cortes (chunks) no rompieron una idea a la mitad.
+2. Alerta Técnica en la Etapa 1: "Min/Max Characters" vs. "Unidad de Significado"
+Veo que en tus parámetros de fragmentación usas Min caracteres y Max caracteres. Esto suena a preparación para RAG (Embeddings) o ventanas de contexto de LLM.
+Cuidado aquí:
+En Teoría Fundamentada, la "fractura de los datos" (Codificación Abierta) debe respetar la semántica, no la longitud de caracteres.
+Escenario de fallo: Si una frase importante de Silvia dice: "El problema fue que [corte por max_chars]... el gobierno no ayudó", y el sistema corta ahí, tendrás dos fragmentos incompletos. El código perderá el contexto.
+Solución: Asegúrate de que tu algoritmo de chunking respete saltos de párrafo o puntos finales, no solo límite de caracteres. O bien, implementa un overlap (superposición) generoso entre fragmentos.
+3. Aciertos del Diseño (Lo que está muy bien)
+Diarización Automática: Es fundamental para separar "Entrevistador" de "Entrevistado". En el análisis constructivista, es vital saber quién dice qué para entender la co-construcción.
+Gestión de Proyectos (Dashboard): Permitir múltiples proyectos (nubewebID) es excelente para manejar diferentes investigaciones simultáneamente.
+Metadata JSON: Es vital para luego filtrar. Por ejemplo: "Muéstrame todos los códigos sobre 'inundación' pero SOLO de entrevistados mayores de 60 años".
+Propuesta de Ajuste del Flujo (Pipeline)
+Para alinear tu desarrollo técnico con la metodología que discutimos antes, te sugiero ajustar el pipeline así:
+Etapa 0 - Transcripción: Audio $\rightarrow$ Texto Crudo (con speakers).
+Etapa 1 - Ingesta (Tu estado actual): Normalización técnica y Chunking inteligente (respetando oraciones).
+Etapa 2 - Familiarización (El eslabón perdido):
+Vista de lectura rápida.
+El investigador valida que la transcripción es fiel.
+Define si la "Unidad de Análisis" será frase por frase o párrafo por párrafo.
+Etapa 3 - Codificación Abierta: Ahora sí, entra el etiquetado (fractura de datos).
+Pregunta para seguir avanzando:
+¿Tu backend de ingesta ya está dividiendo el texto basándose en los cambios de hablante (diarización)? Es decir, ¿garantizas que un chunk nunca mezcle la voz del entrevistador con la del entrevistado? Eso sería crucial para la calidad del código.

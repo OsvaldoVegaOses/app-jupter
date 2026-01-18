@@ -1,0 +1,47 @@
+/* Reuse ConfirmModal base styles and extend for history display */
+
+.code-history-modal {
+  max-width: 900px;
+  width: 95%;
+}
+
+.code-history-modal__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.code-history-modal__table th,
+.code-history-modal__table td {
+  padding: 0.5rem 0.6rem;
+  border-bottom: 1px solid #e2e8f0;
+  vertical-align: top;
+}
+
+.code-history-modal__table th {
+  text-align: left;
+  color: #334155;
+  background: #f8fafc;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.code-history-modal__scroll {
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.code-history-modal__badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.code-history-modal__muted {
+  color: #64748b;
+}

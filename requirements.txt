@@ -1,0 +1,65 @@
+# Core dependencies
+structlog
+python-dotenv[cli]
+typer
+rich
+
+# Data processing
+pandas
+numpy
+
+# AI/ML
+openai
+azure-identity
+
+# Databases
+qdrant-client
+neo4j
+psycopg2-binary
+
+# Document processing
+python-docx
+lxml
+beautifulsoup4
+
+# Web framework
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+python-jose[cryptography]
+slowapi
+bcrypt
+email-validator
+
+# Background tasks
+celery[redis]
+
+# Utilities
+requests
+tenacity
+networkx
+pydub
+
+# Audio processing (for transcription)
+# Note: pydub requires ffmpeg installed on the system
+
+# Testing
+pytest
+
+# Graph algorithms (Sprint 10 - Fallback)
+# Note: hdbscan and cdlib require C++ compilation, install manually if needed
+igraph>=0.10.0
+leidenalg>=0.9.0
+# hdbscan>=0.8.29  # Requires C++ compiler
+# python-cdlib>=0.2.0  # Complex dependencies
+
+# Code normalization (Sprint 11 - Fuzzy matching)
+rapidfuzz>=3.0.0
+
+# Azure Blob Storage (Sprint - Cloud Deployment)
+azure-storage-blob>=12.19.0
+
+# LangGraph Agent (Sprint 29 - Autonomous Research)
+langgraph>=0.2.0
+langchain-core>=0.2.0

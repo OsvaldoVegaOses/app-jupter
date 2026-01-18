@@ -1,0 +1,12 @@
+Columns in app_users:
+  - id
+  - email
+  - password_hash
+  - full_name
+  - organization_id
+  - role
+  - is_active
+  - created_at
+  - updated_at
+  - is_verified
+  - last_login_at

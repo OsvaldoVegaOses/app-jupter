@@ -1,0 +1,62 @@
+﻿python : Traceback 
+(most recent call 
+last):
+En línea: 1 Carácter: 
+1
++ python 
+debug_clients.py 2>&1 
+| Out-File -Encoding 
+utf8 debug_output.t 
+...
++ ~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~
+    + CategoryInfo    
+          : NotSpeci  
+  fied: (Traceback    
+ (most recent call    
+ last)::String) [    
+], RemoteExceptio    n
+    + FullyQualifiedE 
+   rrorId : NativeCo  
+  mmandError
+ 
+  File "C:\Users\osval
+\Downloads\APP_Jupter\
+debug_clients.py", 
+line 10, in <module>
+    clients = build_se
+rvice_clients(settings
+)
+              ^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+^
+  File "C:\Users\osval
+\Downloads\APP_Jupter\
+app\clients.py", line 
+42, in 
+build_service_clients
+    pg_conn = 
+psycopg2.connect(
+              
+^^^^^^^^^^^^^^^^^
+  File "C:\Users\osval
+\AppData\Local\Program
+s\Python\Python312\Lib
+\site-packages\psycopg
+2\__init__.py", line 
+135, in connect
+    conn = 
+_connect(dsn, connecti
+on_factory=connection_
+factory, **kwasync)
+           ^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^
+UnicodeDecodeError: 
+'utf-8' codec can't 
+decode byte 0xab in 
+position 96: invalid 
+start byte
+Settings OK
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xab in position 96: invalid start byte

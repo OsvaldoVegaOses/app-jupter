@@ -1,0 +1,177 @@
+# docker-compose.yml - Entorno de desarrollo local
+# Uso: docker-compose up -d
+# Esto levanta TODOS los servicios necesarios para desarrollo
+
+services:
+  # ===========================================
+  # BACKEND API
+  # ===========================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - VITE_API_BASE=http://backend:8000
+      - VITE_NEO4J_API_KEY=${NEO4J_API_KEY}
+      - AZURE_OPENAI_API_KEY
+      - AZURE_OPENAI_API_VERSION
+      - AZURE_OPENAI_DEPLOYMENT_CHAT
+      - AZURE_OPENAI_DEPLOYMENT_EMBED
+      - AZURE_OPENAI_DEPLOYMENT_TRANSCRIBE_DIARIZE
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      # API Key (usa la del .env)
+      - NEO4J_API_KEY=${NEO4J_API_KEY}
+      # PostgreSQL Azure - Usa credenciales del .env
+      - PGHOST=${PGHOST}
+      - PGPORT=${PGPORT:-5432}
+      - PGUSER=${PGUSER}
+      - PGPASSWORD=${PGPASSWORD}
+      - PGDATABASE=${PGDATABASE}
+      - PGSSLMODE=${PGSSLMODE:-require}
+      # Qdrant Cloud - Usa credenciales del .env
+      - QDRANT_URI=${QDRANT_URI}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-fragments}
+      # Neo4j Aura - Usa credenciales del .env
+      - NEO4J_URI=${NEO4J_URI}
+      - NEO4J_USERNAME=${NEO4J_USERNAME}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - NEO4J_dbms_default__database=${NEO4J_DATABASE}
+      # Redis
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      # PostgreSQL Azure - no depende de contenedor local
+      redis:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/healthz" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ===========================================
+  # FRONTEND (Docker - Production-like)
+  # ===========================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5174:5173" # Host:Container - Docker en 5174, dev mode en 5173
+    env_file:
+      - .env
+    environment:
+      # Browser hits same-origin; Vite dev proxy uses host backend.
+      - VITE_API_BASE=
+      # host.docker.internal permite conectar al backend local desde Docker
+      - VITE_BACKEND_URL=http://host.docker.internal:8000
+      - VITE_NEO4J_API_KEY=${NEO4J_API_KEY}
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+      - ./frontend/.env:/app/.env
+      - ./frontend/.env.local:/app/.env.local
+    # No depends_on backend: backend corre localmente
+
+    # ===========================================
+    # POSTGRESQL - DISABLED: Using Azure PostgreSQL
+    # ===========================================
+    # postgres:
+    #   image: postgres:15-alpine
+    #   ports:
+    #     - "5432:5432"
+    #   env_file:
+    #     - .env
+    #   environment:
+    #     - POSTGRES_USER=${PGUSER}
+    #     - POSTGRES_PASSWORD=${PGPASSWORD}
+    #     - POSTGRES_DB=${PGDATABASE}
+    #   volumes:
+    #     - postgres_data:/var/lib/postgresql/data
+    #     - ./docker/postgres:/docker-entrypoint-initdb.d:ro
+    #   healthcheck:
+    #     test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+    #     interval: 10s
+    #     timeout: 5s
+    #     retries: 5
+
+
+    # ===========================================
+    # QDRANT (Vector DB) - DISABLED: Using Qdrant Cloud
+    # ===========================================
+    # qdrant:
+    #   image: qdrant/qdrant:latest
+    #   ports:
+    #     - "6333:6333"
+    #     - "6334:6334"
+    #   volumes:
+    #     - qdrant_data:/qdrant/storage
+    #   environment:
+    #     - QDRANT__SERVICE__GRPC_PORT=6334
+
+    # ===========================================
+    # NEO4J (Graph DB) - DISABLED: Using Neo4j Aura Cloud
+    # ===========================================
+    # neo4j:
+    #   image: neo4j:5-community
+    #   ports:
+    #     - "7474:7474" # HTTP
+    #     - "7687:7687" # Bolt
+    #   environment:
+    #     - NEO4J_AUTH=${NEO4J_USERNAME}/${NEO4J_PASSWORD}
+    #     - NEO4J_PLUGINS=["apoc"]
+    #     - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+    #     - NEO4J_dbms_default__database=${NEO4J_DATABASE}
+    #   volumes:
+    #     - neo4j_data:/data
+    #   healthcheck:
+    #     test: [ "CMD-SHELL", "wget --spider -q http://localhost:7474 || exit 1" ]
+    #     interval: 10s
+    #     timeout: 5s
+    #     retries: 10
+
+    # ===========================================
+    # REDIS (Celery Broker)
+    # ===========================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379" # External 16379 avoids Windows Hyper-V port conflicts
+    volumes:
+      - redis_data:/data
+
+  # ===========================================
+  # CELERY WORKER (opcional)
+  # ===========================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A backend.celery_worker worker --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      # ... (mismas variables que backend)
+    depends_on:
+      - redis
+      - backend
+    profiles:
+      - workers # Solo se levanta con: docker-compose --profile workers up
+
+volumes:
+  postgres_data: # qdrant_data:  # No longer needed with Qdrant Cloud
+
+  # neo4j_data:   # No longer needed with Neo4j Aura
+  redis_data:
+
+
+networks:
+  default:
+    name: qualitative-network

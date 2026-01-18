@@ -1,0 +1,29 @@
+[2025-12-12T10:14:17.828028] [WARN] File locking skipped on Windows (not fully implemented in script)
+[2025-12-12T10:14:21.326646] [INFO] Starting cleanup...
+[2025-12-12T10:14:22.710369] [ERROR] Unhandled exception: no existe la relación «fragments»
+LINE 1: DELETE FROM fragments WHERE project_id = 'test_ingesta_proj'
+                    ^
+
+Traceback (most recent call last):
+  File "C:\Users\osval\Downloads\APP_Jupter\scripts\verify_ingestion.py", line 295, in main
+    verifier.run_cleanups()
+  File "C:\Users\osval\Downloads\APP_Jupter\scripts\verify_ingestion.py", line 218, in run_cleanups
+    cur.execute("DELETE FROM fragments WHERE project_id = %s", (self.args.project,))
+psycopg2.errors.UndefinedTable: no existe la relación «fragments»
+LINE 1: DELETE FROM fragments WHERE project_id = 'test_ingesta_proj'
+                    ^
+
+{
+  "run_id": "2025-12-12T10:14:21.326646",
+  "project_id": "test_ingesta_proj",
+  "status": "error",
+  "counts": {},
+  "mismatches": [],
+  "actions": [],
+  "audit": {
+    "user": "osval",
+    "host": "Huawei",
+    "command": "scripts/verify_ingestion.py --project test_ingesta_proj --env .env --cleanup --force"
+  },
+  "error": "no existe la relaci\u00f3n \u00abfragments\u00bb\nLINE 1: DELETE FROM fragments WHERE project_id = 'test_ingesta_proj'\n                    ^\n"
+}

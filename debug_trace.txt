@@ -1,0 +1,261 @@
+--- Line 5265 ---
+{
+  "method": "POST",
+  "path": "/api/upload-and-ingest",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "event": "request.start",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:05.586683Z"
+}
+--- Line 5266 ---
+{
+  "used": 0,
+  "available": 9,
+  "maxconn": 80,
+  "event": "pool.getconn.request",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:05.715942Z"
+}
+--- Line 5267 ---
+{
+  "used": 1,
+  "event": "pool.getconn.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:05.717105Z"
+}
+--- Line 5268 ---
+{
+  "used": 0,
+  "event": "pool.putconn.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:05.771290Z"
+}
+--- Line 5272 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "blob": "jd-009/Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "url": "https://appjupterstorage.blob.core.windows.net/interviews/jd-009/Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "size": 115546,
+  "event": "api.upload_and_ingest.saved",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:08.133442Z"
+}
+--- Line 5273 ---
+{
+  "used": 0,
+  "available": 9,
+  "maxconn": 80,
+  "event": "pool.getconn.request",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:08.204140Z"
+}
+--- Line 5274 ---
+{
+  "used": 1,
+  "event": "pool.getconn.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:08.204930Z"
+}
+--- Line 5275 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "event": "ingest.neo4j.available",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:11.995046Z"
+}
+--- Line 5276 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "fragments": 96,
+  "event": "ingest.file.start",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:13.187476Z"
+}
+--- Line 5277 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "par_idx": 0,
+  "issues": [
+    "filler_repetition"
+  ],
+  "preview": "Archivo de audio Primera parte entrevista uv 20 (1).m4a Transcripci\u00f3n Entrevistador Yo me presento primero mi nombre es",
+  "event": "ingest.fragment.flagged",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "warning",
+  "timestamp": "2026-01-10T19:29:13.188667Z"
+}
+--- Line 5278 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "par_idx": 5,
+  "issues": [
+    "filler_repetition"
+  ],
+  "preview": "saber a los dirigentes sociales que ten\u00edan que pedir limpieza de todos los pozos una vez al a\u00f1o. Orador Claro. Presinden",
+  "event": "ingest.fragment.flagged",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "warning",
+  "timestamp": "2026-01-10T19:29:13.191881Z"
+}
+--- Line 5279 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "par_idx": 9,
+  "issues": [
+    "filler_repetition"
+  ],
+  "preview": "que tienen salida hacia ac\u00e1 tambi\u00e9n es por donde se. Presindenta JJVV Silvia Le. A los antes. Secretaria JJVV Victoria A",
+  "event": "ingest.fragment.flagged",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "warning",
+  "timestamp": "2026-01-10T19:29:13.195135Z"
+}
+--- Line 5280 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "par_idx": 10,
+  "issues": [
+    "filler_repetition"
+  ],
+  "preview": "hubieron algunos problemas con el canal que pasa en donde est\u00e1 la caja de condensaci\u00f3n. H\u00e9roes. Entrevistador La. Secret",
+  "event": "ingest.fragment.flagged",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "warning",
+  "timestamp": "2026-01-10T19:29:13.195135Z"
+}
+--- Line 5281 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "par_idx": 14,
+  "issues": [
+    "filler_repetition"
+  ],
+  "preview": "el honor siguiendo por la ventana del ba\u00f1o de mi departamento. Orador S\u00ed. Presindenta JJVV Silvia Fui a un pr. A ver si",
+  "event": "ingest.fragment.flagged",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "warning",
+  "timestamp": "2026-01-10T19:29:13.197287Z"
+}
+--- Line 5282 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "count": 64,
+  "elapsed_ms": 1923.96,
+  "event": "qdrant.upsert.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:17.876394Z"
+}
+--- Line 5283 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "file": "Entrevista_Dirigentas_UV_20_La_Florida_20260110_162905.docx",
+  "batch": 1,
+  "batch_size": 64,
+  "char_len_zero": 0,
+  "duplicates_in_batch": 0,
+  "event": "ingest.batch",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:19.445059Z"
+}
+--- Line 5284 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "count": 32,
+  "elapsed_ms": 421.78,
+  "event": "qdrant.upsert.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:20.697782Z"
+}
+--- Line 5285 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "error": "current transaction is aborted, commands ignored until end of transaction block\n",
+  "event": "api.upload_and_ingest.ingest_error",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "error",
+  "timestamp": "2026-01-10T19:29:21.123392Z"
+}
+--- Line 5286 ---
+{
+  "uses_pool": true,
+  "event": "clients.close.start",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.clients",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:21.124428Z"
+}
+--- Line 5287 ---
+{
+  "used": 0,
+  "event": "pool.putconn.success",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.pool",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:21.130695Z"
+}
+--- Line 5288 ---
+{
+  "event": "clients.close.pg_returned",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.clients",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:21.131555Z"
+}
+--- Line 5289 ---
+{
+  "method": "POST",
+  "path": "/api/upload-and-ingest",
+  "status_code": 500,
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "event": "request.end",
+  "logger": "app.api",
+  "level": "info",
+  "timestamp": "2026-01-10T19:29:21.135538Z"
+}

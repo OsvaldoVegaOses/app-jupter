@@ -1,0 +1,76 @@
+# =============================================================================
+# APP_Jupter .gitignore
+# =============================================================================
+
+# Environment files with secrets
+.env
+.env.*
+.env.production
+.env.local
+.env.*.local
+
+# Keep .env as template (but review before commit!)
+# .env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+.venv_wsl/
+env/
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+frontend/error_log.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Backups locales
+backup_postgresql_*.sql
+backups/
+
+# Data (large files)
+data/projects/*/audio/
+*.mp3
+*.wav
+*.m4a
+
+# Metadata/outputs locales (cloud-only)
+metadata/
+reports/
+notes/
+
+# Cache
+.cache/
+*.cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.tar
+
+# Temporary
+tmp/
+temp/

@@ -1,0 +1,22 @@
+--- Line 4858 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "error": "current transaction is aborted, commands ignored until end of transaction block\n",
+  "event": "api.upload_and_ingest.ingest_error",
+  "request_id": "2d0a449c-932c-4e9d-9344-f71591ce0269",
+  "logger": "app.api",
+  "level": "error",
+  "timestamp": "2026-01-10T19:23:54.274345Z"
+}
+--- Line 5285 ---
+{
+  "endpoint": "upload_and_ingest",
+  "project": "jd-009",
+  "error": "current transaction is aborted, commands ignored until end of transaction block\n",
+  "event": "api.upload_and_ingest.ingest_error",
+  "request_id": "fa2d1060-6b8a-4130-86fa-5630b82d34b6",
+  "logger": "app.api",
+  "level": "error",
+  "timestamp": "2026-01-10T19:29:21.123392Z"
+}

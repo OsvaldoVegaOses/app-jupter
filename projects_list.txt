@@ -1,0 +1,6 @@
+Total fragmentos en Qdrant: 0
+
+PROYECTOS:
+
+
+ARCHIVOS POR PROYECTO:

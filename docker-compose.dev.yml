@@ -1,0 +1,121 @@
+# =============================================================================
+# docker-compose.dev.yml - Desarrollo Híbrido
+# =============================================================================
+# Servicios Locales: Backend, Frontend, PostgreSQL, Redis
+# Servicios Cloud: Neo4j Aura, Qdrant Cloud (configurados en .env.docker)
+# =============================================================================
+# Uso: docker-compose -f docker-compose.dev.yml up -d
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # BACKEND API
+  # ===========================================================================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.docker
+    environment:
+      # PostgreSQL local (Docker)
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      # Azure Storage (Blob) - Optional
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      # Redis local (Docker)
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      # Los demás settings vienen de .env.docker (Neo4j Cloud, Qdrant Cloud)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./metadata:/app/metadata
+      - ./informes:/app/informes
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/healthz" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===========================================================================
+  # FRONTEND (Desarrollo con Vite)
+  # ===========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE=http://localhost:8000
+      - VITE_NEO4J_API_KEY=dev-key
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    depends_on:
+      - backend
+
+  # ===========================================================================
+  # POSTGRESQL (Local Docker)
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres123
+      - POSTGRES_DB=system_inv_sociocultural_v1
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # REDIS (Local Docker - Celery Broker)
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379" # External 16379 avoids Windows Hyper-V port conflicts
+    volumes:
+      - redis_data:/data
+
+  # ===========================================================================
+  # CELERY WORKER (Opcional - activar con --profile workers)
+  # ===========================================================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: celery -A backend.celery_worker worker --loglevel=info
+    env_file:
+      - .env.docker
+    environment:
+      - POSTGRES_HOST=postgres
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - backend
+    profiles:
+      - workers
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  default:
+    name: qualitative-dev-network

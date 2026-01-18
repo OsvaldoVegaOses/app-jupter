@@ -1,0 +1,35 @@
+================================================================================
+INVESTIGANDO FRAGMENTO: 024a5b6e-42a2-56d1-b02b-65ac8d77796d
+================================================================================
+
+[1] FRAGMENTO EN entrevista_fragmentos:
+    ID: 024a5b6e-42a2-56d1-b02b-65ac8d77796d
+    par_idx: 22
+    archivo: Comite de Vivienda Santa Ana.docx
+    speaker: interviewee
+    fragmento (primeros 500 chars):
+    a visitarnos a nosotros y vamos a tener una mejor calidad de vida para todos nuestros vecinos. Entrevistador: Perfecto, recibe ustedes me decían que habían varias localidades en esta zona. La localidad de HHorcónes una localidad chocota, es otra localía. Graciela Rojas: Tan egota como 22 localidades. Entrevistador: Ventana es olla. ¿Ya perfecto y qué a ustedes qué le queda más cerca? ¿Era Puchuncaví o ir Horcón o ir a Ventana VY cómo cómo eso la gente como que se comunica más fácil entre la zona...
+
+[2] CITAS ASIGNADAS A ESTE FRAGMENTO:
+    Código: ayuda_mutua_tradicional
+    Cita: 'llega el pueblo entero y te ayudan a pagar el cajón'
+    Fuente: Entrevistada
+    Creado: 2025-12-22 01:24:26.420072-03:00
+----------------------------------------
+    Código: valores_comunitarios
+    Cita: 'si fallece un pescador llega el pueblo entero y se hace una colecta'
+    Fuente: Entrevistada
+    Creado: 2025-12-22 00:18:33.596702-03:00
+----------------------------------------
+    Código: Solidaridad comunitaria
+    Cita: 'llega el pueblo entero y te ayudan a pagar el cajón'
+    Fuente: Entrevistada
+    Creado: 2025-12-22 08:07:34.162486-03:00
+----------------------------------------
+
+[3] BUSCANDO 'llega el pueblo entero' EN TODOS LOS FRAGMENTOS:
+    ENCONTRADO en fragmento: b86033ef-5db4-5b87-9c58-ffc197f6dca8
+    par_idx: 33
+    speaker: interviewee
+    Contexto: ...scador, nos fallece un familiar. Alguien está mi vecina, está mi otra vecina, está mi otra vecina y llega el pueblo entero y te ayudan a pagar el cajón y te hacen una colecta y te acompañan toda la noche en el Velorio y te...
+----------------------------------------

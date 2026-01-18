@@ -1,0 +1,126 @@
+================================================================================
+                     AUDITORIA DE ALMACENAMIENTO
+                         16 ENERO 2026 - 01:18 UTC
+================================================================================
+
+PROYECTO SOLICITADO: 64317059-08aa-4831-b1b7-ab83d357c08f
+CUENTA: osvaldovegaoses@gmail.com
+
+================================================================================
+RESULTADO
+================================================================================
+
+El proyecto especificado NO EXISTE en el sistema.
+
+PostgreSQL:        0 fragmentos, 0 codigos
+Neo4j:             0 nodos
+Qdrant:            0 puntos
+Blob Storage:      0 archivos
+
+================================================================================
+ESTADO GLOBAL DEL SISTEMA
+================================================================================
+
+FRAGMENTOS TOTALES: 1,872 en 51 archivos
+CODIGOS TOTALES:   745
+PROYECTOS CON DATOS: 8
+
+TOP PROYECTOS:
+1. jd-007...       24 archivos, 800 fragmentos, 165 codigos
+2. jd-009...       15 archivos, 597 fragmentos, 440 codigos
+3. jd-008...        6 archivos, 229 fragmentos
+4. nubeweb...       2 archivos, 74 fragmentos
+5. jd007-vi...      1 archivo,  53 fragmentos
+
+PROYECTO ESPECIFICO: jose-domingo-vg
+   Fragmentos: 0
+   Codigos candidatos: 14 (INCONSISTENCIA - sin fragmentos)
+   Neo4j: VACIO
+   Qdrant: VACIO
+   Blob: VACIO
+
+================================================================================
+BASES DE DATOS
+================================================================================
+
+PostgreSQL
+  Tablas: 30+ tablas publicas
+  Registros fragmentos: 1,872
+  Registros codigos: 745
+  Estado: CONECTADO
+
+Neo4j
+  Nodos: ~3,000+
+  Estado: CONECTADO (notas sobre sintaxis < 5.0)
+  Problema: Queries GROUP BY retornan errores
+
+Qdrant
+  Colecciones: 1 (fragments)
+  Puntos: 38
+  Estado: CONECTADO
+  INCONSISTENCIA: Solo 2% de fragmentos tienen embeddings
+
+Blob Storage
+  Contenedor: interviews
+  Archivos: 51
+  Estado: PARCIALMENTE VALIDADO
+
+================================================================================
+PROBLEMAS DETECTADOS
+================================================================================
+
+1. QDRANT SUB-UTILIZADO
+   - 1,872 fragmentos
+   - Solo 38 embeddings
+   - Ratio: 2% del esperado
+   
+2. JOSE-DOMINGO-VG
+   - 14 codigos candidatos
+   - 0 fragmentos base
+   - Inconsistencia critica
+
+3. NEO4J COMPATIBILITY
+   - Queries Cypher GROUP BY fallan
+   - Compatible solo < Neo4j 5.0
+
+================================================================================
+ACCIONES RECOMENDADAS
+================================================================================
+
+CRITICO:
+[ ] Investigar por que jose-domingo-vg tiene codigos sin fragmentos
+[ ] Calcular embeddings para 1,834 fragmentos faltantes en Qdrant
+
+IMPORTANTE:
+[ ] Validar integridad de 51 archivos en Blob Storage
+[ ] Revisar sincronizacion Neo4j con PostgreSQL
+
+SUGERENCIA:
+[ ] Programar auditorias mensuales de consistencia
+[ ] Actualizar documentacion sobre incidentes detectados
+
+================================================================================
+ARCHIVOS GENERADOS
+================================================================================
+
+1. AUDITORIA_PROYECTO_64317059.md
+   - Reporte detallado del proyecto especifico
+
+2. AUDITORIA_GLOBAL_16ENERO2026.md
+   - Analisis completo del sistema
+
+3. scripts/audit_global.py
+   - Script de auditoria global
+
+4. scripts/audit_storage_state.py
+   - Script de auditoria por proyecto
+
+5. scripts/audit_project_specific.py
+   - Script de auditoria especifica de proyecto
+
+================================================================================
+SIGUIENTE REVISION: 23 ENERO 2026
+================================================================================
+
+Generado por: Sistema de Auditoria
+Timestamp: 2026-01-16T01:18:00Z

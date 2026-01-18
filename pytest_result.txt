@@ -1,0 +1,24 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.1, pluggy-1.6.0 -- C:\Users\osval\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\osval\Downloads\APP_Jupter
+configfile: pyproject.toml
+plugins: anyio-4.11.0
+collecting ... collected 0 items / 1 error
+
+=================================== ERRORS ====================================
+__________________ ERROR collecting tests/test_api_neo4j.py ___________________
+tests\test_api_neo4j.py:14: in <module>
+    from backend import app as backend_app
+backend\app.py:30: in <module>
+    from backend.celery_worker import task_analyze_interview, celery_app
+backend\celery_worker.py:10: in <module>
+    configure_logging()
+app\logging_config.py:53: in configure_logging
+    structlog.dev.set_exc_info,
+    ^^^^^^^^^^^^^
+E   AttributeError: module 'structlog' has no attribute 'dev'
+=========================== short test summary info ===========================
+ERROR tests/test_api_neo4j.py - AttributeError: module 'structlog' has no att...
+!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+============================== 1 error in 6.90s ===============================

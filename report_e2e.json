@@ -1,0 +1,17 @@
+{
+  "run_id": "2025-12-12T11:14:01.370265",
+  "project_id": "test-ingesta-proj",
+  "status": "success",
+  "counts": {
+    "neo4j": 24,
+    "qdrant": 24,
+    "postgres": 24
+  },
+  "mismatches": [],
+  "actions": [],
+  "audit": {
+    "user": "osval",
+    "host": "Huawei",
+    "command": "scripts/verify_ingestion.py --project test-ingesta-proj --env .env --json-out report_e2e.json --timeout 120"
+  }
+}

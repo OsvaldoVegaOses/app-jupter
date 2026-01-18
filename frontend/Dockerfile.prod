@@ -1,0 +1,39 @@
+# Production Dockerfile for React/Vite frontend
+# Build: docker build -t qualitative-frontend -f Dockerfile.prod .
+
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies first (better cache)
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Copy source and build
+COPY . .
+RUN npm run build
+
+# =============================================================================
+# Production image with Nginx
+# =============================================================================
+FROM nginx:alpine
+
+# Copy built assets
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy nginx config as template (for envsubst processing)
+COPY nginx.conf /etc/nginx/templates/nginx.conf.template
+
+# Set default backend URL (can be overridden at runtime)
+ENV BACKEND_URL=http://backend:8000
+
+# Expose port
+EXPOSE 80
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --spider -q http://localhost/health || exit 0
+
+# Process template and start nginx
+CMD ["/bin/sh", "-c", "envsubst '${BACKEND_URL}' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"]
+

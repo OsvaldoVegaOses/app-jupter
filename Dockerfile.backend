@@ -1,0 +1,51 @@
+# Dockerfile para Backend FastAPI
+# Build: docker build -t qualitative-backend -f Dockerfile.backend .
+
+FROM python:3.11-slim
+
+LABEL maintainer="dev@qualitative-analysis.app"
+LABEL version="1.0"
+LABEL description="Backend API para Análisis Cualitativo de Entrevistas"
+
+WORKDIR /app
+
+# Variables de entorno para Python
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Instalar dependencias del sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libpq-dev \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar requirements primero (para cache de Docker)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar código de la aplicación
+COPY app/ ./app/
+COPY backend/ ./backend/
+COPY main.py .
+
+# Crear directorio de logs
+RUN mkdir -p logs data
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
+# Exponer puerto
+EXPOSE 8000
+
+# Usuario no-root para seguridad
+RUN useradd --create-home --shell /bin/bash appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Comando de inicio
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "asyncio"]

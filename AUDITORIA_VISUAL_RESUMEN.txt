@@ -1,0 +1,155 @@
+================================================================================
+                    RESUMEN AUDITORIA - FORMATO VISUAL
+================================================================================
+
+                        PROYECTO ESPECIFICO
+                 64317059-08aa-4831-b1b7-ab83d357c08f
+                      osvaldovegaoses@gmail.com
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ESTADO: NO EXISTE                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PostgreSQL ......................................................... ❌ 0 │
+│    ├─ Fragmentos:                                                     0    │
+│    ├─ Codigos:                                                        0    │
+│    └─ Codigos Candidatos:                                             0    │
+│                                                                              │
+│  Neo4j ............................................................. ❌ 0 │
+│    ├─ Nodos Entrevista:                                               0    │
+│    ├─ Nodos Fragmento:                                                0    │
+│    └─ Nodos Codigo:                                                   0    │
+│                                                                              │
+│  Qdrant ............................................................ ❌ 0 │
+│    ├─ Colecciones:                                                    0    │
+│    └─ Puntos:                                                         0    │
+│                                                                              │
+│  Blob Storage ...................................................... ❌ 0 │
+│    └─ Archivos:                                                       0    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                         ESTADO GLOBAL SISTEMA
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DATOS ALMACENADOS - TODOS PROYECTOS                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PostgreSQL: ✅ CONECTADO                                                   │
+│  ├─ Fragmentos totales:                                        1,872 ✅     │
+│  ├─ Codigos asignados:                                           745 ✅     │
+│  ├─ Archivos ingestionados:                                        51 ✅     │
+│  └─ Proyectos activos:                                             8 ✅     │
+│                                                                              │
+│  Neo4j: ✅ CONECTADO                                                        │
+│  ├─ Nodos estimados:                                          ~3000+ ✅     │
+│  └─ Relaciones:                                              Activas ✅     │
+│                                                                              │
+│  Qdrant: ⚠️  CONECTADO (SUB-UTILIZADO)                                      │
+│  ├─ Colecciones:                                                   1 ✅     │
+│  ├─ Puntos almacenados:                                           38 ⚠️     │
+│  ├─ Puntos esperados:                                          1,872 ❌     │
+│  └─ Cobertura:                                                   2% ⚠️     │
+│                                                                              │
+│  Blob Storage: ✅ ACCESIBLE                                                 │
+│  └─ Archivos:                                                    51 ✅     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                         TOP 5 PROYECTOS ACTIVOS
+
+┌──────┬─────────────────┬──────────┬─────────────┬──────────┐
+│ Rank │ Proyecto ID     │ Archivos │ Fragmentos  │ Codigos  │
+├──────┼─────────────────┼──────────┼─────────────┼──────────┤
+│  1   │ jd-007...       │    24    │     800     │   165    │
+│  2   │ jd-009...       │    15    │     597     │   440    │
+│  3   │ jd-008...       │     6    │     229     │    0     │
+│  4   │ nubeweb...      │     2    │      74     │    0     │
+│  5   │ jd007-vi...     │     1    │      53     │    1     │
+└──────┴─────────────────┴──────────┴─────────────┴──────────┘
+
+                    PROYECTO: jose-domingo-vg
+                 INCONSISTENCIA DETECTADA ⚠️
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                              │
+│  Estado:               ⚠️  INCONSISTENTE                                     │
+│  Fragmentos:          0                                                     │
+│  Codigos abiertos:    0                                                     │
+│  Codigos candidatos:  14  ← SIN FRAGMENTOS BASE                            │
+│  Neo4j nodos:         0                                                     │
+│  Qdrant puntos:       0                                                     │
+│                                                                              │
+│  Diagnosis:           Codigos candidatos huérfanos                          │
+│  Severidad:           MEDIA                                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                       CONSISTENCIA GENERAL
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                                                               │
+│  Fragmentos PostgreSQL vs Neo4j:    ✅ CONSISTENT (ambos ~1900+)           │
+│  Fragmentos PostgreSQL vs Qdrant:   ❌ INCONSISTENT (1872 vs 38 = 2%)      │
+│  Neo4j vs Qdrant:                   ❌ INCONSISTENT                         │
+│                                                                               │
+│  Archivos Huerfanos:                ✅ NINGUNO (limpieza post 16-enero)    │
+│  Datos Corruptos:                   ✅ NINGUNO                              │
+│  Acceso Bloqueado:                  ✅ NINGUNO                              │
+│                                                                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+                          PROBLEMAS DETECTADOS
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SEVERIDAD │ PROBLEMA                          │ ACCION RECOMENDADA          │
+├───────────┼───────────────────────────────────┼─────────────────────────────┤
+│ CRITICA   │ jose-domingo-vg: 14 codigos sin   │ Investigar origen de datos  │
+│           │ fragmentos                        │                             │
+│───────────┼───────────────────────────────────┼─────────────────────────────┤
+│ CRITICA   │ Qdrant: 98% de fragmentos sin     │ Calcular embeddings         │
+│           │ embeddings                        │ faltantes                   │
+│───────────┼───────────────────────────────────┼─────────────────────────────┤
+│ ALTA      │ Neo4j: sintaxis GROUP BY falla    │ Actualizar queries para     │
+│           │ (< Neo4j 5.0)                     │ compatibilidad              │
+│───────────┼───────────────────────────────────┼─────────────────────────────┤
+│ MEDIA     │ Blob Storage: acceso no           │ Validar connection string   │
+│           │ completamente validado           │                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                       ARCHIVOS GENERADOS
+
+✅ AUDITORIA_PROYECTO_64317059.md
+   └─ Reporte detallado del proyecto especifico (4 KB)
+
+✅ AUDITORIA_GLOBAL_16ENERO2026.md
+   └─ Analisis completo del sistema (12 KB)
+
+✅ AUDITORIA_RESUMEN_16ENERO2026.txt
+   └─ Resumen ejecutivo en texto plano (6 KB)
+
+✅ AUDITORIA_GUIA_SCRIPTS.md
+   └─ Documentacion de scripts de auditoria (8 KB)
+
+✅ scripts/audit_global.py
+   └─ Script Python de auditoria global (reutilizable)
+
+✅ scripts/audit_storage_state.py
+   └─ Script Python de auditoria por proyecto (reutilizable)
+
+✅ scripts/audit_project_specific.py
+   └─ Script Python de auditoria especifica (reutilizable)
+
+                         PROXIMOS PASOS
+
+1. ☐ Revisar inconsistencia de jose-domingo-vg
+2. ☐ Calcular embeddings faltantes en Qdrant
+3. ☐ Validar integridad de Blob Storage
+4. ☐ Actualizar queries Neo4j para < 5.0
+5. ☐ Programar auditoria automatica mensual
+6. ☐ Actualizar documentacion del sistema
+
+================================================================================
+Auditoria completada: 16 enero 2026, 01:18 UTC
+Siguiente revision recomendada: 23 enero 2026
+================================================================================

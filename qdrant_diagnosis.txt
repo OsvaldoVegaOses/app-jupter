@@ -1,0 +1,19 @@
+Coleccion: fragments
+Total fragmentos: 164
+
+PROYECTOS:
+  jd-007: 126 fragmentos
+  default: 38 fragmentos
+
+ARCHIVOS POR PROYECTO:
+
+=== Proyecto: jd-007 ===
+  Jefa_Territorial_Municipalidad_La_Florida_20260107_125513.docx: 27 fragmentos
+  Entrevista_equipo_Asesor_Urbano_La_Florida_20260107_125316.docx: 27 fragmentos
+  Secpla_I_M_Puente_Alto_20260107_125522.docx: 19 fragmentos
+  Entrevista_DIPMA_La_Florida_20260107_125356.docx: 19 fragmentos
+  _entrevista_Gerente_Canal_San_Carlos_20260107_125304.docx: 17 fragmentos
+  Entrevista_Encargada_Emergencia_La_Florida_20260107_125434.docx: 17 fragmentos
+
+=== Proyecto: default ===
+  Presidente de Sindicato de Pescadores Fabian Ogaz .docx: 38 fragmentos

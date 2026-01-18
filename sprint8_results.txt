@@ -1,0 +1,60 @@
+﻿============================================================
+Sprint 8 - Verificaci¾n de Estado de Base de Datos
+============================================================
+python : Traceback 
+(most recent call 
+last):
+En línea: 1 Carácter: 
+25
++ ... 
+nv:PYTHONPATH="$pwd"; 
+python scripts/sprint8
+_check_db.py 2>&1 | 
+Out-F ...
++                     
+      ~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~
+~
+    + CategoryInfo    
+          : NotSpeci  
+  fied: (Traceback    
+ (most recent call    
+ last)::String) [    
+], RemoteExceptio    n
+    + FullyQualifiedE 
+   rrorId : NativeCo  
+  mmandError
+ 
+  File "C:\Users\osval
+\Downloads\APP_Jupter\
+scripts\sprint8_check_
+db.py", line 115, in 
+<module>
+    main()
+  File "C:\Users\osval
+\Downloads\APP_Jupter\
+scripts\sprint8_check_
+db.py", line 40, in 
+main
+    
+print("\n\U0001f4ca 
+ESTAD═STICAS 
+PostgreSQL")
+  File "C:\Users\osval
+\AppData\Local\Program
+s\Python\Python312\Lib
+\encodings\cp1252.py",
+ line 19, in encode
+    return codecs.char
+map_encode(input,self.
+errors,encoding_table)
+[0]
+           ^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 
+'charmap' codec can't 
+encode character 
+'\U0001f4ca' in 
+position 2: character 
+maps to <undefined>

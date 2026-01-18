@@ -1,0 +1,201 @@
+﻿============================================================
+PROJECT ISOLATION TEST SUITE
+============================================================
+
+[1/5] Cleaning up test projects...
+
+[Cleanup] Removing test data...
+python : Traceback 
+(most recent call 
+last):
+En línea: 1 
+Carácter: 1
++ python tests/test_p
+roject_isolation.py 
+2>&1 | Out-File 
+-FilePath test ...
++ ~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
+~~~
+    + CategoryInfo   
+           : NotSpe  
+  cified: (Traceba   
+ ck (most recent     
+call last)::Stri    
+ng) [], RemoteEx    
+ception
+    + FullyQualified 
+   ErrorId : Native  
+  CommandError
+ 
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+56, in 
+cleanup_test_projects
+    print(f"\u2713 
+PostgreSQL: Cleaned 
+up entrevista_fragmen
+tos")
+  File "C:\Users\osva
+l\AppData\Local\Progr
+ams\Python\Python312\
+Lib\encodings\cp1252.
+py", line 19, in 
+encode
+    return codecs.cha
+rmap_encode(input,sel
+f.errors,encoding_tab
+le)[0]
+           ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^
+UnicodeEncodeError: 
+'charmap' codec 
+can't encode 
+character '\u2713' 
+in position 0: 
+character maps to 
+<undefined>
+
+During handling of 
+the above exception, 
+another exception 
+occurred:
+
+Traceback (most 
+recent call last):
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+251, in run_all_tests
+    cleanup_test_proj
+ects(clients, 
+settings)
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+59, in 
+cleanup_test_projects
+    print(f"\u26a0 
+PostgreSQL entrevista
+_fragmentos: {e}")
+  File "C:\Users\osva
+l\AppData\Local\Progr
+ams\Python\Python312\
+Lib\encodings\cp1252.
+py", line 19, in 
+encode
+    return codecs.cha
+rmap_encode(input,sel
+f.errors,encoding_tab
+le)[0]
+           ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^
+UnicodeEncodeError: 
+'charmap' codec 
+can't encode 
+character '\u26a0' 
+in position 0: 
+character maps to 
+<undefined>
+
+During handling of 
+the above exception, 
+another exception 
+occurred:
+
+Traceback (most 
+recent call last):
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+56, in 
+cleanup_test_projects
+    print(f"\u2713 
+PostgreSQL: Cleaned 
+up entrevista_fragmen
+tos")
+  File "C:\Users\osva
+l\AppData\Local\Progr
+ams\Python\Python312\
+Lib\encodings\cp1252.
+py", line 19, in 
+encode
+    return codecs.cha
+rmap_encode(input,sel
+f.errors,encoding_tab
+le)[0]
+           ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^
+UnicodeEncodeError: 
+'charmap' codec 
+can't encode 
+character '\u2713' 
+in position 0: 
+character maps to 
+<undefined>
+
+During handling of 
+the above exception, 
+another exception 
+occurred:
+
+Traceback (most 
+recent call last):
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+288, in <module>
+    success = 
+run_all_tests()
+              
+^^^^^^^^^^^^^^^
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+283, in run_all_tests
+    cleanup_test_proj
+ects(clients, 
+settings)
+  File "C:\Users\osva
+l\Downloads\APP_Jupte
+r\tests\test_project_
+isolation.py", line 
+59, in 
+cleanup_test_projects
+    print(f"\u26a0 
+PostgreSQL entrevista
+_fragmentos: {e}")
+  File "C:\Users\osva
+l\AppData\Local\Progr
+ams\Python\Python312\
+Lib\encodings\cp1252.
+py", line 19, in 
+encode
+    return codecs.cha
+rmap_encode(input,sel
+f.errors,encoding_tab
+le)[0]
+           ^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
+^^^
+UnicodeEncodeError: 
+'charmap' codec 
+can't encode 
+character '\u26a0' 
+in position 0: 
+character maps to 
+<undefined>
