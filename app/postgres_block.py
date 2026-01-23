@@ -104,6 +104,7 @@ OpenCodeRow = Tuple[
     str,  # cita
     Optional[str],  # fuente
     Optional[str],  # memo
+    Optional[int],  # code_id (new)
 ]
 
 AxialRow = Tuple[
@@ -1663,6 +1664,8 @@ def ensure_open_coding_table(pg: PGConnection) -> None:
         CREATE INDEX IF NOT EXISTS ix_aca_project_archivo ON analisis_codigos_abiertos(project_id, archivo);
         CREATE INDEX IF NOT EXISTS ix_aca_created_at ON analisis_codigos_abiertos(created_at);
             ALTER TABLE analisis_codigos_abiertos ADD COLUMN IF NOT EXISTS memo TEXT;
+            ALTER TABLE analisis_codigos_abiertos ADD COLUMN IF NOT EXISTS code_id BIGINT;
+        CREATE INDEX IF NOT EXISTS ix_aca_project_code_id ON analisis_codigos_abiertos(project_id, code_id) WHERE code_id IS NOT NULL;
         """
         with pg.cursor() as cur:
             cur.execute(sql)
@@ -2039,6 +2042,8 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     
     IMPORTANTE: Filtra automáticamente registros con fragmento_id vacío o None
     para mantener la coherencia de datos.
+    
+    OpenCodeRow: (project_id, fragmento_id, codigo, archivo, cita, fuente, memo, code_id)
     """
     # Filtrar registros con fragmento_id inválido
     valid_data = [
@@ -2048,6 +2053,15 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     
     if not valid_data:
         return
+    
+    # Si code_id no está en la tupla (compatibilidad), agregar None
+    normalized = []
+    for row in valid_data:
+        if len(row) == 7:
+            # Legacy: agregar code_id=None
+            normalized.append((*row, None))
+        else:
+            normalized.append(row)
         
     sql = """
     INSERT INTO analisis_codigos_abiertos (
@@ -2057,17 +2071,19 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
         archivo,
         cita,
         fuente,
-        memo
+        memo,
+        code_id
     )
     VALUES %s
     ON CONFLICT (project_id, fragmento_id, codigo) DO UPDATE SET
         cita = EXCLUDED.cita,
         fuente = EXCLUDED.fuente,
         memo = EXCLUDED.memo,
+        code_id = COALESCE(EXCLUDED.code_id, analisis_codigos_abiertos.code_id),
         created_at = analisis_codigos_abiertos.created_at;
     """
     with pg.cursor() as cur:
-        execute_values(cur, sql, valid_data, page_size=200)
+        execute_values(cur, sql, normalized, page_size=200)
 
 
 def merge_definitive_codes_by_code(
@@ -4702,6 +4718,8 @@ def ensure_candidate_codes_table(pg: PGConnection) -> None:
     CREATE INDEX IF NOT EXISTS ix_cc_created_at ON codigos_candidatos(created_at DESC);
     CREATE INDEX IF NOT EXISTS ix_cc_archivo ON codigos_candidatos(archivo);
     CREATE INDEX IF NOT EXISTS ix_cc_codigo ON codigos_candidatos(codigo);
+    ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS code_id BIGINT;
+    CREATE INDEX IF NOT EXISTS ix_cc_project_code_id ON codigos_candidatos(project_id, code_id) WHERE code_id IS NOT NULL;
     """
     with pg.cursor() as cur:
         cur.execute(sql)
@@ -4807,10 +4825,13 @@ def insert_candidate_codes(
                 error=str(e),
             )
     
+    # Lookup code_id desde catalogo_codigos para cada candidato
+    ensure_codes_catalog_table(pg)
+    
     sql = """
     INSERT INTO codigos_candidatos (
         project_id, codigo, cita, fragmento_id, archivo,
-        fuente_origen, fuente_detalle, score_confianza, estado, memo
+        fuente_origen, fuente_detalle, score_confianza, estado, memo, code_id
     )
     VALUES %s
     ON CONFLICT (project_id, codigo, fragmento_id) DO UPDATE SET
@@ -4818,13 +4839,23 @@ def insert_candidate_codes(
         fuente_detalle = COALESCE(EXCLUDED.fuente_detalle, codigos_candidatos.fuente_detalle),
         score_confianza = COALESCE(EXCLUDED.score_confianza, codigos_candidatos.score_confianza),
         memo = COALESCE(EXCLUDED.memo, codigos_candidatos.memo),
+        code_id = COALESCE(EXCLUDED.code_id, codigos_candidatos.code_id),
         updated_at = NOW()
     """
     
-    rows = [
-        (
-            c.get("project_id", "default"),
-            c.get("codigo", ""),
+    rows = []
+    for c in processed_candidates:
+        if not c.get("codigo"):
+            continue
+        project_id = c.get("project_id", "default")
+        codigo = c.get("codigo", "")
+        # Lookup code_id if not provided
+        code_id = c.get("code_id")
+        if code_id is None:
+            code_id = get_code_id_for_codigo(pg, project_id, codigo)
+        rows.append((
+            project_id,
+            codigo,
             c.get("cita"),
             c.get("fragmento_id"),
             c.get("archivo"),
@@ -4833,10 +4864,8 @@ def insert_candidate_codes(
             c.get("score_confianza"),
             c.get("estado", "pendiente"),
             c.get("memo"),
-        )
-        for c in processed_candidates
-        if c.get("codigo")
-    ]
+            code_id,
+        ))
     
     with pg.cursor() as cur:
         execute_values(cur, sql, rows, page_size=100)
@@ -6060,9 +6089,10 @@ def promote_to_definitive(
     # Obtener candidatos validados
     # IMPORTANTE: Excluir fragmento_id NULL o vacío para mantener coherencia
     # Selección: por IDs o por 'todos los validados'
+    # Incluye code_id para propagación end-to-end (migration 018)
     if promote_all_validated:
         sql_select = """
-        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id
           FROM codigos_candidatos
          WHERE project_id = %s
            AND estado = 'validado'
@@ -6074,7 +6104,7 @@ def promote_to_definitive(
         mode = "all_validated"
     else:
         sql_select = """
-        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id
           FROM codigos_candidatos
          WHERE project_id = %s
            AND id = ANY(%s)
@@ -6100,7 +6130,7 @@ def promote_to_definitive(
         }
     
     # Insertar en tabla definitiva, resolviendo a código canónico si corresponde.
-    # rows: (id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo)
+    # rows: (id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id)
     open_rows: List[OpenCodeRow] = []
     for r in rows:
         original_codigo = str(r[3]) if r[3] is not None else ""
@@ -6115,7 +6145,13 @@ def promote_to_definitive(
             else:
                 final_memo = f"{prefix}{final_memo}"
 
-        open_rows.append((r[1], r[2], canonical_codigo or original_codigo, r[4], r[5], r[6], final_memo))
+        # Resolver code_id: usar el del candidato, o buscar el canónico
+        candidate_code_id = r[8] if len(r) > 8 else None
+        resolved_code_id = candidate_code_id
+        if resolved_code_id is None and canonical_codigo:
+            resolved_code_id = get_code_id_for_codigo(pg, project_id, canonical_codigo)
+
+        open_rows.append((r[1], r[2], canonical_codigo or original_codigo, r[4], r[5], r[6], final_memo, resolved_code_id))
     upsert_open_codes(pg, open_rows)
 
     # Marcar candidatos como promovidos (best-effort, idempotente)
