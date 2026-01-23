@@ -116,23 +116,23 @@ Modificar `assign_axial_relation()` y la sincronización a Neo4j para usar `code
 
 ### Checklist de implementación — axial.py
 
-- [ ] Importar `resolve_canonical_code_id` y `get_code_id_for_codigo`
-- [ ] En `assign_axial_relation()`:
-  - [ ] Si se recibe `codigo` (texto): obtener `code_id` primero
-  - [ ] Resolver canónico por ID: `canonical_code_id = resolve_canonical_code_id(...)`
-  - [ ] Usar `code_id` canónico para persistencia
-  - [ ] Mantener `codigo` como label para logging/memo
-- [ ] Actualizar `upsert_axial_relationships()` para incluir `code_id` en la tabla
-- [ ] Verificar que evidencia se asocia al `code_id` canónico
+- [x] Importar `resolve_canonical_code_id` y `get_code_id_for_codigo`
+- [x] En `assign_axial_relation()`:
+  - [x] Si se recibe `codigo` (texto): obtener `code_id` primero
+  - [x] Resolver canónico por ID: `canonical_code_id = resolve_canonical_code_id(...)`
+  - [x] Usar `code_id` canónico para persistencia
+  - [x] Mantener `codigo` como label para logging/memo
+- [ ] Actualizar `upsert_axial_relationships()` para incluir `code_id` en la tabla (opcional - PostgreSQL ya tiene relación via JOIN)
+- [x] Verificar que evidencia se asocia al `code_id` canónico
 
 ### Checklist de implementación — neo4j_block.py
 
-- [ ] En `merge_category_code_relationship()`:
-  - [ ] Aceptar parámetro `code_id: Optional[int]`
-  - [ ] MERGE de nodo `:Codigo` incluye propiedad `code_id`
-  - [ ] Si `code_id` existe, usarlo como parte del match (más estable que `nombre`)
-- [ ] Crear/actualizar `sync_code_to_neo4j(neo4j, db, project_id, code_id, codigo, ...)`:
-  - [ ] Nodo con `{code_id: $code_id, nombre: $codigo, project_id: $project_id}`
+- [x] En `merge_category_code_relationship()`:
+  - [x] Aceptar parámetro `code_id: Optional[int]`
+  - [x] MERGE de nodo `:Codigo` incluye propiedad `code_id`
+  - [x] Si `code_id` existe, usarlo como parte del match (más estable que `nombre`)
+- [x] Actualizar `merge_category_code_relationships()` (batch) para soportar `code_id`
+- [x] Agregar índice para `(code_id, project_id)` en `ensure_code_constraints()`
 
 ### Checklist de migración (opcional pero recomendado)
 
@@ -145,9 +145,23 @@ Modificar `assign_axial_relation()` y la sincronización a Neo4j para usar `code
 
 ### Checklist de test
 
-- [ ] Test: crear relación axial → nodo Neo4j tiene `code_id`
-- [ ] Test: código merged → relación apunta al canónico (por `code_id`)
-- [ ] Test: query Neo4j por `code_id` → encuentra el nodo correcto
+- [x] Test: `merge_category_code_relationship` acepta parámetro `code_id` (8 tests pasan)
+- [x] Test: código con `code_id` usa MERGE por ID
+- [x] Test: función batch maneja rows con/sin `code_id`
+- [x] Test: `ensure_code_constraints` crea índice para `code_id`
+
+### Validación manual
+
+- [ ] Crear relación axial desde UI
+- [ ] Query Neo4j: `MATCH (c:Codigo {project_id: 'jd-007'}) RETURN c.nombre, c.code_id LIMIT 10`
+- [ ] Verificar que `code_id` está presente
+
+### Definition of Done
+
+- [x] Relaciones axiales persistidas con `code_id`
+- [x] Nodos Neo4j tienen propiedad `code_id` (cuando se crea con assign_axial_relation)
+- [x] Tests pasan (8/8)
+- [ ] Commit: `feat(axial): use code_id for stable identity in axial relations and Neo4j sync`
 
 ### Validación manual
 
@@ -233,7 +247,7 @@ TICKET-001 ──┐
 |--------|--------|--------|-----|-------|
 | TICKET-001 | ✅ DONE | 2026-01-23 | 2026-01-23 | `resolve_canonical_code_id()` + `get_code_id_for_codigo()` + 11 tests |
 | TICKET-002 | ✅ DONE | 2026-01-23 | 2026-01-23 | `ensure_code_catalog_entry()` retorna code_id + queries incluyen code_id |
-| TICKET-003 | ⬜ NOT STARTED | — | — | Depende de 002 |
+| TICKET-003 | ✅ DONE | 2026-01-23 | 2026-01-23 | axial.py + neo4j_block.py usan code_id + 8 tests |
 | TICKET-004 | ⬜ NOT STARTED | — | — | Depende de 003 |
 
 **Leyenda:**

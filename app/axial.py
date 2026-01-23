@@ -67,6 +67,8 @@ from .postgres_block import (
     ensure_open_coding_table,
     fetch_fragment_by_id,
     upsert_axial_relationships,
+    get_code_id_for_codigo,
+    resolve_canonical_code_id,
 )
 
 
@@ -116,8 +118,20 @@ def assign_axial_relation(
     from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigo
 
     ensure_codes_catalog_table(clients.postgres)
+    project_id = project or "default"
     original_codigo = codigo
-    codigo = resolve_canonical_codigo(clients.postgres, project or "default", codigo)
+    codigo = resolve_canonical_codigo(clients.postgres, project_id, codigo)
+    
+    # Obtener code_id del código canónico para identidad estable
+    code_id = get_code_id_for_codigo(clients.postgres, project_id, codigo)
+    if code_id is not None:
+        # Resolver al canónico por ID (más robusto que por texto)
+        canonical_code_id = resolve_canonical_code_id(clients.postgres, project_id, code_id)
+        if canonical_code_id is not None and canonical_code_id != code_id:
+            # El código fue mergeado, usar el canónico
+            code_id = canonical_code_id
+            log.debug("axial.resolved_canonical_id", original_code_id=code_id, canonical_code_id=canonical_code_id)
+    
     if codigo and original_codigo and codigo.strip().lower() != str(original_codigo).strip().lower():
         # Keep UX/audit context without changing the contract.
         prefix = f"[CANON:{codigo}; ORIG:{str(original_codigo).strip()}] "
@@ -127,7 +141,6 @@ def assign_axial_relation(
             f"Tipo de relacion '{relacion}' invalido. Debe ser uno de: {', '.join(sorted(ALLOWED_REL_TYPES))}."
         )
 
-    project_id = project or "default"
     evidence_ids = _validate_evidence(clients.postgres, codigo, evidencia, project_id)
 
     fragments = [fetch_fragment_by_id(clients.postgres, fid, project_id) for fid in evidence_ids]
@@ -161,6 +174,7 @@ def assign_axial_relation(
         evidencia=evidence_ids,
         memo=memo,
         project_id=project_id,
+        code_id=code_id,
     )
 
     payload = {
@@ -169,6 +183,7 @@ def assign_axial_relation(
         "relacion": rel_tipo,
         "memo": memo,
         "evidencia": evidence_ids,
+        "code_id": code_id,
     }
     log.info("axial.relate", **payload)
     return payload

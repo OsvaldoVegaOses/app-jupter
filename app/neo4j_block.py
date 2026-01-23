@@ -61,12 +61,17 @@ def ensure_code_constraints(driver: Driver, database: str) -> None:
     Crea constraint de unicidad compuesta para nodos Codigo.
     
     Permite que diferentes proyectos tengan códigos con el mismo nombre
-    sin colisión.
+    sin colisión. También crea índice para code_id (identidad estable).
     """
     with driver.session(database=database) as session:
         session.run("""
             CREATE CONSTRAINT codigo_nombre_project IF NOT EXISTS 
             FOR (c:Codigo) REQUIRE (c.nombre, c.project_id) IS UNIQUE
+        """)
+        # Índice para code_id (no unique constraint porque puede ser NULL en nodos legacy)
+        session.run("""
+            CREATE INDEX codigo_code_id_project IF NOT EXISTS 
+            FOR (c:Codigo) ON (c.code_id, c.project_id)
         """)
 
 
@@ -196,6 +201,7 @@ def merge_category_code_relationship(
     evidencia: Sequence[str],
     memo: str | None = None,
     project_id: str | None = None,
+    code_id: int | None = None,
 ) -> None:
     """
     Crea una relación axial entre Categoria y Codigo.
@@ -212,6 +218,7 @@ def merge_category_code_relationship(
         evidencia: Lista de IDs de fragmentos que soportan la relación
         memo: Nota explicativa opcional
         project_id: ID del proyecto (requerido para aislamiento)
+        code_id: ID estable del código en catalogo_codigos (para identidad consistente)
         
     Raises:
         ValueError: Si el tipo de relación no es válido o falta project_id
@@ -221,15 +228,30 @@ def merge_category_code_relationship(
     if not project_id:
         raise ValueError("project_id es requerido para aislamiento entre proyectos")
     evidencia_unique = list(dict.fromkeys(evidencia))
-    cypher = """
-    MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
-    MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
-    SET cod.status = coalesce(cod.status, 'active')
-    MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
-    SET rel.evidencia = $evidencia,
-        rel.memo = $memo,
-        rel.actualizado_en = datetime()
-    """
+    
+    # Si tenemos code_id, usarlo para MERGE más estable (inmune a renombres)
+    if code_id is not None:
+        cypher = """
+        MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
+        MERGE (cod:Codigo {code_id: $code_id, project_id: $project_id})
+        SET cod.nombre = $codigo,
+            cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
+        SET rel.evidencia = $evidencia,
+            rel.memo = $memo,
+            rel.actualizado_en = datetime()
+        """
+    else:
+        # Fallback: MERGE por nombre (comportamiento legacy)
+        cypher = """
+        MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
+        MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
+        SET cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
+        SET rel.evidencia = $evidencia,
+            rel.memo = $memo,
+            rel.actualizado_en = datetime()
+        """
     with driver.session(database=database) as session:
         session.run(
             cypher,
@@ -239,6 +261,7 @@ def merge_category_code_relationship(
             evidencia=evidencia_unique,
             memo=memo,
             project_id=project_id,
+            code_id=code_id,
         )
 
 
@@ -251,20 +274,50 @@ def merge_category_code_relationships(
     Inserta relaciones axiales en batch.
 
     Cada row debe incluir: categoria, codigo, relacion, evidencia, memo, project_id.
+    Opcionalmente puede incluir code_id para identidad estable.
     """
     data = list(rows)
     if not data:
         return
-    cypher = """
-    UNWIND $rows AS r
-    MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
-    MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
-    SET cod.status = coalesce(cod.status, 'active')
-    MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
-    SET rel.evidencia = r.evidencia,
-        rel.memo = r.memo,
-        rel.actualizado_en = datetime()
-    """
+    
+    # Verificar si alguna fila tiene code_id
+    has_code_id = any(row.get("code_id") is not None for row in data)
+    
+    if has_code_id:
+        # Usar code_id para MERGE cuando esté disponible
+        cypher = """
+        UNWIND $rows AS r
+        MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
+        FOREACH (_ IN CASE WHEN r.code_id IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (cod:Codigo {code_id: r.code_id, project_id: r.project_id})
+            SET cod.nombre = r.codigo,
+                cod.status = coalesce(cod.status, 'active')
+            MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+            SET rel.evidencia = r.evidencia,
+                rel.memo = r.memo,
+                rel.actualizado_en = datetime()
+        )
+        FOREACH (_ IN CASE WHEN r.code_id IS NULL THEN [1] ELSE [] END |
+            MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
+            SET cod.status = coalesce(cod.status, 'active')
+            MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+            SET rel.evidencia = r.evidencia,
+                rel.memo = r.memo,
+                rel.actualizado_en = datetime()
+        )
+        """
+    else:
+        # Fallback legacy: MERGE por nombre
+        cypher = """
+        UNWIND $rows AS r
+        MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
+        MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
+        SET cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+        SET rel.evidencia = r.evidencia,
+            rel.memo = r.memo,
+            rel.actualizado_en = datetime()
+        """
     with driver.session(database=database) as session:
         session.run(cypher, rows=data)
 
