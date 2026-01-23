@@ -71,7 +71,8 @@ from .postgres_block import (
     log_constant_comparison,
 )
 from .neo4j_block import delete_fragment_code, ensure_code_constraints, merge_fragment_code
-from .settings import AppSettings
+from .prompts.loader import get_system_prompt
+from .settings import AppSettings, EpistemicMode
 
 _logger = structlog.get_logger()
 
@@ -375,12 +376,14 @@ def suggest_code_from_fragments(
     existing_codes: Optional[List[str]] = None,
     llm_model: Optional[str] = None,
     project: Optional[str] = None,
+    epistemic_mode: Optional[EpistemicMode] = None,
     logger: Optional[structlog.BoundLogger] = None,
 ) -> Dict[str, Any]:
     """
     Sugiere nombre de código y memo basado en fragmentos seleccionados.
     
     Sprint 17 - E2: Sugerencia de Acción con IA.
+    Usa prompts diferenciados por modo epistémico (constructivista/post-positivista).
     
     Args:
         clients: ServiceClients con conexiones
@@ -389,12 +392,14 @@ def suggest_code_from_fragments(
         existing_codes: Códigos existentes para evitar duplicados
         llm_model: Modelo LLM a usar
         project: ID del proyecto
+        epistemic_mode: Modo epistémico (default: CONSTRUCTIVIST)
         
     Returns:
-        Dict con suggested_code, memo, confidence
+        Dict con suggested_code, memo, confidence, prompt_version
     """
     log = logger or _logger
     project_id = project or "default"
+    mode = epistemic_mode or EpistemicMode.CONSTRUCTIVIST
     
     if not fragments:
         return {
@@ -408,7 +413,19 @@ def suggest_code_from_fragments(
     resolved_model = _resolve_llm_model(settings, llm_model) if llm_model else None
     model_name = resolved_model or settings.azure.deployment_chat
     
-    # Construir prompt
+    # Cargar prompt epistémico (EM03: modo diferenciado por proyecto)
+    try:
+        system_prompt, prompt_version = get_system_prompt(mode, "open_coding")
+    except FileNotFoundError:
+        log.warning(
+            "coding.prompt_fallback",
+            epistemic_mode=mode.value,
+            reason="prompt_file_missing",
+        )
+        system_prompt = "Eres un analista cualitativo experto en Teoría Fundamentada. Propones códigos significativos basados en datos."
+        prompt_version = "hardcoded_fallback_v1"
+    
+    # Construir prompt de usuario con fragmentos
     fragment_texts = []
     for i, frag in enumerate(fragments[:5], 1):  # Máximo 5
         texto = (frag.get("fragmento") or frag.get("texto") or "")[:400]
@@ -419,27 +436,30 @@ def suggest_code_from_fragments(
     if existing_codes:
         existing_list = "\n".join(f"- {c}" for c in existing_codes[:20])
     
-    prompt = f"""Analiza los siguientes fragmentos de entrevistas y propón UN código que agrupe el tema central.
+    user_prompt = f"""Analiza los siguientes fragmentos de entrevistas y propón UN código que agrupe el tema central.
 
 FRAGMENTOS:
 {chr(10).join(fragment_texts)}
 
 {"CÓDIGOS EXISTENTES (evitar duplicados):" + chr(10) + existing_list if existing_list else ""}
 
-INSTRUCCIONES:
-1. Propón UN nombre de código en snake_case (2-4 palabras, español)
-2. Escribe un memo de 2-3 oraciones explicando la convergencia temática
-3. Indica nivel de confianza: alta (tema claro), media (tema inferido), baja (fragmentario)
-
 Responde SOLO en formato JSON válido:
 {{"suggested_code": "nombre_del_codigo", "memo": "Explicación del agrupamiento...", "confidence": "alta|media|baja"}}"""
+
+    log.info(
+        "coding.suggest_code.started",
+        project_id=project_id,
+        epistemic_mode=mode.value,
+        prompt_version=prompt_version,
+        fragment_count=len(fragments),
+    )
 
     messages: List[ChatCompletionMessageParam] = [
         ChatCompletionSystemMessageParam(
             role="system",
-            content="Eres un analista cualitativo experto en Teoría Fundamentada. Propones códigos significativos basados en datos.",
+            content=system_prompt,
         ),
-        ChatCompletionUserMessageParam(role="user", content=prompt),
+        ChatCompletionUserMessageParam(role="user", content=user_prompt),
     ]
 
     try:
@@ -480,6 +500,8 @@ Responde SOLO en formato JSON válido:
             
             result["llm_model"] = model_name
             result["fragments_count"] = len(fragments)
+            result["prompt_version"] = prompt_version
+            result["epistemic_mode"] = mode.value
             
             # Validar que suggested_code exista y no esté vacío
             suggested_code = (result.get("suggested_code") or "").strip()
