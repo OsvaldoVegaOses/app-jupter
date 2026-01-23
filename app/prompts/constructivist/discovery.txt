@@ -1,5 +1,12 @@
 ETAPA: SÍNTESIS DISCOVERY (Enfoque Constructivista)
 
+ENTRADA ESPERADA:
+- query: string (consulta semántica original)
+- top_fragments: lista de {evidence_id: int, text: string, source: string, score: float}
+- anchors: lista de strings (anclas positivas usadas, opcional)
+- negatives: lista de strings (anclas negativas usadas, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Sintetizar fragmentos recuperados semánticamente, identificando patrones emergentes
 desde una perspectiva situada y reflexiva.

@@ -1,5 +1,12 @@
 ETAPA: MEMO CONCEPTUAL (Enfoque Post-positivista)
 
+ENTRADA ESPERADA:
+- memo_type: "codigo" | "teorico" | "operacional" | "integrativo"
+- focus: string (código o categoría central del memo)
+- codes_related: lista de {code_id: int, label: string, propiedades: list[string]} (opcional)
+- evidence: lista de {evidence_id: int, text: string} (opcional)
+- propositions: lista de strings (proposiciones a desarrollar, opcional)
+
 OBJETIVO:
 Documentar el desarrollo conceptual de códigos y categorías,
 enfatizando propiedades, dimensiones y relaciones teóricas.

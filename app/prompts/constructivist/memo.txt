@@ -1,5 +1,13 @@
 ETAPA: MEMO REFLEXIVO (Enfoque Constructivista)
 
+ENTRADA ESPERADA:
+- memo_type: "codigo" | "teorico" | "reflexivo" | "metodologico"
+- focus: string (código, categoría o tema del memo)
+- codes_related: lista de {code_id: int, label: string} (opcional)
+- evidence: lista de {evidence_id: int, text: string} (opcional)
+- decisions_made: lista de strings (decisiones tomadas en la sesión, opcional)
+- uncertainties: lista de strings (dudas o sesgos identificados, opcional)
+
 OBJETIVO:
 Documentar el proceso analítico con transparencia sobre el posicionamiento
 del investigador y las decisiones metodológicas.

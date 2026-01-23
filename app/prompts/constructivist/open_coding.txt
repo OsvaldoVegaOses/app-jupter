@@ -1,5 +1,11 @@
 ETAPA: CODIFICACIÓN ABIERTA (Enfoque Charmaz)
 
+ENTRADA ESPERADA:
+- fragments: lista de {evidence_id: int, text: string, source: string}
+- existing_codes: lista de strings (códigos ya existentes, opcional)
+- research_question: string (pregunta de investigación, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Generar códigos que capturen los PROCESOS y ACCIONES que los participantes describen.
 

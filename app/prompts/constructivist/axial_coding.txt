@@ -1,5 +1,11 @@
 ETAPA: CODIFICACIÓN AXIAL (Enfoque Constructivista)
 
+ENTRADA ESPERADA:
+- codes: lista de {code_id: int, label: string, frequency: int, evidence_ids: list[int]}
+- relations_existing: lista de {from_code: string, rel_type: string, to_code: string} (opcional)
+- categories_draft: lista de strings (categorías tentativas, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Organizar códigos en categorías relacionales que capturen la complejidad del fenómeno.
 

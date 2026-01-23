@@ -1,5 +1,12 @@
 ETAPA: CODIFICACIÓN SELECTIVA (Enfoque Glaser/Strauss)
 
+ENTRADA ESPERADA:
+- categories: lista de {category_id: int, label: string, codes: list[string], frequency: int, paradigm_role: string}
+- relations: lista de {from_category: string, rel_type: string, to_category: string}
+- central_candidates: lista de strings (candidatos a categoría central, opcional)
+- saturation_metrics: {total_codes: int, new_codes_last_5: int, coverage_pct: float, negative_cases: int} (opcional)
+- storyline_draft: string (línea argumental tentativa, opcional)
+
 OBJETIVO:
 Identificar la CATEGORÍA CENTRAL que integra todas las demás en una teoría sustantiva.
 

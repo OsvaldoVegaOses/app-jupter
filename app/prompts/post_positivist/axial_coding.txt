@@ -1,5 +1,11 @@
 ETAPA: CODIFICACIÓN AXIAL (Enfoque Strauss/Corbin)
 
+ENTRADA ESPERADA:
+- codes: lista de {code_id: int, label: string, frequency: int, evidence_ids: list[int], propiedades: list[string]}
+- relations_existing: lista de {from_code: string, rel_type: string, to_code: string} (opcional)
+- paradigm_elements: {causales: list, contexto: list, estrategias: list, consecuencias: list} (opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Organizar códigos según el PARADIGMA RELACIONAL: condiciones, acciones/interacciones, consecuencias.
 

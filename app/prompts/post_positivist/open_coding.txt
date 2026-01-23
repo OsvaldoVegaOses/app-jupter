@@ -1,5 +1,11 @@
 ETAPA: CODIFICACIÓN ABIERTA (Enfoque Glaser/Strauss)
 
+ENTRADA ESPERADA:
+- fragments: lista de {evidence_id: int, text: string, source: string}
+- existing_codes: lista de strings (códigos ya existentes, opcional)
+- research_question: string (pregunta de investigación, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Generar códigos conceptuales que abstraigan los PATRONES presentes en los datos.
 

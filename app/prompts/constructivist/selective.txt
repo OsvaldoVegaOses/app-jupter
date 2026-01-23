@@ -1,5 +1,12 @@
 ETAPA: CODIFICACIÓN SELECTIVA (Enfoque Constructivista)
 
+ENTRADA ESPERADA:
+- categories: lista de {category_id: int, label: string, codes: list[string], frequency: int}
+- relations: lista de {from_category: string, rel_type: string, to_category: string}
+- central_candidates: lista de strings (candidatos a categoría central, opcional)
+- saturation_metrics: {total_codes: int, new_codes_last_5: int, coverage_pct: float} (opcional)
+- project_context: string (contexto del proyecto, opcional)
+
 OBJETIVO:
 Identificar la categoría central que integra la teoría emergente,
 manteniendo apertura a múltiples lecturas posibles.
