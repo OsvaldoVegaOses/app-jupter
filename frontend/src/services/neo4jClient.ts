@@ -23,26 +23,41 @@ export interface Neo4jQueryResult {
 }
 
 const DEFAULT_ENDPOINT = "/api/neo4j/query";
-// Support both the explicit VITE_NEO4J_API_KEY and a legacy VITE_API_KEY env var
-const DEFAULT_API_KEY_ENV = "VITE_NEO4J_API_KEY";
-const LEGACY_API_KEY_ENV = "VITE_API_KEY";
 
-export async function runNeo4jQuery(payload: Neo4jQueryRequest): Promise<Neo4jQueryResult> {
-  const endpoint = import.meta.env.VITE_NEO4J_API_URL || DEFAULT_ENDPOINT;
-  const envVars = import.meta.env as Record<string, string | undefined>;
-  // prefer explicit VITE_NEO4J_API_KEY, fall back to legacy VITE_API_KEY for compatibility
-  const apiKey = envVars[DEFAULT_API_KEY_ENV] || envVars[LEGACY_API_KEY_ENV];
+/**
+ * Construye los headers de autenticación usando la misma lógica que api.ts:
+ * 1. JWT Bearer token si el usuario está logueado
+ * 2. X-API-Key como fallback (para desarrollo local o scripts)
+ */
+function buildAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "content-type": "application/json" };
-  // By default we include the API key only when a non-default endpoint is
-  // configured (i.e. a remote URL), to avoid leaking host env keys through the
-  // local proxy. In some deployments the backend still expects the header even
-  // when using the proxy; enable that behavior by setting
-  // VITE_NEO4J_ALWAYS_SEND_API_KEY=true in the frontend env.
+  
+  // Priority 1: JWT Bearer token from localStorage (producción con usuarios logueados)
+  const authToken = localStorage.getItem("access_token");
+  if (authToken) {
+    headers["Authorization"] = `Bearer ${authToken}`;
+    return headers;
+  }
+  
+  // Priority 2: API Key fallback (desarrollo local o integraciones)
+  const envVars = import.meta.env as Record<string, string | undefined>;
+  const apiKey = envVars.VITE_NEO4J_API_KEY || envVars.VITE_API_KEY;
+  const endpoint = envVars.VITE_NEO4J_API_URL || DEFAULT_ENDPOINT;
   const forceSend = Boolean(envVars.VITE_NEO4J_ALWAYS_SEND_API_KEY);
+  
+  // Incluir API Key si: hay key Y (es endpoint remoto O forceSend está activo)
   const includeApiKey = Boolean(apiKey) && (endpoint !== DEFAULT_ENDPOINT || forceSend);
   if (includeApiKey && typeof apiKey === "string") {
     headers["X-API-Key"] = apiKey;
   }
+  
+  return headers;
+}
+
+export async function runNeo4jQuery(payload: Neo4jQueryRequest): Promise<Neo4jQueryResult> {
+  const endpoint = import.meta.env.VITE_NEO4J_API_URL || DEFAULT_ENDPOINT;
+  const headers = buildAuthHeaders();
+  
   const response = await fetch(endpoint, {
     method: "POST",
     headers,
@@ -77,13 +92,8 @@ export async function exportNeo4jQuery(
   const endpoint = import.meta.env.VITE_NEO4J_API_URL || DEFAULT_ENDPOINT;
   const baseUrl = endpoint.replace(/\/?query\/?$/, "");
   const exportUrl = (baseUrl || endpoint).replace(/\/$/, "") + "/export";
-  const envVars = import.meta.env as Record<string, string | undefined>;
-  const apiKey = envVars[DEFAULT_API_KEY_ENV] || envVars[LEGACY_API_KEY_ENV];
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const includeApiKey = Boolean(apiKey) && endpoint !== DEFAULT_ENDPOINT;
-  if (includeApiKey && typeof apiKey === "string") {
-    headers["X-API-Key"] = apiKey;
-  }
+  const headers = buildAuthHeaders();
+  
   const response = await fetch(exportUrl, {
     method: "POST",
     headers,

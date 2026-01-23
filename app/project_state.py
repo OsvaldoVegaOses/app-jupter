@@ -312,10 +312,16 @@ def create_project(
     
     slug = _slugify(name)
     
-    # Verificar si ya existe
-    existing = get_project_db(pg, slug)
+    # Verificar si ya existe DENTRO DE LA MISMA ORGANIZACIÓN
+    # Multi-tenant: cada org puede tener un proyecto con el mismo slug
+    existing = get_project_db(pg, slug, org_id=org_id)
     if existing:
-        raise ValueError(f"Ya existe un proyecto con el identificador '{slug}'.")
+        created_at = existing.get("created_at", "fecha desconocida")
+        existing_name = existing.get("name", slug)
+        raise ValueError(
+            f"Ya existe un proyecto '{existing_name}' (ID: {slug}) creado el {created_at}. "
+            "Intente refrescar la página (F5) para verlo, o cree un proyecto con diferente nombre."
+        )
     
     return create_project_db(
         pg,

@@ -39,9 +39,12 @@ Additional production migrations
 - `008_interview_files.sql`
 - `010_neo4j_sync_tracking.sql`
 - `012_add_is_deleted_to_proyectos.sql`
+- `013_codes_catalog_ontology.sql`
+- `014_code_id_columns.sql`
+- `015_ontology_freeze.sql`
 
 Helper script
-- `../scripts/apply_migrations_production.py` — Runs 007/008/010/012 in order.
+- `../scripts/apply_migrations_production.py` — Runs the production SQL migrations in order.
 
 If you want, I can adapt these scripts to your exact production table names and
 run them if you provide DB credentials or allow me to run remote commands.

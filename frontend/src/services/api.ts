@@ -117,6 +117,69 @@ function isAbortError(err: unknown): boolean {
   );
 }
 
+// =============================================================================
+// Token Refresh Singleton (Sprint 31 - Fix race condition)
+// =============================================================================
+// Evita múltiples refresh concurrentes cuando varias requests fallan con 401
+// simultáneamente. Solo un refresh se ejecuta; las demás esperan el resultado.
+
+let _refreshPromise: Promise<boolean> | null = null;
+
+async function refreshTokenSingleton(): Promise<boolean> {
+  // Si ya hay un refresh en progreso, esperamos su resultado
+  if (_refreshPromise) {
+    console.log("[API] Waiting for existing token refresh...");
+    return _refreshPromise;
+  }
+
+  // Crear nueva promesa de refresh
+  _refreshPromise = (async () => {
+    const refreshToken = localStorage.getItem("refresh_token");
+    if (!refreshToken) {
+      console.warn("[API] No refresh token available");
+      return false;
+    }
+
+    try {
+      console.log("[API] Starting singleton token refresh...");
+      const refreshUrl = buildUrl("/api/auth/refresh");
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+
+      const refreshResponse = await fetch(refreshUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (refreshResponse.ok) {
+        const data = await refreshResponse.json();
+        localStorage.setItem("access_token", data.access_token);
+        console.log("[API] Token refresh successful");
+        return true;
+      } else {
+        console.warn("[API] Token refresh failed:", refreshResponse.status);
+        localStorage.removeItem("access_token");
+        localStorage.removeItem("refresh_token");
+        localStorage.removeItem("user");
+        window.dispatchEvent(new CustomEvent("auth-session-expired"));
+        return false;
+      }
+    } catch (err) {
+      console.error("[API] Token refresh error:", err);
+      return false;
+    }
+  })();
+
+  try {
+    return await _refreshPromise;
+  } finally {
+    _refreshPromise = null; // Limpiar para permitir futuros refreshes
+  }
+}
+
 async function fetchWithTimeout(
   url: string,
   options: RequestInit,
@@ -135,7 +198,8 @@ export async function apiFetch(
   path: string,
   options: RequestInit = {},
   retryOptions?: RetryOptions,
-  _isRefreshRetry = false  // Internal flag to prevent infinite loops
+  _isRefreshRetry = false,  // Internal flag to prevent infinite loops
+  timeoutMs = 30000  // Configurable timeout (default 30s, use 60000+ for runners)
 ): Promise<Response> {
   const url = buildUrl(path);
   const headers: Record<string, string> = {};
@@ -168,46 +232,23 @@ export async function apiFetch(
 
   for (let attempt = 0; attempt <= retry.maxRetries; attempt++) {
     try {
-      const response = await fetchWithTimeout(url, { ...options, headers });
+      const response = await fetchWithTimeout(url, { ...options, headers }, timeoutMs);
 
       // If response is OK, return it
       if (response.ok) {
         return response;
       }
 
-      // Sprint 20: Handle 401 with automatic token refresh
+      // Sprint 20/31: Handle 401 with automatic token refresh (using singleton)
       if (response.status === 401 && !_isRefreshRetry) {
-        const refreshToken = localStorage.getItem("refresh_token");
-        if (refreshToken) {
-          console.log("[API] Access token expired, attempting refresh...");
-          try {
-            const refreshUrl = buildUrl("/api/auth/refresh");
-            const refreshResponse = await fetchWithTimeout(refreshUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ refresh_token: refreshToken }),
-            });
-
-            if (refreshResponse.ok) {
-              const data = await refreshResponse.json();
-              // Save new access token
-              localStorage.setItem("access_token", data.access_token);
-              console.log("[API] Token refreshed successfully, retrying request...");
-              // Retry original request with new token (marked as refresh retry)
-              return apiFetch(path, options, retryOptions, true);
-            } else {
-              // Refresh failed - clear tokens and redirect to login
-              console.warn("[API] Token refresh failed, clearing session...");
-              localStorage.removeItem("access_token");
-              localStorage.removeItem("refresh_token");
-              localStorage.removeItem("user");
-              // Dispatch event for UI to handle logout
-              window.dispatchEvent(new CustomEvent("auth-session-expired"));
-            }
-          } catch (refreshErr) {
-            console.error("[API] Error during token refresh:", refreshErr);
-          }
+        console.log("[API] Access token expired, attempting refresh...");
+        const refreshSuccess = await refreshTokenSingleton();
+        if (refreshSuccess) {
+          console.log("[API] Token refreshed successfully, retrying request...");
+          // Retry original request with new token (marked as refresh retry)
+          return apiFetch(path, options, retryOptions, true, timeoutMs);
         }
+        // Refresh failed - session expired event was already dispatched by singleton
       }
 
       // Check if we should retry (for 5xx errors)
@@ -241,7 +282,8 @@ export async function apiFetch(
       }
 
       if (isAbortError(err)) {
-        const timeoutMsg = `Timeout en ${path}: El servidor no respondió en 30s. Verifica que el backend esté activo.`;
+        const timeoutSec = Math.round(timeoutMs / 1000);
+        const timeoutMsg = `Timeout en ${path}: El servidor no respondió en ${timeoutSec}s. Verifica que el backend esté activo.`;
         dispatchApiError(0, timeoutMsg, path);
         throw new Error(timeoutMsg);
       }
@@ -265,10 +307,91 @@ export async function apiFetch(
 export async function apiFetchJson<T>(
   path: string,
   options: RequestInit = {},
-  retryOptions?: RetryOptions
+  retryOptions?: RetryOptions,
+  timeoutMs = 30000  // Configurable timeout (default 30s, use 60000+ for runners)
 ): Promise<T> {
-  const response = await apiFetch(path, options, retryOptions);
+  const response = await apiFetch(path, options, retryOptions, false, timeoutMs);
   return (await response.json()) as T;
+}
+
+// =============================================================================
+// Fase 1.5 — Code ID Transition (Admin / Maintenance)
+// =============================================================================
+
+export async function codeIdStatus(project: string): Promise<any> {
+  return apiFetchJson(`/api/admin/code-id/status?project=${encodeURIComponent(project)}`);
+}
+
+export async function codeIdInconsistencies(project: string, limit = 50): Promise<any> {
+  return apiFetchJson(
+    `/api/admin/code-id/inconsistencies?project=${encodeURIComponent(project)}&limit=${encodeURIComponent(
+      String(limit)
+    )}`
+  );
+}
+
+export async function codeIdBackfill(
+  project: string,
+  payload: {
+    mode: "code_id" | "canonical_code_id" | "all";
+    dry_run: boolean;
+    confirm: boolean;
+    batch_size: number;
+  }
+): Promise<any> {
+  return apiFetchJson(`/api/admin/code-id/backfill?project=${encodeURIComponent(project)}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function codeIdRepair(
+  project: string,
+  payload: {
+    action: "derive_text_from_id" | "derive_id_from_text" | "fix_self_pointing_mapped";
+    dry_run: boolean;
+    confirm: boolean;
+    batch_size: number;
+  }
+): Promise<any> {
+  return apiFetchJson(`/api/admin/code-id/repair?project=${encodeURIComponent(project)}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+// =============================================================================
+// Ontology Freeze (pre-axialidad)
+// =============================================================================
+
+export async function ontologyFreezeStatus(project: string): Promise<any> {
+  return apiFetchJson(`/api/admin/ontology/freeze?project=${encodeURIComponent(project)}`);
+}
+
+export async function ontologyFreezeSet(
+  project: string,
+  payload: {
+    note?: string | null;
+  }
+): Promise<any> {
+  return apiFetchJson(`/api/admin/ontology/freeze/freeze?project=${encodeURIComponent(project)}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function ontologyFreezeBreak(
+  project: string,
+  payload: {
+    confirm: boolean;
+    phrase: string;
+    note?: string | null;
+  }
+): Promise<any> {
+  return apiFetchJson(`/api/admin/ontology/freeze/break?project=${encodeURIComponent(project)}`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function deleteFileData(project: string, file: string): Promise<any> {
@@ -276,6 +399,91 @@ export async function deleteFileData(project: string, file: string): Promise<any
     method: "POST",
     body: JSON.stringify({ project, file }),
   });
+}
+
+// =============================================================================
+// Admin Ops Panel (Ergonomía operativa)
+// =============================================================================
+
+export type AdminOpsOutcome = "OK" | "NOOP" | "ERROR" | "UNKNOWN";
+
+export type AdminOpsRun = {
+  request_id: string;
+  session_id?: string;
+  project_id?: string;
+  timestamp?: string;
+  path?: string;
+  http_method?: string;
+  status_code?: number;
+  duration_ms?: number;
+  event?: string;
+  is_error?: boolean;
+  dry_run?: boolean;
+  confirm?: boolean;
+  batch_size?: number;
+  mode?: string;
+  action?: string;
+  updated?: any;
+  admin_id?: string;
+};
+
+export type AdminOpsFilters = {
+  kind?: "all" | "errors" | "mutations";
+  op?: "all" | "backfill" | "repair" | "sync" | "maintenance" | "ontology";
+  intent?: "all" | "write_intent_post";
+  since?: string; // ISO
+  until?: string; // ISO
+};
+
+export async function adminOpsRecent(
+  project: string,
+  limit = 20,
+  filters: AdminOpsFilters = {}
+): Promise<{ runs: AdminOpsRun[] }> {
+  const params = new URLSearchParams();
+  params.set("project", project);
+  params.set("limit", String(limit));
+  if (filters.kind) params.set("kind", filters.kind);
+  if (filters.op) params.set("op", filters.op);
+  if (filters.intent) params.set("intent", filters.intent);
+  if (filters.since) params.set("since", filters.since);
+  if (filters.until) params.set("until", filters.until);
+  return apiFetchJson(`/api/admin/ops/recent?${params.toString()}`);
+}
+
+export async function adminOpsLog(
+  project: string,
+  session: string,
+  requestId?: string,
+  tail = 400
+): Promise<{ records: any[] }> {
+  const rid = requestId ? `&request_id=${encodeURIComponent(requestId)}` : "";
+  return apiFetchJson(
+    `/api/admin/ops/log?project=${encodeURIComponent(project)}&session=${encodeURIComponent(session)}${rid}&tail=${encodeURIComponent(
+      String(tail)
+    )}`
+  );
+}
+
+// Ejecuta un POST admin con headers extra (p.ej. X-Session-ID único por ejecución)
+export async function adminPostJson<T>(
+  path: string,
+  payload: any,
+  extraHeaders: Record<string, string> = {},
+  timeoutMs = 60000
+): Promise<T> {
+  return apiFetchJson<T>(
+    path,
+    {
+      method: "POST",
+      headers: {
+        ...(extraHeaders || {}),
+      },
+      body: JSON.stringify(payload),
+    },
+    undefined,
+    timeoutMs
+  );
 }
 
 // =============================================================================
@@ -664,9 +872,6 @@ export async function graphragQuery(request: GraphRAGRequest): Promise<GraphRAGR
   });
 }
 
-/**
- * Discovery search with positive/negative/target triplet.
- */
 export async function discoverSearch(request: DiscoverRequest): Promise<DiscoverResponse> {
   return apiFetchJson<DiscoverResponse>("/api/search/discover", {
     method: "POST",
@@ -1166,11 +1371,13 @@ export interface CandidateCode {
   fuente_origen: string;
   fuente_detalle?: string;
   score_confianza?: number;
-  estado: "pendiente" | "validado" | "rechazado" | "fusionado";
+  estado: "pendiente" | "hipotesis" | "validado" | "rechazado" | "fusionado";
   validado_por?: string;
   validado_en?: string;
   fusionado_a?: string;
   memo?: string;
+  promovido_por?: string;
+  promovido_en?: string;
   created_at?: string;
 }
 
@@ -1190,8 +1397,15 @@ export interface CreateCandidateRequest {
 /** Estadísticas de candidatos por origen */
 export interface CandidateStats {
   by_source: Record<string, Record<string, number>>;
+  by_source_unique?: Record<string, Record<string, number>>;
   totals: Record<string, number>;
   total_candidatos: number;
+  unique_totals?: Record<string, number>;
+  unique_total_codigos?: number;
+  validated_promoted_total?: number;
+  validated_unpromoted_total?: number;
+  validated_promoted_unique?: number;
+  validated_unpromoted_unique?: number;
 }
 
 /** Historial de versiones de un código (codigo_versiones) */
@@ -1245,6 +1459,7 @@ export async function listCandidates(
     estado?: string;
     fuente_origen?: string;
     archivo?: string;
+    promovido?: boolean;
     limit?: number;
     offset?: number;
     sort_order?: "asc" | "desc";
@@ -1257,6 +1472,7 @@ export async function listCandidates(
   if (options?.estado) params.append("estado", options.estado);
   if (options?.fuente_origen) params.append("fuente_origen", options.fuente_origen);
   if (options?.archivo) params.append("archivo", options.archivo);
+  if (typeof options?.promovido === "boolean") params.append("promovido", String(options.promovido));
   if (options?.limit) {
     // Backend enforces `limit <= 500` (FastAPI Query validation). Clamp client-side to avoid 422.
     const safeLimit = Math.max(1, Math.min(500, Number(options.limit)));
@@ -1302,14 +1518,94 @@ export async function rejectCandidate(
 export async function mergeCandidates(
   project: string,
   sourceIds: number[],
-  targetCodigo: string
-): Promise<{ success: boolean; merged_count: number; target_codigo: string }> {
+  targetCodigo: string,
+  options?: { memo?: string; dry_run?: boolean; idempotency_key?: string | null }
+): Promise<{ success: boolean; merged_count: number; target_codigo: string; dry_run?: boolean }> {
+  const idempotencyKey =
+    options?.idempotency_key ?? `ui-merge-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   return apiFetchJson("/api/codes/candidates/merge", {
     method: "POST",
     body: JSON.stringify({
       project,
       source_ids: sourceIds,
       target_codigo: targetCodigo,
+      memo: options?.memo,
+      dry_run: Boolean(options?.dry_run),
+      idempotency_key: idempotencyKey,
+    }),
+  });
+}
+
+/** Pair for auto-merge operation */
+export interface AutoMergePair {
+  source_codigo: string;
+  target_codigo: string;
+}
+
+/** Response for auto-merge operation */
+export interface AutoMergeResponse {
+  success: boolean;
+  total_merged: number;
+  pairs_processed: number;
+  dry_run?: boolean;
+  details: Array<{
+    source: string;
+    target: string;
+    merged_count: number;
+    skipped?: string;
+    dry_run?: boolean;
+    details?: unknown;
+  }>;
+}
+
+/**
+ * Fusiona masivamente pares de códigos duplicados por nombre.
+ * Más robusto que merge por IDs porque busca directamente por nombre de código.
+ */
+export async function autoMergeCandidates(
+  project: string,
+  pairs: AutoMergePair[],
+  options?: { memo?: string; dry_run?: boolean; idempotency_key?: string | null }
+): Promise<AutoMergeResponse> {
+  const idempotencyKey =
+    options?.idempotency_key ?? `ui-auto-merge-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  return apiFetchJson<AutoMergeResponse>("/api/codes/candidates/auto-merge", {
+    method: "POST",
+    body: JSON.stringify({
+      project,
+      pairs,
+      memo: options?.memo,
+      dry_run: Boolean(options?.dry_run),
+      idempotency_key: idempotencyKey,
+    }),
+  });
+}
+
+export interface RevertValidatedCandidatesResponse {
+  success: boolean;
+  project: string;
+  dry_run: boolean;
+  reverted_count?: number;
+  would_revert?: number;
+}
+
+/**
+ * Revierte todos los candidatos con estado 'validado' a 'pendiente' (por proyecto).
+ * Nota: no afecta códigos ya promovidos a tablas definitivas.
+ */
+export async function revertValidatedCandidates(
+  project: string,
+  options?: { memo?: string; dry_run?: boolean }
+): Promise<RevertValidatedCandidatesResponse> {
+  if (!project || !project.trim()) {
+    throw new Error("Missing required 'project' for revertValidatedCandidates");
+  }
+  return apiFetchJson<RevertValidatedCandidatesResponse>("/api/codes/candidates/revert-validated", {
+    method: "POST",
+    body: JSON.stringify({
+      project: project.trim(),
+      memo: options?.memo,
+      dry_run: Boolean(options?.dry_run),
     }),
   });
 }
@@ -1413,13 +1709,21 @@ export async function searchGrouped(
  */
 export async function promoteCandidates(
   project: string,
-  candidateIds: number[]
-): Promise<{ success: boolean; promoted_count: number }> {
+  options?: { candidateIds?: number[]; promoteAllValidated?: boolean }
+): Promise<{
+  success: boolean;
+  promoted_count: number;
+  validated_total?: number;
+  eligible_total?: number;
+  skipped_total?: number;
+  mode?: string;
+}> {
   return apiFetchJson("/api/codes/candidates/promote", {
     method: "POST",
     body: JSON.stringify({
       project,
-      candidate_ids: candidateIds,
+      candidate_ids: options?.candidateIds ?? [],
+      promote_all_validated: Boolean(options?.promoteAllValidated),
     }),
   });
 }
@@ -1527,6 +1831,10 @@ export interface BatchCheckResult {
   codigo: string;
   has_similar: boolean;
   similar: Array<{ existing: string; similarity: number }>;
+  /** True si el mismo batch trae duplicados (por normalización) */
+  duplicate_in_batch?: boolean;
+  /** Tamaño del grupo normalizado dentro del batch */
+  batch_group_size?: number;
 }
 
 /** Response for batch check */
@@ -1537,6 +1845,72 @@ export interface CheckBatchCodesResponse {
   has_any_similar: boolean;
   checked_count: number;
   existing_count: number;
+  /** Métricas opcionales para prevenir "batch blindness" */
+  batch_unique_count?: number;
+  batch_duplicate_groups?: number;
+  batch_duplicates_total?: number;
+}
+
+// =============================================================================
+// Runner IA (solo propuestas): planes de merge auditables por run_id
+// =============================================================================
+
+export type AiPlanMergePair = {
+  source_codigo: string;
+  target_codigo: string;
+  similarity: number;
+  reason?: string;
+};
+
+export type AiPlanMergesResponse = {
+  project: string;
+  run_id: string;
+  threshold: number;
+  input_count: number;
+  pairs_count: number;
+  pairs: AiPlanMergePair[];
+};
+
+export type AiMergePlanRecord = {
+  run_id: string;
+  project_id: string;
+  created_at: string;
+  created_by?: string | null;
+  source?: string | null;
+  threshold?: number | null;
+  input_codigos?: string[];
+  pairs?: AiPlanMergePair[];
+  meta?: Record<string, unknown>;
+};
+
+export async function aiPlanMerges(
+  project: string,
+  codigos: string[],
+  threshold: number,
+  limit: number = 200,
+  source: string = "ui",
+): Promise<AiPlanMergesResponse> {
+  return apiFetchJson<AiPlanMergesResponse>("/api/codes/candidates/ai/plan-merges", {
+    method: "POST",
+    body: JSON.stringify({ project, codigos, threshold, limit, source }),
+  }, undefined, 60000);
+}
+
+export async function getAiMergePlan(project: string, runId: string): Promise<AiMergePlanRecord> {
+  const qs = new URLSearchParams({ project });
+  return apiFetchJson<AiMergePlanRecord>(
+    `/api/codes/candidates/ai/plan-merges/${encodeURIComponent(runId)}?${qs.toString()}`,
+  );
+}
+
+export async function listAiMergePlans(
+  project: string,
+  limit: number = 20,
+): Promise<{ project: string; plans: AiMergePlanRecord[]; count: number }> {
+  const qs = new URLSearchParams({ project, limit: String(limit) });
+  return apiFetchJson<{ project: string; plans: AiMergePlanRecord[]; count: number }>(
+    `/api/codes/candidates/ai/plan-merges?${qs.toString()}`,
+  );
 }
 
 /**

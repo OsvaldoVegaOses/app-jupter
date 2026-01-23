@@ -221,15 +221,18 @@ CREATE TABLE IF NOT EXISTS analisis_nucleo_notas (
 
 CREATE TABLE IF NOT EXISTS codigo_versiones (
     id SERIAL PRIMARY KEY,
-    codigo_id INTEGER,
-    proyecto TEXT,
-    codigo TEXT,
-    definicion_anterior TEXT,
-    definicion_nueva TEXT,
-    changed_by UUID,
-    changed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    reason TEXT
+    project_id TEXT NOT NULL,
+    codigo TEXT NOT NULL,
+    version INT NOT NULL DEFAULT 1,
+    memo_anterior TEXT,
+    memo_nuevo TEXT,
+    accion TEXT NOT NULL DEFAULT 'create',
+    changed_by TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS ix_cv_project_codigo ON codigo_versiones(project_id, codigo);
+CREATE INDEX IF NOT EXISTS ix_cv_created_at ON codigo_versiones(created_at);
 
 -- =============================================================================
 -- VERIFICATION

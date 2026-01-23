@@ -269,27 +269,36 @@ def load_settings(env_file: Optional[str | os.PathLike[str]] = None) -> AppSetti
         transcribe_api_version=os.getenv("AZURE_OPENAI_TRANSCRIBE_API_VERSION", "2025-03-01-preview"),
     )
 
-    # Qdrant (vectores)
+    # Qdrant (vectores) - REQUIRED: no fallback a localhost para producción
+    qdrant_uri = os.getenv("QDRANT_URI")
+    if not qdrant_uri:
+        raise ValueError("QDRANT_URI not set - required for cloud deployment (no localhost fallback)")
     qdrant = QdrantSettings(
-        uri=os.getenv("QDRANT_URI", "http://localhost:6333"),
+        uri=qdrant_uri,
         api_key=os.getenv("QDRANT_API_KEY"),
         collection=os.getenv("QDRANT_COLLECTION", "fragmentos"),
         timeout=int(os.getenv("QDRANT_TIMEOUT", "30")),
         batch_size=int(os.getenv("QDRANT_BATCH_SIZE", "20")),
     )
 
-    # Neo4j (grafo)
+    # Neo4j (grafo) - REQUIRED: no fallback a localhost para producción
+    neo4j_uri = os.getenv("NEO4J_URI")
+    if not neo4j_uri:
+        raise ValueError("NEO4J_URI not set - required for cloud deployment (no localhost fallback)")
     neo4j = Neo4jSettings(
-        uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        uri=neo4j_uri,
         username=os.getenv("NEO4J_USERNAME", "neo4j"),
         password=os.getenv("NEO4J_PASSWORD"),
         database=os.getenv("NEO4J_DATABASE", "neo4j"),
     )
 
-    # PostgreSQL (códigos y proyectos)
+    # PostgreSQL (códigos y proyectos) - REQUIRED: no fallback a localhost para producción
     # Soporta tanto POSTGRES_* como PG* para compatibilidad
+    pg_host = os.getenv("POSTGRES_HOST") or os.getenv("PGHOST")
+    if not pg_host:
+        raise ValueError("PGHOST/POSTGRES_HOST not set - required for cloud deployment (no localhost fallback)")
     postgres = PostgresSettings(
-        host=os.getenv("POSTGRES_HOST") or os.getenv("PGHOST", "localhost"),
+        host=pg_host,
         port=int(os.getenv("POSTGRES_PORT") or os.getenv("PGPORT", "5432")),
         username=os.getenv("POSTGRES_USER") or os.getenv("PGUSER", "postgres"),
         password=os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD"),

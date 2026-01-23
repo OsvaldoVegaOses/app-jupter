@@ -354,6 +354,20 @@ def sync_axial_relationships(
     if not rows:
         return {"synced": 0, "skipped": 0, "remaining": 0, "offset": offset}
 
+    # Canonicalize codes (best-effort) to avoid pushing merged aliases into Neo4j.
+    try:
+        from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigos_bulk
+
+        ensure_codes_catalog_table(clients.postgres)
+        idx_codigo_tmp = select_fields.index("codigo") if "codigo" in select_fields else None
+        if idx_codigo_tmp is not None:
+            unique_codes = {str(r[idx_codigo_tmp]).strip() for r in rows if r and r[idx_codigo_tmp]}
+            canon_map = resolve_canonical_codigos_bulk(clients.postgres, project, unique_codes)
+        else:
+            canon_map = {}
+    except Exception:
+        canon_map = {}
+
     def _get_idx(name: str) -> Optional[int]:
         return select_fields.index(name) if name in select_fields else None
 
@@ -372,6 +386,9 @@ def sync_axial_relationships(
         project_id = row[idx_project] if idx_project is not None else project
         categoria = row[idx_categoria]
         codigo = row[idx_codigo]
+        if codigo is not None:
+            codigo_s = str(codigo).strip()
+            codigo = canon_map.get(codigo_s, codigo_s)
         relacion = None
         if idx_relacion is not None:
             relacion = row[idx_relacion]

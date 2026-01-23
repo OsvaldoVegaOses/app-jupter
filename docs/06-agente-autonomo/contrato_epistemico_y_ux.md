@@ -52,6 +52,7 @@ En cualitativa aplicada, la app debe soportar al menos estas posturas (a veces c
 
 ### Neo4j (memoria topológica)
 - Función epistémica: **explicabilidad estructural** (categorías↔códigos↔evidencias; comunidades/centralidad).
+- Rol de verdad: **proyección derivada y mutable** (vista analítica). Puede recalcularse/reconstruirse desde PostgreSQL; no reemplaza al ledger.
 - UX: soporta “micro-teoría del caso” y luego comparativo entre casos.
 
 ### LLM (motor abductivo)
@@ -65,6 +66,13 @@ En cualitativa aplicada, la app debe soportar al menos estas posturas (a veces c
 ---
 
 ## 4) Reglas metodológicas convertidas en invariantes de producto
+
+### Invariante 0 — Resolución canónica obligatoria (anti-contaminación)
+Toda operación que escriba o consuma códigos “con efectos” (promoción, axial, GDS/algoritmos, sincronización a grafo) debe pasar por el **resolver canónico**:
+- Si un código está `merged` (o apunta a un canónico), se utiliza el **canónico**.
+- Los nodos/relaciones de códigos `merged` no deben entrar a proyecciones/algoritmos (evitar duplicidad y sesgo en centralidad/comunidades).
+
+Implicancia: PostgreSQL sostiene el estado ontológico; Neo4j materializa la vista (y puede rehacerse).
 
 ### Invariante 1 — Nada sin evidencia
 Cualquier código sugerido debe incluir 1–3 fragmentos evidenciales o quedar marcado como “sin evidencia” y no ser promovible.
@@ -162,6 +170,8 @@ Neo4j debe entrar **después** de E3, cuando ya existe suficiente material valid
 - `codigo` consolidado (idealmente promovido a definitivo), y
 - evidencia citada (IDs de fragmentos) para cada relación.
 
+**Regla de higiene**: antes de escribir o proyectar, resolver siempre el **código canónico** y excluir códigos `merged` de análisis/algoritmos.
+
 Aplicación práctica:
 - E3 (modo Caso) → construir “micro-grafo del caso” (código ↔ fragmento ↔ memo) sin inferencias fuertes.
 - E4 (comparativo) → recién aquí permitir aristas entre entrevistas/códigos, con evidencia cruzada y trazabilidad.
@@ -194,3 +204,8 @@ El punto clave no es que la app “imponga” eso, sino que la UX:
 - Evidencia en runner: `docs/06-agente-autonomo/analisis_algoritmo_link_codes_to_fragments.md`
 - Auditoría de Discovery: `docs/06-agente-autonomo/auditoria_calidad_discovery.md`
 - Ejemplo de informe: `docs/06-agente-autonomo/informe_runner_avance_jd009.md`
+
+### Roadmap (identidad estable de conceptos)
+Si el volumen de merges crece, considerar evolucionar de `codigo` (texto) a una identidad estable (`code_id`) y registrar merges como eventos:
+- `code_id` (concepto), `canonical_code_id` (puntero), y `code_merge_events` (quién/cuándo/por qué).
+- Mantener compatibilidad: el UI puede seguir mostrando `codigo` (label), mientras el backend resuelve por ID.

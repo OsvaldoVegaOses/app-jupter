@@ -52,12 +52,31 @@ import logging
 
 _logger = logging.getLogger(__name__)
 
+
+def ensure_unaccent(pg_conn: PGConnection) -> bool:
+    """Habilita la extensión unaccent si no existe (normalización de texto)."""
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent;")
+        pg_conn.commit()
+        return True
+    except Exception as exc:
+        _logger.warning("unaccent.not_available", extra={"error": str(exc)})
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+        return False
+
 # Guard flags to avoid re-running heavy DDL on every request (helps prevent
 # statement timeouts when PG has a low statement_timeout).
 _fragment_table_ready = False
 _fragment_table_lock = threading.Lock()
 _open_coding_table_ready = False
 _open_coding_table_lock = threading.Lock()
+
+_codes_catalog_table_ready = False
+_codes_catalog_table_lock = threading.Lock()
 
 Row = Tuple[
     str,  # project_id
@@ -1628,13 +1647,233 @@ def ensure_open_coding_table(pg: PGConnection) -> None:
         with pg.cursor() as cur:
             cur.execute(sql)
         pg.commit()
+
         _open_coding_table_ready = True
 
 
-def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
-    data = list(rows)
-    if not data:
+def ensure_codes_catalog_table(pg: PGConnection) -> None:
+    """Catálogo ontológico de códigos (definitivos).
+
+    Mantiene estado post-fusión (active/merged/deprecated) y un puntero canónico.
+    Diseñado para coexistir con `analisis_codigos_abiertos` sin romper compatibilidad.
+    """
+
+    global _codes_catalog_table_ready
+    if _codes_catalog_table_ready:
         return
+
+    with _codes_catalog_table_lock:
+        if _codes_catalog_table_ready:
+            return
+
+        sql = """
+        CREATE TABLE IF NOT EXISTS catalogo_codigos (
+          project_id TEXT NOT NULL,
+          codigo TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          canonical_codigo TEXT,
+          merged_at TIMESTAMPTZ,
+          merged_by TEXT,
+          memo TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (project_id, codigo)
+        );
+
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint WHERE conname = 'ck_catalogo_codigos_status'
+                    ) THEN
+                        ALTER TABLE catalogo_codigos
+                            ADD CONSTRAINT ck_catalogo_codigos_status
+                            CHECK (status IN ('active','merged','deprecated'));
+                    END IF;
+                END $$;
+
+        CREATE INDEX IF NOT EXISTS ix_catalogo_project_status ON catalogo_codigos(project_id, status);
+        CREATE INDEX IF NOT EXISTS ix_catalogo_project_canonical ON catalogo_codigos(project_id, canonical_codigo);
+
+        CREATE OR REPLACE FUNCTION update_catalogo_codigos_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = NOW();
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        DROP TRIGGER IF EXISTS trg_catalogo_codigos_updated_at ON catalogo_codigos;
+        CREATE TRIGGER trg_catalogo_codigos_updated_at
+            BEFORE UPDATE ON catalogo_codigos
+            FOR EACH ROW
+            EXECUTE FUNCTION update_catalogo_codigos_updated_at();
+
+        -- Backfill best-effort: asegurar entradas para códigos ya existentes (definitivos).
+        INSERT INTO catalogo_codigos (project_id, codigo, status)
+        SELECT DISTINCT project_id, codigo, 'active'
+          FROM analisis_codigos_abiertos
+         WHERE project_id IS NOT NULL AND codigo IS NOT NULL
+        ON CONFLICT (project_id, codigo) DO NOTHING;
+        """
+
+        with pg.cursor() as cur:
+            cur.execute(sql)
+        pg.commit()
+
+        _codes_catalog_table_ready = True
+
+
+def ensure_code_catalog_entry(
+    pg: PGConnection,
+    project_id: str,
+    codigo: str,
+    *,
+    status: str = "active",
+) -> None:
+    """Crea (si falta) una fila en `catalogo_codigos` para un código."""
+    if not codigo or not str(codigo).strip():
+        return
+
+    ensure_codes_catalog_table(pg)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO catalogo_codigos (project_id, codigo, status)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (project_id, codigo) DO NOTHING
+            """,
+            (project_id, str(codigo).strip(), status),
+        )
+
+
+def resolve_canonical_codigo(
+    pg: PGConnection,
+    project_id: str,
+    codigo: str,
+    *,
+    max_hops: int = 10,
+) -> str:
+    """Resuelve un código hacia su canónico siguiendo `catalogo_codigos`.
+
+    Si no existe entrada, retorna el mismo código.
+    """
+    if not codigo or not str(codigo).strip():
+        return str(codigo)
+
+    ensure_codes_catalog_table(pg)
+
+    current = str(codigo).strip()
+    seen: set[str] = set()
+    for _ in range(max_hops):
+        if current in seen:
+            break
+        seen.add(current)
+
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, canonical_codigo
+                  FROM catalogo_codigos
+                 WHERE project_id = %s AND codigo = %s
+                """,
+                (project_id, current),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            return current
+
+        status, canonical_codigo = row[0], row[1]
+        if status == "merged" and canonical_codigo and str(canonical_codigo).strip():
+            nxt = str(canonical_codigo).strip()
+            if nxt.lower() == current.lower():
+                return current
+            current = nxt
+            continue
+        return current
+
+    return current
+
+
+def resolve_canonical_codigos_bulk(
+    pg: PGConnection,
+    project_id: str,
+    codigos: Iterable[str],
+    *,
+    max_hops: int = 10,
+) -> Dict[str, str]:
+    """Resuelve múltiples códigos a su canónico (mejor performance que per-row)."""
+    ensure_codes_catalog_table(pg)
+
+    origins: List[str] = []
+    for c in codigos:
+        if c is None:
+            continue
+        s = str(c).strip()
+        if not s:
+            continue
+        origins.append(s)
+    if not origins:
+        return {}
+
+    # Track current canonical candidate per origin.
+    current: Dict[str, str] = {o: o for o in origins}
+
+    for _ in range(int(max_hops) if max_hops and max_hops > 0 else 1):
+        uniques = sorted(set(current.values()))
+        if not uniques:
+            break
+
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                SELECT codigo, status, canonical_codigo
+                  FROM catalogo_codigos
+                 WHERE project_id = %s
+                   AND codigo = ANY(%s)
+                """,
+                (project_id, uniques),
+            )
+            rows = cur.fetchall() or []
+
+        info: Dict[str, Tuple[Optional[str], Optional[str]]] = {
+            str(r[0]): (r[1], r[2]) for r in rows if r and r[0] is not None
+        }
+
+        changed = False
+        for origin, cur_code in list(current.items()):
+            status, canonical = info.get(cur_code, (None, None))
+            if status == "merged" and canonical and str(canonical).strip():
+                nxt = str(canonical).strip()
+            else:
+                nxt = cur_code
+            if nxt != cur_code:
+                current[origin] = nxt
+                changed = True
+
+        if not changed:
+            break
+
+    return current
+
+
+
+def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
+    """
+    Inserta o actualiza códigos abiertos.
+    
+    IMPORTANTE: Filtra automáticamente registros con fragmento_id vacío o None
+    para mantener la coherencia de datos.
+    """
+    # Filtrar registros con fragmento_id inválido
+    valid_data = [
+        row for row in rows 
+        if row[1] is not None and row[1] != '' and len(str(row[1])) > 10
+    ]
+    
+    if not valid_data:
+        return
+        
     sql = """
     INSERT INTO analisis_codigos_abiertos (
         project_id,
@@ -1653,7 +1892,149 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
         created_at = analisis_codigos_abiertos.created_at;
     """
     with pg.cursor() as cur:
-        execute_values(cur, sql, data, page_size=200)
+        execute_values(cur, sql, valid_data, page_size=200)
+
+
+def merge_definitive_codes_by_code(
+    pg: PGConnection,
+    project_id: str,
+    source_codigo: str,
+    target_codigo: str,
+    merged_by: Optional[str] = None,
+    memo: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fusiona códigos definitivos (evidencia) y actualiza ontología en `catalogo_codigos`.
+
+    - Mueve filas de `analisis_codigos_abiertos` desde `source_codigo` hacia `target_codigo`
+      cuando no hay conflicto por (project_id, fragmento_id, codigo).
+    - Elimina duplicados restantes (cuando el target ya tiene la misma evidencia).
+    - Marca el source como `merged` apuntando al target canónico.
+    """
+    ensure_open_coding_table(pg)
+    ensure_codes_catalog_table(pg)
+
+    if not source_codigo or not target_codigo:
+        raise ValueError("Se requieren source_codigo y target_codigo")
+
+    src = str(source_codigo).strip()
+    tgt_input = str(target_codigo).strip()
+    if not src or not tgt_input:
+        raise ValueError("Se requieren source_codigo y target_codigo")
+
+    if src.lower() == tgt_input.lower():
+        return {
+            "project": project_id,
+            "source": src,
+            "target": tgt_input,
+            "skipped": "self",
+            "moved_rows": 0,
+            "dedup_deleted": 0,
+        }
+
+    # Si el target ya está fusionado, apuntar al canónico final.
+    tgt = resolve_canonical_codigo(pg, project_id, tgt_input)
+
+    ensure_code_catalog_entry(pg, project_id, src)
+    ensure_code_catalog_entry(pg, project_id, tgt)
+
+    moved_rows = 0
+    dedup_deleted = 0
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            WITH updated AS (
+                UPDATE analisis_codigos_abiertos src
+                   SET codigo = %s
+                 WHERE src.project_id = %s
+                   AND src.codigo = %s
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM analisis_codigos_abiertos tgt
+                        WHERE tgt.project_id = src.project_id
+                          AND tgt.fragmento_id = src.fragmento_id
+                          AND tgt.codigo = %s
+                   )
+                 RETURNING 1
+            )
+            SELECT COUNT(*)::INT FROM updated
+            """,
+            (tgt, project_id, src, tgt),
+        )
+        moved_rows = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute(
+            """
+            WITH deleted AS (
+                DELETE FROM analisis_codigos_abiertos src
+                 WHERE src.project_id = %s
+                   AND src.codigo = %s
+                   AND EXISTS (
+                       SELECT 1
+                         FROM analisis_codigos_abiertos tgt
+                        WHERE tgt.project_id = src.project_id
+                          AND tgt.fragmento_id = src.fragmento_id
+                          AND tgt.codigo = %s
+                   )
+                 RETURNING 1
+            )
+            SELECT COUNT(*)::INT FROM deleted
+            """,
+            (project_id, src, tgt),
+        )
+        dedup_deleted = int((cur.fetchone() or [0])[0] or 0)
+
+        cur.execute(
+            """
+            UPDATE catalogo_codigos
+               SET status = 'merged',
+                   canonical_codigo = %s,
+                   merged_at = NOW(),
+                   merged_by = %s,
+                   memo = COALESCE(%s, memo)
+             WHERE project_id = %s AND codigo = %s
+            """,
+            (tgt, merged_by, memo, project_id, src),
+        )
+
+        # Asegurar que el target quede activo.
+        cur.execute(
+            """
+            UPDATE catalogo_codigos
+               SET status = 'active',
+                   canonical_codigo = NULL
+             WHERE project_id = %s AND codigo = %s
+            """,
+            (project_id, tgt),
+        )
+
+    pg.commit()
+
+    # Best-effort audit trail
+    try:
+        previous_src = _get_latest_code_memo(pg, project_id, src)
+        log_code_version(
+            pg,
+            project=project_id,
+            codigo=src,
+            accion="definitive_merge",
+            memo_anterior=previous_src,
+            memo_nuevo=(
+                f"merged_into:{tgt}; moved_rows:{moved_rows}; dedup_deleted:{dedup_deleted}"
+                + (f"\n{str(memo).strip()}" if memo and str(memo).strip() else "")
+            ),
+            changed_by=merged_by,
+        )
+    except Exception:
+        pass
+
+    return {
+        "project": project_id,
+        "source": src,
+        "target": tgt,
+        "moved_rows": int(moved_rows or 0),
+        "dedup_deleted": int(dedup_deleted or 0),
+    }
     pg.commit()
 
 
@@ -1700,11 +2081,128 @@ def ensure_code_versions_table(pg: PGConnection) -> None:
       changed_by TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-    CREATE INDEX IF NOT EXISTS ix_cv_project_codigo ON codigo_versiones(project_id, codigo);
-    CREATE INDEX IF NOT EXISTS ix_cv_created_at ON codigo_versiones(created_at);
     """
+
     with pg.cursor() as cur:
+        # Create base table (new schema) if missing
         cur.execute(sql)
+
+        # --- Compatibilidad con esquemas legacy (p.ej. scripts/init_schema.sql) ---
+        # Si la tabla ya existe con columnas distintas, CREATE TABLE IF NOT EXISTS
+        # no aplica cambios. Por eso añadimos columnas nuevas y hacemos backfill.
+        cur.execute(
+            """
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS project_id TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS codigo TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS version INT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS memo_anterior TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS memo_nuevo TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS accion TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS changed_by TEXT;
+            ALTER TABLE codigo_versiones ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+            """
+        )
+
+        # Convertir changed_by a TEXT si venía como UUID u otro tipo (best-effort)
+        try:
+            cur.execute(
+                "ALTER TABLE codigo_versiones ALTER COLUMN changed_by TYPE TEXT USING changed_by::text"
+            )
+        except Exception:
+            pass
+
+        # Conocer columnas existentes para backfill seguro.
+        cur.execute(
+            """
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'codigo_versiones'
+            """
+        )
+        cols = {str(r[0]) for r in (cur.fetchall() or [])}
+
+        # Backfill project_id desde columnas legacy (proyecto)
+        if "proyecto" in cols:
+            cur.execute(
+                """
+                UPDATE codigo_versiones
+                   SET project_id = COALESCE(project_id, proyecto)
+                 WHERE project_id IS NULL AND proyecto IS NOT NULL
+                """
+            )
+        # Backfill created_at desde changed_at
+        if "changed_at" in cols:
+            cur.execute(
+                """
+                UPDATE codigo_versiones
+                   SET created_at = COALESCE(created_at, changed_at)
+                 WHERE created_at IS NULL AND changed_at IS NOT NULL
+                """
+            )
+        # Backfill memos desde legacy definiciones/reason
+        if "definicion_anterior" in cols:
+            cur.execute(
+                """
+                UPDATE codigo_versiones
+                   SET memo_anterior = COALESCE(memo_anterior, definicion_anterior)
+                 WHERE memo_anterior IS NULL AND definicion_anterior IS NOT NULL
+                """
+            )
+        if "definicion_nueva" in cols:
+            cur.execute(
+                """
+                UPDATE codigo_versiones
+                   SET memo_nuevo = COALESCE(memo_nuevo, definicion_nueva)
+                 WHERE memo_nuevo IS NULL AND definicion_nueva IS NOT NULL
+                """
+            )
+        if "reason" in cols:
+            cur.execute(
+                """
+                UPDATE codigo_versiones
+                   SET memo_nuevo = COALESCE(memo_nuevo, reason)
+                 WHERE memo_nuevo IS NULL AND reason IS NOT NULL
+                """
+            )
+
+        # Backfill accion si está vacío
+        cur.execute(
+            """
+            UPDATE codigo_versiones
+               SET accion = COALESCE(NULLIF(accion, ''), 'legacy')
+             WHERE accion IS NULL OR accion = ''
+            """
+        )
+
+        # Backfill version si falta
+        cur.execute(
+            """
+            WITH ranked AS (
+              SELECT
+                id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY COALESCE(project_id, 'default'), codigo
+                  ORDER BY COALESCE(created_at, NOW()), id
+                ) AS rn
+              FROM codigo_versiones
+              WHERE codigo IS NOT NULL AND codigo <> ''
+            )
+            UPDATE codigo_versiones cv
+               SET version = ranked.rn
+              FROM ranked
+             WHERE cv.id = ranked.id
+               AND (cv.version IS NULL OR cv.version <= 0)
+            """
+        )
+
+        # Índices (idempotentes)
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_cv_project_codigo ON codigo_versiones(project_id, codigo);
+            CREATE INDEX IF NOT EXISTS ix_cv_created_at ON codigo_versiones(created_at);
+            """
+        )
+
     pg.commit()
 
 
@@ -1937,6 +2435,35 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
     data = list(rows)
     if not data:
         return
+
+    # Canonicalize codes to avoid contaminating axial/GDS with merged aliases.
+    # Note: `relacion` is a relation type (not a code) in current model.
+    ensure_codes_catalog_table(pg)
+    by_project_codes: Dict[str, set] = {}
+    for project_id, _cat, code, _rel, _archivo, _memo, _evidencia in data:
+        pid = str(project_id or "default")
+        if code is None:
+            continue
+        by_project_codes.setdefault(pid, set()).add(str(code).strip())
+
+    by_project_map: Dict[str, Dict[str, str]] = {}
+    for pid, codes in by_project_codes.items():
+        by_project_map[pid] = resolve_canonical_codigos_bulk(pg, pid, codes)
+
+    canonicalized: List[AxialRow] = []
+    for project_id, cat, code, relacion, archivo, memo, evidencia in data:
+        pid = str(project_id or "default")
+        code_str = str(code).strip() if code is not None else ""
+        canon = by_project_map.get(pid, {}).get(code_str, code_str)
+        if canon:
+            try:
+                ensure_code_catalog_entry(pg, pid, canon)
+            except Exception:
+                # best-effort
+                pass
+        canonicalized.append((pid, cat, canon or code_str, relacion, archivo, memo, evidencia))
+
+    data = canonicalized
     cols = _pg_get_table_columns(pg, "analisis_axial")
 
     # Preferred/new schema path.
@@ -2477,25 +3004,29 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
     """
     clauses: List[str] = []
     params: List[Any] = []
-    clauses.append("project_id = %s")
+    clauses.append("aca.project_id = %s")
     params.append(project or "default")
     if search and search.strip():
-        clauses.append("codigo ILIKE %s")
+        clauses.append("aca.codigo ILIKE %s")
         params.append(f"%{search.strip()}%")
     if archivo and archivo.strip():
-        clauses.append("archivo = %s")
+        clauses.append("aca.archivo = %s")
         params.append(archivo.strip())
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
-    SELECT codigo,
+    SELECT aca.codigo,
            COUNT(*) AS citas,
-           COUNT(DISTINCT fragmento_id) AS fragmentos,
-           MIN(created_at) AS primera_cita,
-           MAX(created_at) AS ultima_cita
-      FROM analisis_codigos_abiertos
+                     COUNT(DISTINCT aca.fragmento_id) AS fragmentos,
+                     MIN(aca.created_at) AS primera_cita,
+                     MAX(aca.created_at) AS ultima_cita,
+           COALESCE(cc.status, 'active') AS status,
+           cc.canonical_codigo
+      FROM analisis_codigos_abiertos aca
+      LEFT JOIN catalogo_codigos cc
+        ON cc.project_id = aca.project_id AND cc.codigo = aca.codigo
       {where}
-     GROUP BY codigo
-     ORDER BY MAX(created_at) DESC NULLS LAST, codigo ASC
+     GROUP BY aca.codigo, cc.status, cc.canonical_codigo
+         ORDER BY MAX(aca.created_at) DESC NULLS LAST, aca.codigo ASC
      LIMIT %s
     """
     params.append(max(limit, 1))
@@ -2509,6 +3040,8 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
             "fragmentos": row[2],
             "primera_cita": row[3].isoformat().replace("+00:00", "Z") if row[3] else None,
             "ultima_cita": row[4].isoformat().replace("+00:00", "Z") if row[4] else None,
+            "status": row[5],
+            "canonical_codigo": row[6],
         }
         for row in rows
     ]
@@ -3704,12 +4237,257 @@ CandidateCodeRow = Tuple[
 
 _candidate_codes_table_ensured = False
 _candidate_codes_table_lock = threading.Lock()
+_candidate_codes_table_promote_migrated = False
+
+
+# =============================================================================
+# AI Runner: Merge Plans (audit by run_id)
+# =============================================================================
+
+_ai_merge_plans_table_ensured = False
+_ai_merge_plans_table_lock = threading.Lock()
+
+
+def ensure_ai_merge_plans_table(pg: PGConnection) -> None:
+    """Tabla durable para planes/propuestas de auto-merge (runner IA).
+
+    Objetivo: auditoría reproducible por `run_id`.
+    Nota: UUIDs se generan en Python (compat Azure PG).
+    """
+    global _ai_merge_plans_table_ensured
+    if _ai_merge_plans_table_ensured:
+        return
+
+    with _ai_merge_plans_table_lock:
+        if _ai_merge_plans_table_ensured:
+            return
+
+        sql = """
+        CREATE TABLE IF NOT EXISTS ai_merge_plans (
+            run_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            created_by TEXT,
+            source TEXT NOT NULL DEFAULT 'ui',
+            threshold FLOAT,
+            input_count INT,
+            pairs_count INT,
+            input_codigos JSONB,
+            pairs JSONB,
+            meta JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS ix_amp_project_created ON ai_merge_plans(project_id, created_at DESC);
+        """
+        with pg.cursor() as cur:
+            cur.execute(sql)
+        pg.commit()
+
+        _ai_merge_plans_table_ensured = True
+
+
+def insert_ai_merge_plan(
+    pg: PGConnection,
+    *,
+    run_id: str,
+    project_id: str,
+    created_by: Optional[str],
+    source: str,
+    threshold: float,
+    input_codigos: List[str],
+    pairs: List[Dict[str, Any]],
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Inserta un plan de merge IA (propuesta) para auditoría."""
+    ensure_ai_merge_plans_table(pg)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO ai_merge_plans (
+                run_id, project_id, created_by, source, threshold,
+                input_count, pairs_count, input_codigos, pairs, meta
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                run_id,
+                project_id,
+                created_by,
+                (source or "ui"),
+                float(threshold),
+                int(len(input_codigos)),
+                int(len(pairs)),
+                Json(input_codigos),
+                Json(pairs),
+                Json(meta) if meta is not None else None,
+            ),
+        )
+    pg.commit()
+
+
+def get_ai_merge_plan(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    run_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Obtiene un plan por run_id."""
+    ensure_ai_merge_plans_table(pg)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT run_id, project_id, created_by, source, threshold,
+                   input_count, pairs_count, input_codigos, pairs, meta, created_at
+              FROM ai_merge_plans
+             WHERE project_id = %s AND run_id = %s
+            """,
+            (project_id, run_id),
+        )
+        row = cur.fetchone()
+    pg.commit()
+    if not row:
+        return None
+
+    created_at = row[10]
+    return {
+        "run_id": row[0],
+        "project": row[1],
+        "created_by": row[2],
+        "source": row[3],
+        "threshold": float(row[4]) if row[4] is not None else None,
+        "input_count": int(row[5] or 0),
+        "pairs_count": int(row[6] or 0),
+        "input_codigos": row[7] or [],
+        "pairs": row[8] or [],
+        "meta": row[9],
+        "created_at": created_at.isoformat().replace("+00:00", "Z") if created_at else None,
+    }
+
+
+def list_ai_merge_plans(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Lista planes recientes (resumen) para un proyecto."""
+    ensure_ai_merge_plans_table(pg)
+    safe_limit = max(1, min(200, int(limit)))
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT run_id, created_by, source, threshold, input_count, pairs_count, created_at
+              FROM ai_merge_plans
+             WHERE project_id = %s
+             ORDER BY created_at DESC
+             LIMIT %s
+            """,
+            (project_id, safe_limit),
+        )
+        rows = cur.fetchall()
+    pg.commit()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        created_at = r[6]
+        out.append(
+            {
+                "run_id": r[0],
+                "created_by": r[1],
+                "source": r[2],
+                "threshold": float(r[3]) if r[3] is not None else None,
+                "input_count": int(r[4] or 0),
+                "pairs_count": int(r[5] or 0),
+                "created_at": created_at.isoformat().replace("+00:00", "Z") if created_at else None,
+            }
+        )
+    return out
+
+
+def ensure_api_idempotency_table(pg: PGConnection) -> None:
+    """Tabla mínima para idempotencia de requests (reintentos seguros desde frontend)."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS api_idempotency (
+        project_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        response_json JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (project_id, endpoint, idempotency_key)
+    );
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql)
+    pg.commit()
+
+
+def get_idempotency_response(
+    pg: PGConnection,
+    project_id: str,
+    endpoint: str,
+    idempotency_key: str,
+) -> Optional[Dict[str, Any]]:
+    if not idempotency_key:
+        return None
+    ensure_api_idempotency_table(pg)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT response_json
+            FROM api_idempotency
+            WHERE project_id = %s AND endpoint = %s AND idempotency_key = %s
+            """,
+            (project_id, endpoint, idempotency_key),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def store_idempotency_response(
+    pg: PGConnection,
+    project_id: str,
+    endpoint: str,
+    idempotency_key: str,
+    response: Dict[str, Any],
+) -> None:
+    if not idempotency_key:
+        return
+    import json
+
+    ensure_api_idempotency_table(pg)
+    payload = json.dumps(response, ensure_ascii=False)
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO api_idempotency(project_id, endpoint, idempotency_key, response_json)
+            VALUES (%s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, endpoint, idempotency_key)
+            DO NOTHING
+            """,
+            (project_id, endpoint, idempotency_key, payload),
+        )
+    pg.commit()
 
 
 def ensure_candidate_codes_table(pg: PGConnection) -> None:
     """Crea la tabla de códigos candidatos si no existe."""
     global _candidate_codes_table_ensured
+    global _candidate_codes_table_promote_migrated
     if _candidate_codes_table_ensured:
+        # Even if table exists, ensure we apply schema migrations (idempotent).
+        if not _candidate_codes_table_promote_migrated:
+            with _candidate_codes_table_lock:
+                if not _candidate_codes_table_promote_migrated:
+                    with pg.cursor() as cur:
+                        cur.execute(
+                            """
+                            ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS promovido_por TEXT;
+                            ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS promovido_en TIMESTAMPTZ;
+                            CREATE INDEX IF NOT EXISTS ix_cc_project_promovido_en ON codigos_candidatos(project_id, promovido_en);
+                            """
+                        )
+                    pg.commit()
+                    _candidate_codes_table_promote_migrated = True
         return
 
     with _candidate_codes_table_lock:
@@ -3748,6 +4526,21 @@ def ensure_candidate_codes_table(pg: PGConnection) -> None:
     pg.commit()
 
     _candidate_codes_table_ensured = True
+
+    # Apply schema migrations (idempotent)
+    if not _candidate_codes_table_promote_migrated:
+        with _candidate_codes_table_lock:
+            if not _candidate_codes_table_promote_migrated:
+                with pg.cursor() as cur:
+                    cur.execute(
+                        """
+                        ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS promovido_por TEXT;
+                        ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS promovido_en TIMESTAMPTZ;
+                        CREATE INDEX IF NOT EXISTS ix_cc_project_promovido_en ON codigos_candidatos(project_id, promovido_en);
+                        """
+                    )
+                pg.commit()
+                _candidate_codes_table_promote_migrated = True
 
 
 def count_pending_candidates(pg: PGConnection, project_id: str) -> int:
@@ -3875,6 +4668,7 @@ def list_candidate_codes(
     estado: Optional[str] = None,
     fuente_origen: Optional[str] = None,
     archivo: Optional[str] = None,
+    promovido: Optional[bool] = None,
     limit: int = 100,
     offset: int = 0,
     sort_order: str = "desc",
@@ -3909,16 +4703,24 @@ def list_candidate_codes(
     if archivo:
         clauses.append("archivo = %s")
         params.append(archivo)
+
+    # Filtro de promoción (útil para UX: validados por promover vs ya promovidos)
+    if promovido is True:
+        clauses.append("promovido_en IS NOT NULL")
+    elif promovido is False:
+        clauses.append("promovido_en IS NULL")
     
     where = " AND ".join(clauses)
     params.extend([limit, offset])
     
     order = "ASC" if sort_order.lower() == "asc" else "DESC"
-    
+
     sql = f"""
     SELECT id, project_id, codigo, cita, fragmento_id, archivo,
            fuente_origen, fuente_detalle, score_confianza, estado,
-           validado_por, validado_en, fusionado_a, memo, created_at
+           validado_por, validado_en, fusionado_a, memo,
+           promovido_por, promovido_en,
+           created_at
       FROM codigos_candidatos
      WHERE {where}
      ORDER BY created_at {order}
@@ -3945,7 +4747,9 @@ def list_candidate_codes(
             "validado_en": r[11].isoformat() if r[11] else None,
             "fusionado_a": r[12],
             "memo": r[13],
-            "created_at": r[14].isoformat() if r[14] else None,
+            "promovido_por": r[14],
+            "promovido_en": r[15].isoformat() if r[15] else None,
+            "created_at": r[16].isoformat() if r[16] else None,
         }
         for r in rows
     ]
@@ -4026,6 +4830,13 @@ def validate_candidate(
     Returns:
         True si se actualizó, False si no existe
     """
+
+    def _candidate_audit_memo(estado: str, candidate_id: int, user_memo: Optional[str]) -> str:
+        base = f"candidate_estado:{estado}; candidate_id:{candidate_id}"
+        if user_memo is None or not str(user_memo).strip():
+            return base
+        return f"{base}\n{str(user_memo).strip()}"
+
     ensure_candidate_codes_table(pg)
     
     with pg.cursor() as cur:
@@ -4076,7 +4887,7 @@ def validate_candidate(
             codigo=str(before_codigo),
             accion="candidate_validate",
             memo_anterior=before_memo,
-            memo_nuevo=(memo if memo is not None else before_memo),
+            memo_nuevo=_candidate_audit_memo("validado", candidate_id, memo),
             changed_by=validated_by,
         )
     except Exception:
@@ -4108,6 +4919,13 @@ def reject_candidate(
     Returns:
         True si se actualizó, False si no existe
     """
+
+    def _candidate_audit_memo(estado: str, candidate_id: int, user_memo: Optional[str]) -> str:
+        base = f"candidate_estado:{estado}; candidate_id:{candidate_id}"
+        if user_memo is None or not str(user_memo).strip():
+            return base
+        return f"{base}\n{str(user_memo).strip()}"
+
     ensure_candidate_codes_table(pg)
     
     with pg.cursor() as cur:
@@ -4135,6 +4953,9 @@ def reject_candidate(
         cur.execute(sql, (rejected_by, memo, project_id, candidate_id))
         affected = cur.rowcount
 
+    # Persist state change first; audit logging is best-effort.
+    pg.commit()
+
     if affected > 0:
         try:
             log_code_version(
@@ -4143,13 +4964,126 @@ def reject_candidate(
                 codigo=str(before_codigo),
                 accion="candidate_reject",
                 memo_anterior=before_memo,
-                memo_nuevo=(memo if memo is not None else before_memo),
+                memo_nuevo=_candidate_audit_memo("rechazado", candidate_id, memo),
                 changed_by=rejected_by,
             )
         except Exception:
-            pass
-    pg.commit()
+            try:
+                pg.rollback()
+            except Exception:
+                pass
     return affected > 0
+
+
+def revert_validated_candidates_to_pending(
+    pg: PGConnection,
+    project_id: str,
+    reverted_by: Optional[str] = None,
+    memo: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Revierte candidatos validados a pendientes.
+
+    Operación masiva para un proyecto específico.
+
+    Nota: Esto solo modifica la tabla `codigos_candidatos`. No elimina/retrocede
+    códigos ya promovidos a tablas definitivas.
+    """
+    ensure_candidate_codes_table(pg)
+
+    if dry_run:
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM codigos_candidatos WHERE project_id = %s AND estado = 'validado'",
+                (project_id,),
+            )
+            row = cur.fetchone()
+        pg.commit()
+        return {
+            "project": project_id,
+            "dry_run": True,
+            "would_revert": int(row[0] if row else 0),
+        }
+
+    def _bulk_revert_audit_memo(
+        *,
+        per_code_reverted: int,
+        total_reverted: int,
+        user_memo: Optional[str],
+    ) -> str:
+        base = (
+            "candidate_estado:pendiente; revert_from:validado; "
+            f"reverted_rows:{int(per_code_reverted)}; reverted_total:{int(total_reverted)}"
+        )
+        if user_memo is None or not str(user_memo).strip():
+            return base
+        return f"{base}\n{str(user_memo).strip()}"
+
+    sql = """
+    WITH updated AS (
+        UPDATE codigos_candidatos
+           SET estado = 'pendiente',
+               validado_por = NULL,
+               validado_en = NULL,
+               memo = COALESCE(%s, memo),
+               updated_at = NOW()
+         WHERE project_id = %s
+           AND estado = 'validado'
+         RETURNING codigo
+    )
+    SELECT codigo, COUNT(*)::INT AS reverted_rows
+      FROM updated
+     GROUP BY codigo
+    """
+
+    with pg.cursor() as cur:
+        cur.execute(sql, (memo, project_id))
+        per_code_rows = cur.fetchall() or []
+
+    total_reverted = sum(int(r[1] or 0) for r in per_code_rows)
+
+    # Persist state change before best-effort audit logging.
+    pg.commit()
+
+    if total_reverted > 0:
+        # Best-effort: register one history entry per affected code.
+        try:
+            ensure_code_versions_table(pg)
+        except Exception:
+            try:
+                pg.rollback()
+            except Exception:
+                pass
+        else:
+            for codigo, per_code_reverted in per_code_rows:
+                if not codigo:
+                    continue
+                try:
+                    log_code_version(
+                        pg,
+                        project=project_id,
+                        codigo=str(codigo),
+                        accion="candidates_revert_validated",
+                        memo_anterior=None,
+                        memo_nuevo=_bulk_revert_audit_memo(
+                            per_code_reverted=int(per_code_reverted or 0),
+                            total_reverted=int(total_reverted),
+                            user_memo=memo,
+                        ),
+                        changed_by=reverted_by,
+                    )
+                except Exception:
+                    try:
+                        pg.rollback()
+                    except Exception:
+                        pass
+
+    return {
+        "project": project_id,
+        "dry_run": False,
+        "reverted_count": int(total_reverted or 0),
+        "reverted_by": reverted_by,
+    }
 
 
 def merge_candidates(
@@ -4158,6 +5092,7 @@ def merge_candidates(
     source_ids: List[int],
     target_codigo: str,
     merged_by: Optional[str] = None,
+    memo: Optional[str] = None,
 ) -> int:
     """
     Fusiona múltiples códigos candidatos en uno.
@@ -4176,45 +5111,734 @@ def merge_candidates(
     if not source_ids:
         return 0
     
-    sql = """
-    UPDATE codigos_candidatos
+    # Semántica recomendada (alineada a Fusión_duplicados):
+    # 1) mover evidencia al target cuando no existe ya (mantiene estado)
+    # 2) si la evidencia ya existe bajo el target, marcar como fusionado (dedupe)
+    sql_move = """
+    UPDATE codigos_candidatos src
+       SET codigo = %s,
+           fusionado_a = %s,
+           updated_at = NOW()
+     WHERE src.project_id = %s
+       AND src.id = ANY(%s)
+       AND src.estado IN ('pendiente', 'validado')
+       AND lower(trim(src.codigo)) <> lower(trim(%s))
+       AND NOT EXISTS (
+           SELECT 1
+             FROM codigos_candidatos tgt
+            WHERE tgt.project_id = src.project_id
+              AND tgt.codigo = %s
+              AND tgt.fragmento_id = src.fragmento_id
+       )
+     RETURNING src.id, src.codigo, src.memo
+    """
+
+    sql_dedupe = """
+    UPDATE codigos_candidatos src
        SET estado = 'fusionado',
            fusionado_a = %s,
            validado_por = %s,
            validado_en = NOW(),
            updated_at = NOW()
-     WHERE project_id = %s AND id = ANY(%s) AND estado = 'pendiente'
-     RETURNING codigo, memo
+     WHERE src.project_id = %s
+       AND src.id = ANY(%s)
+       AND src.estado IN ('pendiente', 'validado')
+       AND lower(trim(src.codigo)) <> lower(trim(%s))
+       AND EXISTS (
+           SELECT 1
+             FROM codigos_candidatos tgt
+            WHERE tgt.project_id = src.project_id
+              AND tgt.codigo = %s
+              AND tgt.fragmento_id = src.fragmento_id
+       )
+     RETURNING src.id, src.codigo, src.memo
     """
+
     with pg.cursor() as cur:
-        cur.execute(sql, (target_codigo, merged_by, project_id, source_ids))
-        updated_rows = cur.fetchall()
-        affected = len(updated_rows)
+        cur.execute(
+            sql_move,
+            (target_codigo, target_codigo, project_id, source_ids, target_codigo, target_codigo),
+        )
+        moved_rows = cur.fetchall()
+
+        cur.execute(
+            sql_dedupe,
+            (target_codigo, merged_by, project_id, source_ids, target_codigo, target_codigo),
+        )
+        dedup_rows = cur.fetchall()
+
+    affected = len(moved_rows) + len(dedup_rows)
 
     if affected > 0:
-        for codigo, before_memo in updated_rows:
+        memo_suffix = ""
+        if memo and str(memo).strip():
+            memo_suffix = f"\nmerge_memo: {str(memo).strip()}"
+
+        for _id, codigo, before_memo in moved_rows:
             try:
                 log_code_version(
                     pg,
                     project=project_id,
                     codigo=str(codigo),
-                    accion="candidate_merge",
+                    accion="candidate_merge_move",
                     memo_anterior=before_memo,
-                    memo_nuevo=f"fusionado_a:{target_codigo}",
+                    memo_nuevo=f"fusionado_a:{target_codigo}{memo_suffix}",
+                    changed_by=merged_by,
+                )
+            except Exception:
+                pass
+
+        for _id, codigo, before_memo in dedup_rows:
+            try:
+                log_code_version(
+                    pg,
+                    project=project_id,
+                    codigo=str(codigo),
+                    accion="candidate_merge_dedupe",
+                    memo_anterior=before_memo,
+                    memo_nuevo=f"fusionado_a:{target_codigo}{memo_suffix}",
+                    changed_by=merged_by,
+                )
+            except Exception:
+                pass
+
+    pg.commit()
+    return affected
+
+
+def preview_merge_candidates_by_ids(
+    pg: PGConnection,
+    project_id: str,
+    source_ids: List[int],
+    target_codigo: str,
+) -> Dict[str, Any]:
+    """Dry-run: estima cuántas filas se moverían vs deduplicarían (sin UPDATE)."""
+    ensure_candidate_codes_table(pg)
+    if not source_ids:
+        return {"would_move": 0, "would_dedupe": 0, "would_merge": 0}
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM codigos_candidatos src
+            WHERE src.project_id = %s
+              AND src.id = ANY(%s)
+              AND src.estado IN ('pendiente','validado')
+              AND lower(trim(src.codigo)) <> lower(trim(%s))
+              AND NOT EXISTS (
+                SELECT 1 FROM codigos_candidatos tgt
+                WHERE tgt.project_id = src.project_id
+                  AND tgt.codigo = %s
+                  AND tgt.fragmento_id = src.fragmento_id
+              )
+            """,
+            (project_id, source_ids, target_codigo, target_codigo),
+        )
+        would_move = int(cur.fetchone()[0] or 0)
+
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM codigos_candidatos src
+            WHERE src.project_id = %s
+              AND src.id = ANY(%s)
+              AND src.estado IN ('pendiente','validado')
+              AND lower(trim(src.codigo)) <> lower(trim(%s))
+              AND EXISTS (
+                SELECT 1 FROM codigos_candidatos tgt
+                WHERE tgt.project_id = src.project_id
+                  AND tgt.codigo = %s
+                  AND tgt.fragmento_id = src.fragmento_id
+              )
+            """,
+            (project_id, source_ids, target_codigo, target_codigo),
+        )
+        would_dedupe = int(cur.fetchone()[0] or 0)
+
+    return {
+        "would_move": would_move,
+        "would_dedupe": would_dedupe,
+        "would_merge": (would_move + would_dedupe),
+    }
+
+
+def merge_candidates_by_code(
+    pg: PGConnection,
+    project_id: str,
+    source_codigo: str,
+    target_codigo: str,
+    merged_by: Optional[str] = None,
+    memo: Optional[str] = None,
+) -> int:
+    """
+    Fusiona todos los candidatos con un código específico hacia otro código.
+    
+    A diferencia de merge_candidates que usa IDs, esta función busca por nombre
+    de código, lo que es más robusto para el auto-merge de duplicados.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto
+        source_codigo: Nombre del código a fusionar (se busca case-insensitive)
+        target_codigo: Nombre del código destino
+        merged_by: Usuario que realizó la fusión
+    
+    Returns:
+        Número de candidatos fusionados
+    """
+    ensure_candidate_codes_table(pg)
+    
+    _logger.info(
+        "merge_candidates_by_code.start",
+        extra={
+            "project": project_id,
+            "source": source_codigo,
+            "target": target_codigo,
+            "merged_by": merged_by,
+        },
+    )
+
+    if not source_codigo or not target_codigo:
+        _logger.warning(
+            "merge_candidates_by_code.skipped_missing",
+            extra={
+                "project": project_id,
+                "source": source_codigo,
+                "target": target_codigo,
+            },
+        )
+        return 0
+    
+    # Don't merge a code into itself
+    if source_codigo.strip().lower() == target_codigo.strip().lower():
+        _logger.warning(
+            "merge_candidates_by_code.skipped_self",
+            extra={
+                "project": project_id,
+                "source": source_codigo,
+                "target": target_codigo,
+            },
+        )
+        return 0
+    
+    use_unaccent = ensure_unaccent(pg)
+    _logger.info(
+        "merge_candidates_by_code.normalize",
+        extra={
+            "project": project_id,
+            "use_unaccent": use_unaccent,
+        },
+    )
+    # IMPORTANT: qualify with src. to avoid any ambiguity in UPDATE scope.
+    normalize_col = "unaccent(lower(trim(src.codigo)))" if use_unaccent else "lower(trim(src.codigo))"
+    normalize_param = "unaccent(lower(trim(%s)))" if use_unaccent else "lower(trim(%s))"
+
+    # Paso 1: Reasignar citas al código destino (mantener estado)
+    sql_move = f"""
+    UPDATE codigos_candidatos src
+       SET codigo = %s,
+           fusionado_a = %s,
+           updated_at = NOW()
+     WHERE src.project_id = %s
+       AND (src.codigo = %s OR {normalize_col} = {normalize_param})
+       AND src.estado IN ('pendiente', 'validado')
+       AND NOT EXISTS (
+           SELECT 1
+             FROM codigos_candidatos tgt
+            WHERE tgt.project_id = src.project_id
+              AND tgt.codigo = %s
+              AND tgt.fragmento_id = src.fragmento_id
+       )
+     RETURNING src.id, src.codigo, src.memo
+    """
+
+    # Paso 2: Si ya existe la misma cita bajo el destino, marcar como fusionado
+    sql_dedupe = f"""
+    UPDATE codigos_candidatos src
+       SET estado = 'fusionado',
+           fusionado_a = %s,
+           validado_por = %s,
+           validado_en = NOW(),
+           updated_at = NOW()
+     WHERE src.project_id = %s
+       AND (src.codigo = %s OR {normalize_col} = {normalize_param})
+       AND src.estado IN ('pendiente', 'validado')
+       AND EXISTS (
+           SELECT 1
+             FROM codigos_candidatos tgt
+            WHERE tgt.project_id = src.project_id
+              AND tgt.codigo = %s
+              AND tgt.fragmento_id = src.fragmento_id
+       )
+     RETURNING src.id, src.codigo, src.memo
+    """
+
+    with pg.cursor() as cur:
+        cur.execute(
+            sql_move,
+            (
+                target_codigo,
+                target_codigo,
+                project_id,
+                source_codigo,
+                source_codigo,
+                target_codigo,
+            ),
+        )
+        moved_rows = cur.fetchall()
+        moved_count = len(moved_rows)
+
+        cur.execute(
+            sql_dedupe,
+            (
+                target_codigo,
+                merged_by,
+                project_id,
+                source_codigo,
+                source_codigo,
+                target_codigo,
+            ),
+        )
+        dedup_rows = cur.fetchall()
+        dedup_count = len(dedup_rows)
+
+    affected = moved_count + dedup_count
+
+    if affected > 0:
+        memo_suffix = ""
+        if memo and str(memo).strip():
+            memo_suffix = f"\nmerge_memo: {str(memo).strip()}"
+
+        for _id, codigo, before_memo in moved_rows:
+            try:
+                log_code_version(
+                    pg,
+                    project=project_id,
+                    codigo=str(codigo),
+                    accion="candidate_merge_move",
+                    memo_anterior=before_memo,
+                    memo_nuevo=f"fusionado_a:{target_codigo}{memo_suffix}",
+                    changed_by=merged_by,
+                )
+            except Exception:
+                pass
+
+        for _id, codigo, before_memo in dedup_rows:
+            try:
+                log_code_version(
+                    pg,
+                    project=project_id,
+                    codigo=str(codigo),
+                    accion="candidate_merge_dedupe",
+                    memo_anterior=before_memo,
+                    memo_nuevo=f"fusionado_a:{target_codigo}{memo_suffix}",
+                    changed_by=merged_by,
+                )
+            except Exception:
+                pass
+
+    pg.commit()
+    return affected
+
+
+def preview_merge_candidates_by_code(
+    pg: PGConnection,
+    project_id: str,
+    source_codigo: str,
+    target_codigo: str,
+) -> Dict[str, Any]:
+    """Dry-run: estima cuántas filas se moverían vs deduplicarían (sin UPDATE)."""
+    ensure_candidate_codes_table(pg)
+    if not source_codigo or not target_codigo:
+        return {"would_move": 0, "would_dedupe": 0, "would_merge": 0}
+    if source_codigo.strip().lower() == target_codigo.strip().lower():
+        return {"would_move": 0, "would_dedupe": 0, "would_merge": 0, "skipped": "self"}
+
+    use_unaccent = ensure_unaccent(pg)
+    # IMPORTANT: qualify with src. to avoid any ambiguity in query scope.
+    normalize_col = "unaccent(lower(trim(src.codigo)))" if use_unaccent else "lower(trim(src.codigo))"
+    normalize_param = "unaccent(lower(trim(%s)))" if use_unaccent else "lower(trim(%s))"
+
+    with pg.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM codigos_candidatos src
+            WHERE src.project_id = %s
+              AND (src.codigo = %s OR {normalize_col} = {normalize_param})
+              AND src.estado IN ('pendiente','validado')
+              AND NOT EXISTS (
+                SELECT 1 FROM codigos_candidatos tgt
+                WHERE tgt.project_id = src.project_id
+                  AND tgt.codigo = %s
+                  AND tgt.fragmento_id = src.fragmento_id
+              )
+            """,
+            (project_id, source_codigo, source_codigo, target_codigo),
+        )
+        would_move = int(cur.fetchone()[0] or 0)
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM codigos_candidatos src
+            WHERE src.project_id = %s
+              AND (src.codigo = %s OR {normalize_col} = {normalize_param})
+              AND src.estado IN ('pendiente','validado')
+              AND EXISTS (
+                SELECT 1 FROM codigos_candidatos tgt
+                WHERE tgt.project_id = src.project_id
+                  AND tgt.codigo = %s
+                  AND tgt.fragmento_id = src.fragmento_id
+              )
+            """,
+            (project_id, source_codigo, source_codigo, target_codigo),
+        )
+        would_dedupe = int(cur.fetchone()[0] or 0)
+
+    return {
+        "would_move": would_move,
+        "would_dedupe": would_dedupe,
+        "would_merge": (would_move + would_dedupe),
+        "use_unaccent": bool(use_unaccent),
+    }
+
+    if affected > 0:
+        for row_id, codigo, before_memo in moved_rows:
+            try:
+                log_code_version(
+                    pg,
+                    project=project_id,
+                    codigo=str(codigo),
+                    accion="candidate_merge_by_code",
+                    memo_anterior=before_memo,
+                    memo_nuevo=f"reassigned_to:{target_codigo}",
+                    changed_by=merged_by,
+                )
+            except Exception:
+                pass
+        for row_id, codigo, before_memo in dedup_rows:
+            try:
+                log_code_version(
+                    pg,
+                    project=project_id,
+                    codigo=str(codigo),
+                    accion="candidate_merge_by_code",
+                    memo_anterior=before_memo,
+                    memo_nuevo=f"dedup_fusionado_a:{target_codigo}",
                     changed_by=merged_by,
                 )
             except Exception:
                 pass
     pg.commit()
+    _logger.info(
+        "merge_candidates_by_code.summary",
+        extra={
+            "project": project_id,
+            "source": source_codigo,
+            "target": target_codigo,
+            "moved_count": moved_count,
+            "dedup_count": dedup_count,
+        },
+    )
+    if affected == 0:
+        _logger.warning(
+            "merge_candidates_by_code.no_rows",
+            extra={
+                "project": project_id,
+                "source": source_codigo,
+                "target": target_codigo,
+            },
+        )
+    _logger.info(
+        "merge_candidates_by_code.completed project=%s source=%s target=%s affected=%d",
+        project_id,
+        source_codigo,
+        target_codigo,
+        affected,
+    )
     return affected
+
+
+# =============================================================================
+# HIPÓTESIS Y MUESTREO TEÓRICO (Grounded Theory)
+# =============================================================================
+
+
+def list_hypothesis_codes(
+    pg: PGConnection,
+    project: str,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """
+    Lista códigos en estado 'hipotesis' que requieren muestreo teórico.
+    
+    En Grounded Theory, estas son proposiciones emergentes que necesitan
+    validación empírica antes de ser aceptadas como códigos definitivos.
+    
+    Según Charmaz (2014): "Theoretical sampling means sampling to develop 
+    or refine emerging theoretical categories... keeps them grounded in data."
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project: ID del proyecto
+        limit: Máximo de resultados
+        
+    Returns:
+        Lista de hipótesis pendientes de validación empírica
+    """
+    ensure_candidate_codes_table(pg)
+    
+    sql = """
+    SELECT id, codigo, cita, fuente_detalle, score_confianza, 
+           memo, created_at, fuente_origen, requiere_muestreo,
+           muestreo_notas, codigo_origen_hipotesis
+    FROM codigos_candidatos
+    WHERE project_id = %s 
+      AND estado = 'hipotesis'
+    ORDER BY score_confianza DESC NULLS LAST, created_at DESC
+    LIMIT %s
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql, (project, limit))
+        rows = cur.fetchall()
+    
+    return [
+        {
+            "id": r[0],
+            "codigo": r[1],
+            "cita": r[2],
+            "fuente_detalle": r[3],
+            "score_confianza": r[4],
+            "memo": r[5],
+            "created_at": r[6].isoformat() if r[6] else None,
+            "fuente_origen": r[7],
+            "requiere_muestreo": r[8],
+            "muestreo_notas": r[9],
+            "codigo_origen_hipotesis": r[10],
+        }
+        for r in rows
+    ]
+
+
+def count_hypothesis_codes(
+    pg: PGConnection,
+    project: str,
+) -> int:
+    """Cuenta hipótesis pendientes de validación empírica."""
+    ensure_candidate_codes_table(pg)
+    
+    sql = """
+    SELECT COUNT(*) FROM codigos_candidatos
+    WHERE project_id = %s AND estado = 'hipotesis'
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql, (project,))
+        result = cur.fetchone()
+    return result[0] if result else 0
+
+
+def validate_hypothesis_with_evidence(
+    pg: PGConnection,
+    hypothesis_id: int,
+    project: str,
+    fragmento_id: str,
+    cita: str,
+    validado_por: str = "investigador",
+) -> Dict[str, Any]:
+    """
+    Valida una hipótesis vinculándola a evidencia empírica.
+    
+    Este es el paso final del muestreo teórico: la hipótesis
+    se convierte en código validado al encontrar un fragmento
+    que la respalda.
+    
+    Según Glaser & Strauss (1967): "Grounded theory is defined as 
+    the discovery of theory from data."
+    
+    Args:
+        pg: Conexión PostgreSQL
+        hypothesis_id: ID del candidato en estado 'hipotesis'
+        project: ID del proyecto
+        fragmento_id: ID del fragmento que respalda la hipótesis
+        cita: Cita textual del fragmento
+        validado_por: Usuario que realiza la validación
+    
+    Returns:
+        Dict con resultado de la operación
+        
+    Raises:
+        ValueError: Si fragmento_id es inválido o hipótesis no existe
+    """
+    if not fragmento_id or len(fragmento_id) < 10:
+        raise ValueError("Se requiere un fragmento_id válido para validar la hipótesis")
+    
+    sql = """
+    UPDATE codigos_candidatos
+    SET estado = 'validado',
+        fragmento_id = %s,
+        cita = %s,
+        validado_por = %s,
+        validado_en = NOW(),
+        memo = COALESCE(memo, '') || ' [VALIDADO via muestreo teórico: evidencia encontrada]',
+        updated_at = NOW()
+    WHERE id = %s 
+      AND project_id = %s 
+      AND estado = 'hipotesis'
+    RETURNING id, codigo, fragmento_id
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql, (fragmento_id, cita, validado_por, hypothesis_id, project))
+        result = cur.fetchone()
+    pg.commit()
+    
+    if not result:
+        raise ValueError(f"Hipótesis {hypothesis_id} no encontrada o no está en estado 'hipotesis'")
+    
+    log.info(
+        "hypothesis.validated",
+        hypothesis_id=hypothesis_id,
+        codigo=result[1],
+        fragmento_id=fragmento_id,
+        project=project,
+    )
+    
+    return {
+        "success": True,
+        "id": result[0],
+        "codigo": result[1],
+        "fragmento_id": result[2],
+        "message": "Hipótesis validada con evidencia empírica"
+    }
+
+
+def reject_hypothesis(
+    pg: PGConnection,
+    hypothesis_id: int,
+    project: str,
+    razon: str,
+    rechazado_por: str = "investigador",
+) -> Dict[str, Any]:
+    """
+    Rechaza una hipótesis después de muestreo teórico fallido.
+    
+    Se debe proporcionar una razón metodológica del rechazo.
+    En Grounded Theory, las hipótesis que no encuentran evidencia
+    deben ser descartadas para mantener el rigor metodológico.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        hypothesis_id: ID de la hipótesis a rechazar
+        project: ID del proyecto
+        razon: Razón metodológica del rechazo
+        rechazado_por: Usuario que rechaza
+        
+    Returns:
+        Dict con resultado
+    """
+    sql = """
+    UPDATE codigos_candidatos
+    SET estado = 'rechazado',
+        validado_por = %s,
+        validado_en = NOW(),
+        memo = COALESCE(memo, '') || ' [RECHAZADO - Muestreo teórico: ' || %s || ']',
+        updated_at = NOW()
+    WHERE id = %s 
+      AND project_id = %s 
+      AND estado = 'hipotesis'
+    RETURNING id, codigo
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql, (rechazado_por, razon, hypothesis_id, project))
+        result = cur.fetchone()
+    pg.commit()
+    
+    if not result:
+        raise ValueError(f"Hipótesis {hypothesis_id} no encontrada o no está en estado 'hipotesis'")
+    
+    log.info(
+        "hypothesis.rejected",
+        hypothesis_id=hypothesis_id,
+        codigo=result[1],
+        razon=razon,
+        project=project,
+    )
+    
+    return {
+        "success": True,
+        "id": result[0],
+        "codigo": result[1],
+        "message": f"Hipótesis rechazada: {razon}"
+    }
+
+
+def search_evidence_for_hypothesis(
+    pg: PGConnection,
+    project: str,
+    hypothesis_codigo: str,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    Busca fragmentos que podrían servir como evidencia para una hipótesis.
+    
+    Realiza búsqueda en analisis_codigos_abiertos para encontrar fragmentos
+    que contengan códigos relacionados semánticamente.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project: ID del proyecto
+        hypothesis_codigo: Nombre del código hipotético
+        limit: Máximo de resultados
+        
+    Returns:
+        Lista de fragmentos potencialmente relacionados
+    """
+    # Extraer palabras clave del código para búsqueda
+    keywords = hypothesis_codigo.replace("_", " ").replace("-", " ").split()
+    
+    # Buscar fragmentos que contengan términos relacionados en su cita
+    sql = """
+    SELECT DISTINCT fragmento_id, archivo, cita, codigo
+    FROM analisis_codigos_abiertos
+    WHERE project_id = %s
+      AND fragmento_id IS NOT NULL
+      AND fragmento_id != ''
+      AND (
+        LOWER(cita) LIKE ANY(%s)
+        OR LOWER(codigo) LIKE ANY(%s)
+      )
+    ORDER BY fragmento_id
+    LIMIT %s
+    """
+    
+    like_patterns = [f"%{kw.lower()}%" for kw in keywords if len(kw) > 3]
+    
+    if not like_patterns:
+        return []
+    
+    with pg.cursor() as cur:
+        cur.execute(sql, (project, like_patterns, like_patterns, limit))
+        rows = cur.fetchall()
+    
+    return [
+        {
+            "fragmento_id": r[0],
+            "archivo": r[1],
+            "cita": r[2],
+            "codigo_existente": r[3],
+        }
+        for r in rows
+    ]
 
 
 def promote_to_definitive(
     pg: PGConnection,
     project_id: str,
     candidate_ids: List[int],
+    promote_all_validated: bool = False,
     promoted_by: Optional[str] = None,
-) -> int:
+) -> Dict[str, Any]:
     """
     Promueve códigos candidatos validados a la tabla definitiva (analisis_codigos_abiertos).
     
@@ -4223,41 +5847,116 @@ def promote_to_definitive(
         candidate_ids: IDs de candidatos validados a promover
     
     Returns:
-        Número de códigos promovidos
+        Dict con métricas:
+        - promoted_count: filas promovidas a analisis_codigos_abiertos
+        - validated_total: total de candidatos validados en bandeja (filas)
+        - eligible_total: validados elegibles (con fragmento_id usable)
+        - skipped_total: validados omitidos por falta de evidencia
+        - mode: 'ids' | 'all_validated'
     """
     ensure_candidate_codes_table(pg)
     ensure_open_coding_table(pg)
+    ensure_codes_catalog_table(pg)
     
-    if not candidate_ids:
-        return 0
-    
-    # Obtener candidatos validados
-    sql_select = """
-    SELECT project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
-      FROM codigos_candidatos
-         WHERE project_id = %s
-             AND id = ANY(%s)
-             AND estado = 'validado'
-             AND fragmento_id IS NOT NULL
-    """
+    if not candidate_ids and not promote_all_validated:
+        return {
+            "mode": "ids",
+            "validated_total": 0,
+            "eligible_total": 0,
+            "promoted_count": 0,
+            "skipped_total": 0,
+        }
+
+    # Totales para UX (independientes de candidate_ids)
     with pg.cursor() as cur:
-        cur.execute(sql_select, (project_id, candidate_ids))
+        cur.execute(
+            "SELECT COUNT(*) FROM codigos_candidatos WHERE project_id = %s AND estado = 'validado'",
+            (project_id,),
+        )
+        validated_total = int((cur.fetchone() or [0])[0] or 0)
+
+    # Obtener candidatos validados
+    # IMPORTANTE: Excluir fragmento_id NULL o vacío para mantener coherencia
+    # Selección: por IDs o por 'todos los validados'
+    if promote_all_validated:
+        sql_select = """
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+          FROM codigos_candidatos
+         WHERE project_id = %s
+           AND estado = 'validado'
+           AND fragmento_id IS NOT NULL
+           AND fragmento_id != ''
+           AND LENGTH(fragmento_id) > 10
+        """
+        select_params: Tuple[Any, ...] = (project_id,)
+        mode = "all_validated"
+    else:
+        sql_select = """
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+          FROM codigos_candidatos
+         WHERE project_id = %s
+           AND id = ANY(%s)
+           AND estado = 'validado'
+           AND fragmento_id IS NOT NULL
+           AND fragmento_id != ''
+           AND LENGTH(fragmento_id) > 10
+        """
+        select_params = (project_id, candidate_ids)
+        mode = "ids"
+
+    with pg.cursor() as cur:
+        cur.execute(sql_select, select_params)
         rows = cur.fetchall()
     
     if not rows:
-        return 0
+        return {
+            "mode": mode,
+            "validated_total": validated_total,
+            "eligible_total": 0,
+            "promoted_count": 0,
+            "skipped_total": max(validated_total - 0, 0) if promote_all_validated else 0,
+        }
     
-    # Insertar en tabla definitiva
-    open_rows = [
-        (r[0], r[1], r[2], r[3], r[4], r[5], r[6])
-        for r in rows
-    ]
+    # Insertar en tabla definitiva, resolviendo a código canónico si corresponde.
+    # rows: (id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo)
+    open_rows: List[OpenCodeRow] = []
+    for r in rows:
+        original_codigo = str(r[3]) if r[3] is not None else ""
+        canonical_codigo = resolve_canonical_codigo(pg, project_id, original_codigo)
+        ensure_code_catalog_entry(pg, project_id, canonical_codigo)
+
+        final_memo = r[7]
+        if canonical_codigo and original_codigo and canonical_codigo.lower() != original_codigo.strip().lower():
+            prefix = f"[CANON:{canonical_codigo}; ORIG:{original_codigo.strip()}] "
+            if not final_memo:
+                final_memo = prefix.strip()
+            else:
+                final_memo = f"{prefix}{final_memo}"
+
+        open_rows.append((r[1], r[2], canonical_codigo or original_codigo, r[4], r[5], r[6], final_memo))
     upsert_open_codes(pg, open_rows)
+
+    # Marcar candidatos como promovidos (best-effort, idempotente)
+    promoted_ids = [int(r[0]) for r in rows if r and r[0] is not None]
+    if promoted_ids:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE codigos_candidatos
+                   SET promovido_por = COALESCE(%s, promovido_por),
+                       promovido_en = COALESCE(promovido_en, NOW()),
+                       updated_at = NOW()
+                 WHERE project_id = %s
+                   AND id = ANY(%s)
+                """,
+                (promoted_by, project_id, promoted_ids),
+            )
+        pg.commit()
 
     # Audit promotion per codigo (grouped), best-effort.
     grouped: Dict[str, List[Tuple[Any, ...]]] = {}
     for row in rows:
-        codigo = str(row[2])
+        codigo = str(row[3])
         grouped.setdefault(codigo, []).append(row)
 
     for codigo, group_rows in grouped.items():
@@ -4265,11 +5964,11 @@ def promote_to_definitive(
             previous = _get_latest_code_memo(pg, project_id, codigo)
             sample_memo = None
             for r in group_rows:
-                if r[6]:
-                    sample_memo = r[6]
+                if r[7]:
+                    sample_memo = r[7]
                     break
             if not sample_memo:
-                sample_memo = group_rows[0][4] if group_rows and group_rows[0][4] else None
+                sample_memo = group_rows[0][5] if group_rows and group_rows[0][5] else None
             summary = (
                 f"promote_to_definitive: {len(group_rows)} cita(s). {sample_memo}"
                 if sample_memo
@@ -4287,7 +5986,19 @@ def promote_to_definitive(
         except Exception:
             pass
 
-    return len(open_rows)
+    promoted_count = len(open_rows)
+
+    # Elegibles (aprox. == filas seleccionadas); omitidos solo se reportan en modo masivo.
+    eligible_total = promoted_count
+    skipped_total = max(validated_total - eligible_total, 0) if promote_all_validated else 0
+
+    return {
+        "mode": mode,
+        "validated_total": validated_total,
+        "eligible_total": eligible_total,
+        "promoted_count": promoted_count,
+        "skipped_total": skipped_total,
+    }
 
 
 def get_candidate_stats_by_source(
@@ -4315,21 +6026,120 @@ def get_candidate_stats_by_source(
         cur.execute(sql, (project,))
         rows = cur.fetchall()
     
-    # Organizar por origen
+    # Organizar por origen (conteo de filas) + (conteo de códigos únicos por fuente)
     by_source: Dict[str, Dict[str, int]] = {}
-    totals = {"pendiente": 0, "validado": 0, "rechazado": 0, "fusionado": 0}
-    
+    by_source_unique: Dict[str, Dict[str, int]] = {}
+    totals = {"pendiente": 0, "validado": 0, "rechazado": 0, "fusionado": 0, "hipotesis": 0}
+
     for origen, estado, cantidad, unicos in rows:
         if origen not in by_source:
-            by_source[origen] = {"pendiente": 0, "validado": 0, "rechazado": 0, "fusionado": 0, "total": 0}
-        by_source[origen][estado] = cantidad
-        by_source[origen]["total"] += cantidad
-        totals[estado] += cantidad
-    
+            by_source[origen] = {
+                "pendiente": 0,
+                "validado": 0,
+                "rechazado": 0,
+                "fusionado": 0,
+                "hipotesis": 0,
+                "total": 0,
+            }
+            by_source_unique[origen] = {
+                "pendiente": 0,
+                "validado": 0,
+                "rechazado": 0,
+                "fusionado": 0,
+                "hipotesis": 0,
+                "total": 0,
+            }
+
+        # Manejar estados desconocidos (robustez)
+        if estado not in by_source[origen]:
+            by_source[origen][estado] = 0
+        if estado not in by_source_unique[origen]:
+            by_source_unique[origen][estado] = 0
+        if estado not in totals:
+            totals[estado] = 0
+
+        by_source[origen][estado] = int(cantidad or 0)
+        by_source[origen]["total"] += int(cantidad or 0)
+        totals[estado] += int(cantidad or 0)
+
+        by_source_unique[origen][estado] = int(unicos or 0)
+        by_source_unique[origen]["total"] += int(unicos or 0)
+
+    # Códigos únicos reales por estado (a nivel proyecto), sin duplicar entre fuentes.
+    unique_totals = {"pendiente": 0, "validado": 0, "rechazado": 0, "fusionado": 0, "hipotesis": 0}
+    unique_total_codigos = 0
+    with pg.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = 10000")
+        cur.execute(
+            """
+            SELECT estado, COUNT(DISTINCT codigo) AS codigos_unicos
+              FROM codigos_candidatos
+             WHERE project_id = %s
+             GROUP BY estado
+            """,
+            (project,),
+        )
+        uniq_rows = cur.fetchall()
+
+    for estado, unicos in uniq_rows:
+        if estado not in unique_totals:
+            unique_totals[estado] = 0
+        unique_totals[estado] = int(unicos or 0)
+
+    # Total de códigos únicos a nivel proyecto (sin duplicar entre estados)
+    with pg.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = 10000")
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT codigo)
+              FROM codigos_candidatos
+             WHERE project_id = %s
+            """,
+            (project,),
+        )
+        row_total = cur.fetchone()
+        unique_total_codigos = int(row_total[0] or 0) if row_total else 0
+
+    # Sub-métricas UX: distinguir 'validados' que ya fueron promovidos vs pendientes por promover.
+    # Nota: esto es por FILA; también retornamos versión por código único.
+    promoted_validated_total = 0
+    unpromoted_validated_total = 0
+    promoted_validated_unique = 0
+    unpromoted_validated_unique = 0
+    with pg.cursor() as cur:
+        cur.execute("SET LOCAL statement_timeout = 10000")
+        cur.execute(
+            """
+            SELECT
+              SUM(CASE WHEN estado = 'validado' AND promovido_en IS NOT NULL THEN 1 ELSE 0 END) AS promoted_rows,
+              SUM(CASE WHEN estado = 'validado' AND (promovido_en IS NULL) THEN 1 ELSE 0 END) AS unpromoted_rows,
+              COUNT(DISTINCT CASE WHEN estado = 'validado' AND promovido_en IS NOT NULL THEN codigo END) AS promoted_unique,
+              COUNT(DISTINCT CASE WHEN estado = 'validado' AND (promovido_en IS NULL) THEN codigo END) AS unpromoted_unique
+            FROM codigos_candidatos
+            WHERE project_id = %s
+            """,
+            (project,),
+        )
+        r = cur.fetchone() or (0, 0, 0, 0)
+        promoted_validated_total = int(r[0] or 0)
+        unpromoted_validated_total = int(r[1] or 0)
+        promoted_validated_unique = int(r[2] or 0)
+        unpromoted_validated_unique = int(r[3] or 0)
+
+    # Total general de filas
+    total_candidatos = int(sum(int(v or 0) for v in totals.values()))
+
     return {
         "by_source": by_source,
+        "by_source_unique": by_source_unique,
         "totals": totals,
-        "total_candidatos": sum(totals.values()),
+        "total_candidatos": total_candidatos,
+        "unique_totals": unique_totals,
+        "unique_total_codigos": unique_total_codigos,
+        "validated_promoted_total": promoted_validated_total,
+        "validated_unpromoted_total": unpromoted_validated_total,
+        "validated_promoted_unique": promoted_validated_unique,
+        "validated_unpromoted_unique": unpromoted_validated_unique,
     }
 
 
@@ -4893,14 +6703,29 @@ def list_projects_db(pg: PGConnection, org_id: Optional[str] = None, owner_id: O
     ]
 
 
-def get_project_db(pg: PGConnection, project_id: str) -> Optional[Dict[str, Any]]:
-    """Obtiene un proyecto por ID desde PostgreSQL."""
-    sql = """
-    SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
-    FROM proyectos WHERE id = %s
+def get_project_db(pg: PGConnection, project_id: str, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Obtiene un proyecto por ID desde PostgreSQL.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto a buscar
+        org_id: Si se provee, solo busca proyectos de esta organización
+                (para verificación de duplicados scoped a org)
     """
+    if org_id:
+        sql = """
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        FROM proyectos WHERE id = %s AND org_id = %s
+        """
+        params = (project_id, org_id)
+    else:
+        sql = """
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        FROM proyectos WHERE id = %s
+        """
+        params = (project_id,)
     with pg.cursor() as cur:
-        cur.execute(sql, (project_id,))
+        cur.execute(sql, params)
         row = cur.fetchone()
     
     if row is None:

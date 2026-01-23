@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+
+# Ensure project root is importable when running as a script.
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from app.clients import get_pg_connection, return_pg_connection
 from app.settings import load_settings
@@ -12,6 +16,9 @@ MIGRATIONS = [
     "migrations/008_interview_files.sql",
     "migrations/010_neo4j_sync_tracking.sql",
     "migrations/012_add_is_deleted_to_proyectos.sql",
+    "migrations/013_codes_catalog_ontology.sql",
+    "migrations/014_code_id_columns.sql",
+    "migrations/015_ontology_freeze.sql",
 ]
 
 

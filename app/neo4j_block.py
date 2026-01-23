@@ -224,6 +224,7 @@ def merge_category_code_relationship(
     cypher = """
     MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
     MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
+    SET cod.status = coalesce(cod.status, 'active')
     MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
     SET rel.evidencia = $evidencia,
         rel.memo = $memo,
@@ -258,6 +259,7 @@ def merge_category_code_relationships(
     UNWIND $rows AS r
     MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
     MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
+    SET cod.status = coalesce(cod.status, 'active')
     MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
     SET rel.evidencia = r.evidencia,
         rel.memo = r.memo,
@@ -265,4 +267,47 @@ def merge_category_code_relationships(
     """
     with driver.session(database=database) as session:
         session.run(cypher, rows=data)
+
+
+def mark_codigo_merged(
+    driver: Driver,
+    database: str,
+    *,
+    project_id: str,
+    source_codigo: str,
+    target_codigo: str,
+    merged_by: Optional[str] = None,
+    memo: Optional[str] = None,
+) -> None:
+    """Marca un código como fusionado en Neo4j (best-effort).
+
+    Esto permite filtrar nodos `Codigo` fusionados en proyecciones GDS.
+    """
+    src = str(source_codigo).strip()
+    tgt = str(target_codigo).strip()
+    if not src or not tgt:
+        return
+    if src.lower() == tgt.lower():
+        return
+
+    cypher = """
+    MERGE (src:Codigo {nombre: $src, project_id: $project_id})
+    SET src.status = 'merged',
+        src.canonical_codigo = $tgt,
+        src.merged_at = datetime(),
+        src.merged_by = $merged_by,
+        src.merge_memo = $memo
+    MERGE (tgt:Codigo {nombre: $tgt, project_id: $project_id})
+    SET tgt.status = coalesce(tgt.status, 'active')
+    MERGE (src)-[:MERGED_INTO]->(tgt)
+    """
+    with driver.session(database=database) as session:
+        session.run(
+            cypher,
+            project_id=project_id,
+            src=src,
+            tgt=tgt,
+            merged_by=merged_by,
+            memo=memo,
+        ).consume()
 

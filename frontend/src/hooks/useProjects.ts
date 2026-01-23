@@ -18,6 +18,25 @@ interface UseProjectsResult {
   exportProject: (projectId: string) => Promise<boolean>;
 }
 
+const slugify = (value: string): string =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "default";
+
+const suggestUniqueName = (name: string, existingIds: Set<string>): string => {
+  let suffix = 2;
+  let candidate = name;
+  let slug = slugify(candidate);
+  while (existingIds.has(slug)) {
+    candidate = `${name} ${suffix}`;
+    slug = slugify(candidate);
+    suffix += 1;
+  }
+  return candidate;
+};
+
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
   return apiFetchJson<T>(url, {
     method: "POST",
@@ -63,26 +82,51 @@ export function useProjects(): UseProjectsResult {
 
   const create = useCallback(
     async (input: { name: string; description?: string }) => {
+      const trimmedName = input.name.trim();
+      const existingIds = new Set(state.items.map((item) => item.id));
+      const slug = slugify(trimmedName);
+      if (existingIds.has(slug)) {
+        const suggestion = suggestUniqueName(trimmedName, existingIds);
+        const message = `Ya existe un proyecto con el identificador '${slug}'. Cree un proyecto con diferente nombre. Sugerencia: "${suggestion}".`;
+        logClient("projects.create.duplicate", { name: trimmedName, slug, suggestion }, "warn");
+        setState((prev) => ({ ...prev, error: message }));
+        throw new Error(message);
+      }
+
       try {
-        logClient("projects.create.start", { name: input.name });
-        const result = await postJSON<ProjectEntry>("/api/projects", input);
+        logClient("projects.create.start", { name: trimmedName, slug });
+        const result = await postJSON<ProjectEntry>("/api/projects", {
+          name: trimmedName,
+          description: input.description
+        });
         logClient("projects.create.success", { id: result.id, name: result.name });
+        // Refresh the project list to show the new project
+        logClient("projects.create.refreshing_list");
         await load();
+        logClient("projects.create.list_refreshed", { itemCount: state.items.length + 1 });
         return result;
       } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
         logClient(
           "projects.create.error",
-          { name: input.name, message: error instanceof Error ? error.message : String(error) },
+          { name: trimmedName, message: errorMsg },
           "error"
         );
+        
+        // Si el error menciona "Ya existe", recargar lista por si se creó pero no se mostró
+        if (errorMsg.includes("Ya existe") || errorMsg.includes("already exists")) {
+          logClient("projects.create.reloading_after_duplicate_error");
+          await load();
+        }
+        
         setState((prev) => ({
           ...prev,
-          error: error instanceof Error ? error.message : "Error desconocido"
+          error: errorMsg
         }));
-        return null;
+        throw error;
       }
     },
-    [load]
+    [load, state.items]
   );
 
   const update = useCallback(

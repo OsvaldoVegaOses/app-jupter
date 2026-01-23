@@ -374,6 +374,8 @@ const apiPlugin: PluginOption & {
         if (
           url.pathname.startsWith("/api/coding/") ||
           url.pathname.startsWith("/api/codes/") ||
+          url.pathname.startsWith("/api/admin") ||
+          url.pathname.startsWith("/api/maintenance") ||
           url.pathname.startsWith("/api/projects") ||
           url.pathname.startsWith("/api/fragments") ||
           url.pathname.startsWith("/api/interviews") ||

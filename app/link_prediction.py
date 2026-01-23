@@ -122,6 +122,14 @@ def _get_graph_data_from_postgres(
     """
     adjacency = defaultdict(set)
     node_types = {}
+
+    # Canonicalize codes so predictions don't learn from merged aliases.
+    try:
+        from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigos_bulk
+
+        ensure_codes_catalog_table(pg)
+    except Exception:
+        resolve_canonical_codigos_bulk = None  # type: ignore
     
     # 1. Obtener relaciones axiales (Categoria -> Codigo)
     with pg.cursor() as cur:
@@ -130,11 +138,23 @@ def _get_graph_data_from_postgres(
             FROM analisis_axial 
             WHERE project_id = %s
         """, (project_id,))
-        for cat, cod, rel in cur.fetchall():
-            adjacency[cat].add(cod)
-            adjacency[cod].add(cat)
-            node_types[cat] = "Categoria"
-            node_types[cod] = "Codigo"
+        axial_rows = cur.fetchall() or []
+
+    canon_map = {}
+    if resolve_canonical_codigos_bulk is not None:
+        unique_codes = {str(r[1]).strip() for r in axial_rows if r and r[1]}
+        try:
+            canon_map = resolve_canonical_codigos_bulk(pg, project_id, unique_codes)
+        except Exception:
+            canon_map = {}
+
+    for cat, cod, rel in axial_rows:
+        cod_s = str(cod).strip() if cod is not None else ""
+        cod_c = canon_map.get(cod_s, cod_s)
+        adjacency[cat].add(cod_c)
+        adjacency[cod_c].add(cat)
+        node_types[cat] = "Categoria"
+        node_types[cod_c] = "Codigo"
     
     # 2. Obtener co-ocurrencias de códigos en fragmentos (códigos relacionados)
     with pg.cursor() as cur:
@@ -149,11 +169,26 @@ def _get_graph_data_from_postgres(
             GROUP BY a.codigo, b.codigo
             HAVING COUNT(*) >= 2
         """, (project_id,))
-        for cod1, cod2, count in cur.fetchall():
-            adjacency[cod1].add(cod2)
-            adjacency[cod2].add(cod1)
-            node_types.setdefault(cod1, "Codigo")
-            node_types.setdefault(cod2, "Codigo")
+        co_rows = cur.fetchall() or []
+
+    if resolve_canonical_codigos_bulk is not None and co_rows:
+        unique_codes2 = {str(c).strip() for r in co_rows for c in r[:2] if c}
+        try:
+            canon_map2 = resolve_canonical_codigos_bulk(pg, project_id, unique_codes2)
+        except Exception:
+            canon_map2 = {}
+    else:
+        canon_map2 = {}
+
+    for cod1, cod2, count in co_rows:
+        c1 = canon_map2.get(str(cod1).strip(), str(cod1).strip())
+        c2 = canon_map2.get(str(cod2).strip(), str(cod2).strip())
+        if not c1 or not c2 or c1.lower() == c2.lower():
+            continue
+        adjacency[c1].add(c2)
+        adjacency[c2].add(c1)
+        node_types.setdefault(c1, "Codigo")
+        node_types.setdefault(c2, "Codigo")
     
     _logger.info(
         "link_prediction.postgres_graph", 

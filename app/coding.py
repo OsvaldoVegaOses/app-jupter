@@ -446,7 +446,7 @@ Responde SOLO en formato JSON válido:
         response = clients.aoai.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_completion_tokens=300,
+            max_completion_tokens=400,  # Increased from 300 to reduce truncation
         )
         
         # Handle potential None content safely
@@ -459,9 +459,39 @@ Responde SOLO en formato JSON válido:
         # Extraer JSON del contenido
         json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
         if json_match:
-            result = json.loads(json_match.group())
+            try:
+                result = json.loads(json_match.group())
+            except json.JSONDecodeError as je:
+                log.warning(
+                    "coding.suggest_code.json_decode_error",
+                    error=str(je),
+                    raw_match=json_match.group()[:500],
+                    full_content=content[:1000],
+                    content_length=len(content),
+                    model=model_name,
+                    fragments_count=len(fragments),
+                )
+                return {
+                    "suggested_code": None,
+                    "memo": content,
+                    "confidence": "baja",
+                    "error": f"JSON decode error: {je}",
+                }
+            
             result["llm_model"] = model_name
             result["fragments_count"] = len(fragments)
+            
+            # Validar que suggested_code exista y no esté vacío
+            suggested_code = (result.get("suggested_code") or "").strip()
+            if not suggested_code:
+                log.warning(
+                    "coding.suggest_code.missing_suggested_code",
+                    parsed_result=result,
+                    full_content=content[:1000],
+                    content_length=len(content),
+                    model=model_name,
+                    fragments_count=len(fragments),
+                )
             
             log.info(
                 "coding.suggest_code",
@@ -472,7 +502,15 @@ Responde SOLO en formato JSON válido:
             
             return result
         else:
-            log.warning("coding.suggest_code.parse_error", content=content[:200])
+            # No se encontró JSON en la respuesta - log detallado para diagnóstico
+            log.warning(
+                "coding.suggest_code.no_json_found",
+                full_content=content[:1000],
+                content_length=len(content),
+                content_empty=len(content.strip()) == 0,
+                model=model_name,
+                fragments_count=len(fragments),
+            )
             return {
                 "suggested_code": None,
                 "memo": content,
@@ -914,6 +952,9 @@ def list_available_interviews(
 
 def list_open_codes(clients: ServiceClients, project: Optional[str], limit: int = 50, search: Optional[str] = None, archivo: Optional[str] = None) -> List[Dict[str, Any]]:
     ensure_open_coding_table(clients.postgres)
+    from app.postgres_block import ensure_codes_catalog_table
+
+    ensure_codes_catalog_table(clients.postgres)
     return list_codes_summary(clients.postgres, project or "default", limit=limit, search=search, archivo=archivo)
 
 

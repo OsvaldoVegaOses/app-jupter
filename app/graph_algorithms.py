@@ -459,6 +459,14 @@ class GraphAlgorithms:
         node_props = {}
         node_id_counter = 0
         name_to_id = {}
+
+        # Canonicalize codes so graph algorithms don't amplify merged aliases.
+        try:
+            from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigos_bulk
+
+            ensure_codes_catalog_table(self.clients.postgres)
+        except Exception:
+            resolve_canonical_codigos_bulk = None  # type: ignore
         
         def get_or_create_id(name: str, label: str) -> str:
             nonlocal node_id_counter
@@ -475,10 +483,22 @@ class GraphAlgorithms:
                 FROM analisis_axial 
                 WHERE project_id = %s
             """, (project_id,))
-            for cat, cod, rel in cur.fetchall():
-                cat_id = get_or_create_id(cat, "Categoria")
-                cod_id = get_or_create_id(cod, "Codigo")
-                G.add_edge(cat_id, cod_id)
+            axial_rows = cur.fetchall() or []
+
+        canon_map = {}
+        if resolve_canonical_codigos_bulk is not None and axial_rows:
+            unique_codes = {str(r[1]).strip() for r in axial_rows if r and r[1]}
+            try:
+                canon_map = resolve_canonical_codigos_bulk(self.clients.postgres, project_id, unique_codes)
+            except Exception:
+                canon_map = {}
+
+        for cat, cod, rel in axial_rows:
+            cod_s = str(cod).strip() if cod is not None else ""
+            cod_c = canon_map.get(cod_s, cod_s)
+            cat_id = get_or_create_id(cat, "Categoria")
+            cod_id = get_or_create_id(cod_c, "Codigo")
+            G.add_edge(cat_id, cod_id)
         
         # 2. Co-ocurrencias de códigos (para Louvain/comunidades)
         with self.clients.postgres.cursor() as cur:
@@ -493,10 +513,24 @@ class GraphAlgorithms:
                 GROUP BY a.codigo, b.codigo
                 HAVING COUNT(*) >= 2
             """, (project_id,))
-            for cod1, cod2, cnt in cur.fetchall():
-                id1 = get_or_create_id(cod1, "Codigo")
-                id2 = get_or_create_id(cod2, "Codigo")
-                G.add_edge(id1, id2)
+            co_rows = cur.fetchall() or []
+
+        canon_map2 = {}
+        if resolve_canonical_codigos_bulk is not None and co_rows:
+            unique_codes2 = {str(c).strip() for r in co_rows for c in r[:2] if c}
+            try:
+                canon_map2 = resolve_canonical_codigos_bulk(self.clients.postgres, project_id, unique_codes2)
+            except Exception:
+                canon_map2 = {}
+
+        for cod1, cod2, cnt in co_rows:
+            c1 = canon_map2.get(str(cod1).strip(), str(cod1).strip())
+            c2 = canon_map2.get(str(cod2).strip(), str(cod2).strip())
+            if not c1 or not c2 or c1.lower() == c2.lower():
+                continue
+            id1 = get_or_create_id(c1, "Codigo")
+            id2 = get_or_create_id(c2, "Codigo")
+            G.add_edge(id1, id2)
         
         _logger.info(
             "graph_algorithms.postgres_graph",
@@ -877,13 +911,18 @@ class GraphAlgorithms:
     def _create_gds_projection(self, session, graph_name: str, project_id: str) -> None:
         """Crea proyección GDS con filtro de proyecto."""
         node_query = f"""
-            MATCH (n) WHERE n.project_id = '{project_id}' 
-            AND (n:Categoria OR n:Codigo)
+                        MATCH (n)
+                        WHERE n.project_id = '{project_id}'
+                            AND (
+                                n:Categoria OR (n:Codigo AND coalesce(n.status,'active') <> 'merged')
+                            )
             RETURN id(n) AS id
         """
         rel_query = f"""
             MATCH (s)-[r:REL]->(t) 
-            WHERE s.project_id = '{project_id}' AND t.project_id = '{project_id}'
+                        WHERE s.project_id = '{project_id}' AND t.project_id = '{project_id}'
+                            AND (NOT s:Codigo OR coalesce(s.status,'active') <> 'merged')
+                            AND (NOT t:Codigo OR coalesce(t.status,'active') <> 'merged')
             RETURN id(s) AS source, id(t) AS target, type(r) AS type
         """
         session.run(
@@ -907,22 +946,24 @@ class GraphAlgorithms:
     def _louvain_memgraph(self, project_id: str, persist: bool) -> List[Dict[str, Any]]:
         """Louvain con Memgraph MAGE."""
         _logger.info("graph_algorithms.louvain", engine="memgraph_mage", project_id=project_id)
-        
+
         # MAGE no tiene graph catalog, ejecuta directamente sobre nodos
         query = """
         MATCH (n)-[r:REL]-(m)
         WHERE n.project_id = $project_id AND m.project_id = $project_id
+          AND (NOT n:Codigo OR coalesce(n.status,'active') <> 'merged')
+          AND (NOT m:Codigo OR coalesce(m.status,'active') <> 'merged')
         WITH collect(n) AS nodes, collect(r) AS rels
-        CALL community_detection.louvain(nodes, rels) 
+        CALL community_detection.louvain(nodes, rels)
         YIELD node, community_id
         RETURN node.nombre AS nombre, labels(node) AS etiquetas, community_id
         ORDER BY community_id, nombre
         """
-        
+
         try:
             with self.clients.neo4j.session(database=self.settings.neo4j.database) as session:
                 results = [dict(r) for r in session.run(query, project_id=project_id)]
-                
+
                 if persist and results:
                     # Persist community_id
                     update_query = """
@@ -931,7 +972,7 @@ class GraphAlgorithms:
                     SET n.community_id = row.community_id
                     """
                     session.run(update_query, data=results, project_id=project_id).consume()
-                
+
                 return results
         except Exception as e:
             _logger.warning("graph_algorithms.mage_failed_fallback", algorithm="louvain", error=str(e))
@@ -946,15 +987,16 @@ class GraphAlgorithms:
     ) -> List[Dict[str, Any]]:
         """PageRank con Memgraph MAGE."""
         _logger.info("graph_algorithms.pagerank", engine="memgraph_mage", project_id=project_id)
-        
+
         query = """
         CALL pagerank.get()
         YIELD node, rank
         WHERE node.project_id = $project_id
+          AND (NOT node:Codigo OR coalesce(node.status,'active') <> 'merged')
         RETURN node.nombre AS nombre, labels(node) AS etiquetas, rank AS score
         ORDER BY score DESC
         """
-        
+
         try:
             with self.clients.neo4j.session(database=self.settings.neo4j.database) as session:
                 results = [dict(r) for r in session.run(query, project_id=project_id)]

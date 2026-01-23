@@ -17,7 +17,8 @@
  * - POST /api/neo4j/export → Exportar CSV/JSON
  * - GET /api/coding/citations → Citas por código (detalle de nodo)
  * 
- * NOTA: Los algoritmos GDS (Louvain, PageRank) ahora están en LinkPredictionPanel.
+ * NOTA: Los controles GDS en UI fueron removidos; la ejecución de GDS ocurre vía API/CLI
+ * (p.ej. `POST /api/axial/gds` o `python main.py axial gds ...`).
  * 
  * @module components/Neo4jExplorer
  */

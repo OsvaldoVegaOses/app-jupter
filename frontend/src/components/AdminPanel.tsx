@@ -5,7 +5,12 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import { apiFetchJson, apiFetch } from "../services/api";
+import { CodeIdTransitionSection } from "./CodeIdTransitionSection";
+import { AdminOpsPanel } from "./AdminOpsPanel";
 import "./AdminPanel.css";
+
+// Constante de localStorage consistente con App.tsx
+const PROJECT_STORAGE_KEY = "qualy-dashboard-project";
 
 interface OrgUser {
     id: string;
@@ -52,7 +57,7 @@ function Neo4jSyncSection() {
     const [resetting, setResetting] = useState(false);
     const [message, setMessage] = useState<string | null>(null);
     const [axialMessage, setAxialMessage] = useState<string | null>(null);
-    const project = localStorage.getItem("project") || "default";
+    const project = localStorage.getItem(PROJECT_STORAGE_KEY) || "default";
 
     const fetchStatus = useCallback(async () => {
         try {
@@ -210,7 +215,7 @@ interface AnalysisResult {
 
 // Cleanup Section Component
 function CleanupSection() {
-    const [project, setProject] = useState(() => localStorage.getItem("project") || "default");
+    const [project, setProject] = useState(() => localStorage.getItem(PROJECT_STORAGE_KEY) || "default");
     const [cleaningAll, setCleaningAll] = useState(false);
     const [cleaningProjects, setCleaningProjects] = useState(false);
     const [cleaningOrphans, setCleaningOrphans] = useState(false);
@@ -435,7 +440,7 @@ function CleanupSection() {
 
 // Analysis Section Component
 function AnalysisSection() {
-    const [project, setProject] = useState(() => localStorage.getItem("project") || "default");
+    const [project, setProject] = useState(() => localStorage.getItem(PROJECT_STORAGE_KEY) || "default");
     const [threshold, setThreshold] = useState(0.85);
     const [analyzeLoading, setAnalyzeLoading] = useState<string | null>(null);
     const [analysisResults, setAnalysisResults] = useState<Record<string, AnalysisResult | null>>({
@@ -729,7 +734,7 @@ export function AdminPanel({ currentUserId }: AdminPanelProps) {
     const [error, setError] = useState<string | null>(null);
     const [actionLoading, setActionLoading] = useState<string | null>(null);
     const [panelResetKey, setPanelResetKey] = useState(0);
-    const [syncProjectId, setSyncProjectId] = useState(() => localStorage.getItem("project") || "default");
+    const [syncProjectId, setSyncProjectId] = useState(() => localStorage.getItem(PROJECT_STORAGE_KEY) || "default");
     const [syncOrgId, setSyncOrgId] = useState("default_org");
     const [syncUseUserRole, setSyncUseUserRole] = useState(true);
     const [syncDefaultRole, setSyncDefaultRole] = useState("codificador");
@@ -765,7 +770,7 @@ export function AdminPanel({ currentUserId }: AdminPanelProps) {
     }, [stats]);
 
     const handleResetPanel = () => {
-        const projectDefault = localStorage.getItem("project") || "default";
+        const projectDefault = localStorage.getItem(PROJECT_STORAGE_KEY) || "default";
         setError(null);
         setSyncMessage(null);
         setActionLoading(null);
@@ -971,6 +976,12 @@ export function AdminPanel({ currentUserId }: AdminPanelProps) {
 
             {/* Neo4j Sync Section */}
             <Neo4jSyncSection key={`neo4j-${panelResetKey}`} />
+
+            {/* Ergonomía operativa: historial de ejecuciones admin (logs JSONL) */}
+            <AdminOpsPanel />
+
+            {/* Fase 1.5: Mantenimiento identidad (code_id) */}
+            <CodeIdTransitionSection />
 
             {/* Cleanup Section */}
             <CleanupSection key={`cleanup-${panelResetKey}`} />

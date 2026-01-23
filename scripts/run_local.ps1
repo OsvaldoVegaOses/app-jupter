@@ -10,6 +10,18 @@ cd frontend
 npm run dev
 #### Matar procesos
 python "C:\Users\osval\Downloads\APP_Jupter\scripts\Cerrar_procesos.py" --kill-python
+# Solo liberar puertos 8000 y 5173-5180 (Vite puede moverse de 5173 a 5174+)
+
+python scripts/Cerrar_procesos.py
+
+# Matar frontend (node.exe)
+python scripts/Cerrar_procesos.py --kill-node
+
+# Matar backend (python.exe excepto este script)
+python scripts/Cerrar_procesos.py --kill-python
+
+# Matar TODO (recomendado)
+python scripts/Cerrar_procesos.py --kill-app
 
 .DESCRIPTION
   Acciones soportadas:

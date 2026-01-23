@@ -171,7 +171,13 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
 
   const pollRunnerStatus = useCallback(async (taskId: string) => {
     try {
-      const status = await apiFetchJson<AgentStatusResponse>(`/api/agent/status/${taskId}`);
+      // Sprint 31: Timeout de 60s para runner (en lugar de 30s default)
+      const status = await apiFetchJson<AgentStatusResponse>(
+        `/api/agent/status/${taskId}`,
+        {},
+        undefined,
+        60000  // 60s timeout for runner operations
+      );
       pollFailCountRef.current = 0; // Reset on success
       setRunnerTask(status);
 
@@ -183,16 +189,19 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
         }
       }
     } catch (err) {
+      // Sprint 31: Con timeout de 60s, los timeouts son ahora fallos reales
       pollFailCountRef.current += 1;
-      console.warn(`Runner poll failed (${pollFailCountRef.current}/3):`, err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.warn(`Runner poll failed (${pollFailCountRef.current}/5):`, err);
 
-      // Sprint 30: After 3 consecutive failures, stop polling and show error
-      if (pollFailCountRef.current >= 3) {
+      // Después de 5 fallos, mostrar error
+      if (pollFailCountRef.current >= 5) {
         clearRunnerInterval();
         setRunnerLoading(false);
         setRunnerError(
           "⚠️ Conexión perdida con el servidor. " +
-          (err instanceof Error ? err.message : "Verifica que el backend esté activo.")
+          errorMessage +
+          "\n\n💡 El runner puede haber terminado correctamente. Refresca la página para ver los resultados."
         );
       }
     }
@@ -219,16 +228,22 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
     clearRunnerInterval();
 
     try {
-      const data = await apiFetchJson<AgentExecuteResponse>("/api/agent/execute", {
-        method: "POST",
-        body: JSON.stringify({
-          project_id: project,
-          concepts: positives,
-          max_iterations: 50,
-          discovery_only: true,
-          // Defaults in backend: max_interviews=10, iterations_per_interview=4
-        }),
-      });
+      // Sprint 31: Timeout de 60s para runner execute
+      const data = await apiFetchJson<AgentExecuteResponse>(
+        "/api/agent/execute",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            project_id: project,
+            concepts: positives,
+            max_iterations: 50,
+            discovery_only: true,
+            // Defaults in backend: max_interviews=10, iterations_per_interview=4
+          }),
+        },
+        undefined,
+        60000  // 60s timeout for runner operations
+      );
 
       // Start polling
       await pollRunnerStatus(data.task_id);

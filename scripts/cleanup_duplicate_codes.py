@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import unicodedata
 from typing import List, Dict, Any, Tuple
 
 # Agregar el directorio raíz al path
@@ -27,31 +28,111 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 import psycopg2
+from rapidfuzz.distance import Levenshtein
 
-load_dotenv()
+load_dotenv(os.getenv("APP_ENV_FILE", ".env"))
 
 
 def get_pg_connection():
     """Crea conexión a PostgreSQL."""
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=os.getenv("POSTGRES_DB", "jupter"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        host=os.getenv("POSTGRES_HOST") or os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("POSTGRES_PORT") or os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("POSTGRES_DB") or os.getenv("PGDATABASE", "jupter"),
+        user=os.getenv("POSTGRES_USER") or os.getenv("PGUSER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD", "postgres"),
+        sslmode=os.getenv("POSTGRES_SSLMODE") or os.getenv("PGSSLMODE", "prefer"),
     )
 
 
-def ensure_fuzzystrmatch(conn) -> bool:
-    """Habilita la extensión fuzzystrmatch si no existe."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;")
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"⚠️ No se pudo habilitar fuzzystrmatch: {e}")
-        return False
+def _normalize_text(value: str) -> str:
+    """Normaliza texto: trim, lower y remueve acentos (Unicode)."""
+    if value is None:
+        return ""
+    trimmed = value.strip().lower()
+    normalized = unicodedata.normalize("NFKD", trimmed)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _levenshtein_distance(s1: str, s2: str) -> int:
+    """Calcula distancia de Levenshtein usando RapidFuzz (compatible con Azure)."""
+    return Levenshtein.distance(s1, s2)
+
+
+def _find_similar_pairs(
+    codes: List[str],
+    threshold: float = 0.80,
+    limit: int = 100,
+    include_exact: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Encuentra pares de códigos similares usando RapidFuzz (Levenshtein).
+    Si include_exact=True, incluye duplicados exactos (distancia=0).
+    """
+    normalized_codes = [_normalize_text(c) for c in codes if c]
+    rep_by_norm: Dict[str, str] = {}
+    for original, norm in zip(codes, normalized_codes):
+        if original:
+            rep_by_norm.setdefault(norm, original)
+
+    duplicates: List[Dict[str, Any]] = []
+
+    if include_exact:
+        counts: Dict[str, int] = {}
+        variants_by_norm: Dict[str, set[str]] = {}
+        for original, norm in zip(codes, normalized_codes):
+            counts[norm] = counts.get(norm, 0) + 1
+            variants_by_norm.setdefault(norm, set()).add(original.strip())
+        for norm, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+            if count <= 1:
+                continue
+            if len(variants_by_norm.get(norm, set())) <= 1:
+                continue
+            duplicates.append({
+                "code1": rep_by_norm.get(norm, norm),
+                "code2": rep_by_norm.get(norm, norm),
+                "distance": 0,
+                "max_len": len(norm),
+                "similarity": 1.0,
+                "is_exact_duplicate": True,
+                "duplicate_count": count,
+            })
+            if len(duplicates) >= limit:
+                return duplicates[:limit]
+
+    unique_codes = list(set(normalized_codes))
+
+    for i, c1 in enumerate(unique_codes):
+        for c2 in unique_codes[i + 1:]:
+            max_len = max(len(c1), len(c2))
+            if max_len == 0:
+                continue
+            # Pre-filter por diferencia de longitud
+            if abs(len(c1) - len(c2)) > int((1 - threshold) * max_len):
+                continue
+
+            distance = _levenshtein_distance(c1, c2)
+            if distance == 0:
+                continue
+            similarity = 1 - (distance / max_len)
+
+            if similarity >= threshold:
+                duplicates.append({
+                    "code1": rep_by_norm.get(c1, c1),
+                    "code2": rep_by_norm.get(c2, c2),
+                    "distance": distance,
+                    "max_len": max_len,
+                    "similarity": round(similarity, 3),
+                    "is_exact_duplicate": False,
+                })
+
+                if len(duplicates) >= limit:
+                    break
+        if len(duplicates) >= limit:
+            break
+
+    duplicates.sort(key=lambda x: x["similarity"], reverse=True)
+    return duplicates[:limit]
 
 
 def find_similar_candidates(
@@ -72,46 +153,17 @@ def find_similar_candidates(
     Returns:
         Lista de pares similares con sus scores
     """
-    # Convertir threshold (0-1) a distancia máxima de Levenshtein
-    # Para códigos cortos (~15 chars), threshold 0.80 ≈ max 3 ediciones
-    max_distance = int((1 - threshold) * 15)  # Aproximación
-    
     sql = """
-    WITH unique_codes AS (
-        SELECT DISTINCT codigo
-        FROM codigos_candidatos
-        WHERE project_id = %s AND estado IN ('pendiente', 'validado')
-    )
-    SELECT 
-        c1.codigo AS code1,
-        c2.codigo AS code2,
-        levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) AS distance,
-        GREATEST(LENGTH(c1.codigo), LENGTH(c2.codigo)) AS max_len,
-        1.0 - (levenshtein(LOWER(c1.codigo), LOWER(c2.codigo))::float / 
-               GREATEST(LENGTH(c1.codigo), LENGTH(c2.codigo))::float) AS similarity
-    FROM unique_codes c1, unique_codes c2
-    WHERE c1.codigo < c2.codigo  -- Evitar duplicados y auto-comparación
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) <= %s
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) > 0  -- No idénticos
-    ORDER BY similarity DESC
-    LIMIT %s
+    SELECT DISTINCT codigo
+    FROM codigos_candidatos
+    WHERE project_id = %s AND estado IN ('pendiente', 'validado')
     """
-    
     with conn.cursor() as cur:
-        cur.execute(sql, (project_id, max_distance, limit))
+        cur.execute(sql, (project_id,))
         rows = cur.fetchall()
-    
-    return [
-        {
-            "code1": row[0],
-            "code2": row[1],
-            "distance": row[2],
-            "max_len": row[3],
-            "similarity": round(row[4], 3),
-        }
-        for row in rows
-        if row[4] >= threshold  # Filtrar por threshold real
-    ]
+
+    codes = [row[0] for row in rows if row[0]]
+    return _find_similar_pairs(codes, threshold=threshold, limit=limit)
 
 
 def find_similar_open_codes(
@@ -123,44 +175,17 @@ def find_similar_open_codes(
     """
     Encuentra pares de códigos abiertos (definitivos) similares.
     """
-    max_distance = int((1 - threshold) * 15)
-    
     sql = """
-    WITH unique_codes AS (
-        SELECT DISTINCT codigo
-        FROM analisis_codigos_abiertos
-        WHERE project_id = %s
-    )
-    SELECT 
-        c1.codigo AS code1,
-        c2.codigo AS code2,
-        levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) AS distance,
-        GREATEST(LENGTH(c1.codigo), LENGTH(c2.codigo)) AS max_len,
-        1.0 - (levenshtein(LOWER(c1.codigo), LOWER(c2.codigo))::float / 
-               GREATEST(LENGTH(c1.codigo), LENGTH(c2.codigo))::float) AS similarity
-    FROM unique_codes c1, unique_codes c2
-    WHERE c1.codigo < c2.codigo
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) <= %s
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) > 0
-    ORDER BY similarity DESC
-    LIMIT %s
+    SELECT DISTINCT codigo
+    FROM analisis_codigos_abiertos
+    WHERE project_id = %s
     """
-    
     with conn.cursor() as cur:
-        cur.execute(sql, (project_id, max_distance, limit))
+        cur.execute(sql, (project_id,))
         rows = cur.fetchall()
-    
-    return [
-        {
-            "code1": row[0],
-            "code2": row[1],
-            "distance": row[2],
-            "max_len": row[3],
-            "similarity": round(row[4], 3),
-        }
-        for row in rows
-        if row[4] >= threshold
-    ]
+
+    codes = [row[0] for row in rows if row[0]]
+    return _find_similar_pairs(codes, threshold=threshold, limit=limit)
 
 
 def get_duplicate_stats(conn, project_id: str, threshold: float = 0.80) -> Dict[str, Any]:
@@ -202,17 +227,20 @@ def main():
     
     conn = get_pg_connection()
     
-    # Habilitar extensión
-    if not ensure_fuzzystrmatch(conn):
-        print("❌ Error: No se pudo habilitar fuzzystrmatch")
-        sys.exit(1)
+    # RapidFuzz no requiere extensiones en PostgreSQL
     
     # Buscar duplicados en candidatos
     print("📋 Códigos candidatos duplicados:")
     candidates = find_similar_candidates(conn, args.project, args.threshold, args.limit)
     if candidates:
         for pair in candidates:
-            print(f"   • '{pair['code1']}' ↔ '{pair['code2']}' ({pair['similarity']:.0%})")
+            if pair.get("is_exact_duplicate"):
+                print(
+                    f"   • '{pair['code1']}' ↔ '{pair['code2']}' "
+                    f"(EXACTO x{pair.get('duplicate_count', 2)})"
+                )
+            else:
+                print(f"   • '{pair['code1']}' ↔ '{pair['code2']}' ({pair['similarity']:.0%})")
     else:
         print("   ✅ No se encontraron duplicados")
     
@@ -223,7 +251,13 @@ def main():
     open_codes = find_similar_open_codes(conn, args.project, args.threshold, args.limit)
     if open_codes:
         for pair in open_codes:
-            print(f"   • '{pair['code1']}' ↔ '{pair['code2']}' ({pair['similarity']:.0%})")
+            if pair.get("is_exact_duplicate"):
+                print(
+                    f"   • '{pair['code1']}' ↔ '{pair['code2']}' "
+                    f"(EXACTO x{pair.get('duplicate_count', 2)})"
+                )
+            else:
+                print(f"   • '{pair['code1']}' ↔ '{pair['code2']}' ({pair['similarity']:.0%})")
     else:
         print("   ✅ No se encontraron duplicados")
     

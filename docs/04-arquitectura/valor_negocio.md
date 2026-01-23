@@ -68,7 +68,7 @@ Lectura práctica: Memgraph rinde más cuando el valor está en **compute** y ra
 
 #### C) Recomendación concreta para tu producto (sin sobrediseñar)
 
-1) **Usa Neo4j como grafo “canon”** (persistente y gobernable) para:
+1) **Usa PostgreSQL como ledger canónico (fuente de verdad)** y **Neo4j como proyección persistida y gobernable** para:
 	- relaciones axiales confirmadas, evidencia, y navegación explicable.
 	- controles de consistencia (reglas de integridad por proyecto).
 
@@ -77,7 +77,7 @@ Lectura práctica: Memgraph rinde más cuando el valor está en **compute** y ra
 3) **Considera Memgraph solo si** el cuello de botella real es compute/latencia o si quieres un sandbox de analítica:
 	- No como “sustituto por defecto”, sino como **acelerador** o **entorno de experimentación**.
 
-4) **Evita la dualidad sin motivo**: mantener dos grafos en paralelo (Neo4j + Memgraph) exige sincronización, definición de “fuente de verdad” y planes de recuperación.
+4) **Evita la dualidad sin motivo**: mantener dos grafos en paralelo (Neo4j + Memgraph) exige sincronización, definición explícita de “fuente de verdad” (PostgreSQL) y planes de recuperación.
 
 
 

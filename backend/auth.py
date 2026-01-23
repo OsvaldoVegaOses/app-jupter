@@ -39,11 +39,33 @@ from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 from app.tenant_context import set_current_user_context
 
-load_dotenv()
+ENV_FILE_VAR = "APP_ENV_FILE"
+
+# Load .env early so module-level auth settings (API_KEY_*) are correctly
+# initialized even under uvicorn --reload where cwd/app-dir can vary.
+try:
+    _env_file = os.getenv(ENV_FILE_VAR) or find_dotenv(usecwd=True)
+    if not _env_file:
+        try:
+            from pathlib import Path
+
+            candidate = Path(__file__).resolve().parents[1] / ".env"
+            if candidate.exists():
+                _env_file = str(candidate)
+        except Exception:
+            _env_file = None
+    if _env_file:
+        load_dotenv(_env_file, override=True)
+    else:
+        # best-effort: fall back to default dotenv behavior
+        load_dotenv(override=True)
+except Exception:
+    # Never fail import due to dotenv issues.
+    pass
 
 # =============================================================================
 # CONFIGURACIÓN
@@ -58,13 +80,39 @@ ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 # Tiempo de expiración de tokens (minutos)
 ACCESS_TOKEN_EXPIRE_MINUTES = 240  # 4 horas para desarrollo
 
-# API Key alternativa (para integraciones simples)
-# Prioriza NEO4J_API_KEY por compatibilidad con configuración existente
-API_KEY = os.getenv("NEO4J_API_KEY") or os.getenv("API_KEY")
-# En multi-tenant estricto, la API key debe estar acotada a una organización.
-API_KEY_ORG_ID = os.getenv("API_KEY_ORG_ID")
-API_KEY_USER_ID = os.getenv("API_KEY_USER_ID", "api-key-user")
-API_KEY_ROLES = [r.strip() for r in os.getenv("API_KEY_ROLES", "admin").split(",") if r.strip()]
+def _get_api_key_config() -> tuple[Optional[str], Optional[str], str, List[str]]:
+    """Lee configuración de API key desde el entorno (runtime).
+
+    Nota: no confiamos en valores inicializados en import-time porque uvicorn
+    --reload y diferentes cwd/app-dir pueden desincronizar la carga del .env.
+    """
+
+    @lru_cache(maxsize=1)
+    def _ensure_env_loaded() -> None:
+        try:
+            env_file = os.getenv(ENV_FILE_VAR) or find_dotenv(usecwd=True)
+            if not env_file:
+                try:
+                    from pathlib import Path
+
+                    candidate = Path(__file__).resolve().parents[1] / ".env"
+                    if candidate.exists():
+                        env_file = str(candidate)
+                except Exception:
+                    env_file = None
+            if env_file:
+                load_dotenv(env_file, override=True)
+        except Exception:
+            pass
+
+    # Ensure env is loaded before reading values.
+    _ensure_env_loaded()
+
+    api_key = os.getenv("NEO4J_API_KEY") or os.getenv("API_KEY")
+    org_id = os.getenv("API_KEY_ORG_ID")
+    user_id = os.getenv("API_KEY_USER_ID", "api-key-user")
+    roles = [r.strip() for r in os.getenv("API_KEY_ROLES", "admin").split(",") if r.strip()]
+    return api_key, org_id, user_id, roles
 
 # Esquema OAuth2 para extraer token del header
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
@@ -171,15 +219,29 @@ async def get_current_user(
         return user
 
     # Opción 2: API Key (para integraciones simples)
-    if x_api_key and API_KEY and x_api_key == API_KEY:
-        if not API_KEY_ORG_ID:
+    api_key, org_id, api_user_id, api_roles = _get_api_key_config()
+
+    # Best-effort: if org_id is missing, try to load settings (which loads .env
+    # with override=True) and then re-read env. This avoids 401s when the running
+    # process didn't pick up .env correctly.
+    if x_api_key and api_key and x_api_key == api_key and not org_id:
+        try:
+            from app.settings import load_settings
+
+            load_settings(os.getenv(ENV_FILE_VAR))
+        except Exception:
+            pass
+        api_key, org_id, api_user_id, api_roles = _get_api_key_config()
+
+    if x_api_key and api_key and x_api_key == api_key:
+        if not org_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="API Key requires API_KEY_ORG_ID for strict multi-tenant",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        roles = [str(r).strip().lower() for r in API_KEY_ROLES if str(r).strip()]
-        user = User(user_id=API_KEY_USER_ID, organization_id=API_KEY_ORG_ID, roles=roles)
+        roles = [str(r).strip().lower() for r in (api_roles or []) if str(r).strip()]
+        user = User(user_id=str(api_user_id), organization_id=str(org_id), roles=roles)
         set_current_user_context(user.user_id, user.organization_id, user.roles)
         return user
 

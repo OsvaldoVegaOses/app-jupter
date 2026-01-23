@@ -76,6 +76,8 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import unicodedata
 import uuid
 import asyncio
 from collections import Counter
@@ -89,6 +91,7 @@ from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple, Union, cast, LiteralString
 
 import structlog
+from rapidfuzz.distance import Levenshtein
 from pydantic import BaseModel, ConfigDict, Field
 import openai
 
@@ -168,6 +171,7 @@ from app.postgres_block import (
     validate_candidate,
     reject_candidate,
     merge_candidates,
+    merge_candidates_by_code,
     promote_to_definitive,
     get_candidate_stats_by_source,
     get_canonical_examples,
@@ -1303,6 +1307,12 @@ async def api_create_project(
     
     El owner_id se asigna automáticamente al usuario que lo crea.
     """
+    api_logger.info(
+        "project.create.start",
+        project_name=payload.name,
+        user=user.user_id,
+        org_id=user.organization_id,
+    )
     try:
         entry = create_project(
             clients.postgres,
@@ -1311,16 +1321,42 @@ async def api_create_project(
             org_id=user.organization_id,
             owner_id=user.user_id,  # Asignar al usuario creador
         )
-        # En multi-tenant estricto, el creador debe quedar como admin del proyecto.
-        add_project_member(
-            clients.postgres,
-            entry.get("id"),
-            user.user_id,
-            "admin",
-            added_by=user.user_id,
+        api_logger.info(
+            "project.create.db_success",
+            project_id=entry.get("id"),
+            project_name=payload.name,
         )
+        # En multi-tenant estricto, el creador debe quedar como admin del proyecto.
+        try:
+            add_project_member(
+                clients.postgres,
+                entry.get("id"),
+                user.user_id,
+                "admin",
+                added_by=user.user_id,
+            )
+        except Exception as member_exc:
+            # Log pero no fallar - el proyecto ya fue creado
+            api_logger.warning(
+                "project.create.member_add_warning",
+                project_id=entry.get("id"),
+                error=str(member_exc),
+            )
     except ValueError as exc:
+        api_logger.warning(
+            "project.create.validation_error",
+            project_name=payload.name,
+            error=str(exc),
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        api_logger.error(
+            "project.create.unexpected_error",
+            project_name=payload.name,
+            error=str(exc),
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f"Error interno: {exc}") from exc
     api_logger.info(
         "project.created",
         project_id=entry.get("id"),
@@ -3239,6 +3275,9 @@ class MergeCandidatesRequest(BaseModel):
     project: str
     source_ids: List[int]
     target_codigo: str
+    memo: Optional[str] = None
+    dry_run: bool = False
+    idempotency_key: Optional[str] = None
 
 
 class PromoteCandidatesRequest(BaseModel):
@@ -3246,7 +3285,17 @@ class PromoteCandidatesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project: str
-    candidate_ids: List[int]
+    candidate_ids: Optional[List[int]] = None
+    promote_all_validated: bool = False
+
+
+class RevertValidatedCandidatesRequest(BaseModel):
+    """Request para revertir candidatos validados a pendientes."""
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    memo: Optional[str] = None
+    dry_run: bool = False
 
 
 @app.get("/api/codes/candidates")
@@ -3256,6 +3305,7 @@ async def api_list_candidates(
     estado: Optional[str] = Query(None, description="Filtrar por estado: pendiente, validado, rechazado, fusionado"),
     fuente_origen: Optional[str] = Query(None, description="Filtrar por origen: llm, manual, discovery, semantic_suggestion"),
     archivo: Optional[str] = Query(None, description="Filtrar por archivo"),
+    promovido: Optional[bool] = Query(None, description="Filtrar por promoción: true (ya promovidos) / false (pendientes por promover)"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     sort_order: str = Query("desc", description="Ordenamiento: 'desc' (recientes primero) o 'asc' (antiguos primero)"),
@@ -3274,6 +3324,7 @@ async def api_list_candidates(
             estado=estado,
             fuente_origen=fuente_origen,
             archivo=archivo,
+            promovido=promovido,
             limit=limit,
             offset=offset,
             sort_order=sort_order,
@@ -3367,6 +3418,43 @@ async def api_create_candidate(
     return {"success": count > 0, "inserted": count}
 
 
+@app.post("/api/codes/candidates/revert-validated")
+async def api_revert_validated_candidates(
+    payload: RevertValidatedCandidatesRequest,
+    clients: ServiceClients = Depends(get_service_clients),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Revierte todos los candidatos validados a pendientes para un proyecto.
+
+    Operación acotada a `codigos_candidatos` (no retrocede promociones a tablas definitivas).
+    """
+    try:
+        project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    from app.postgres_block import revert_validated_candidates_to_pending
+
+    result = revert_validated_candidates_to_pending(
+        clients.postgres,
+        project_id=project_id,
+        reverted_by=(user.user_id if user else None),
+        memo=payload.memo,
+        dry_run=bool(payload.dry_run),
+    )
+
+    api_logger.info(
+        "codes.candidates.revert_validated",
+        project_id=project_id,
+        dry_run=bool(payload.dry_run),
+        reverted_count=int(result.get("reverted_count", 0) or 0),
+        would_revert=int(result.get("would_revert", 0) or 0),
+        user_id=(user.user_id if user else None),
+    )
+
+    return {"success": True, **result}
+
+
 @app.put("/api/codes/candidates/{candidate_id}/validate")
 async def api_validate_candidate(
     candidate_id: int,
@@ -3382,6 +3470,59 @@ async def api_validate_candidate(
     
     clients = build_clients_or_error(settings)
     try:
+        # Pre-validación robusta: evitar falsos positivos antes de validar
+        with clients.postgres.cursor() as cur:
+            cur.execute(
+                "SELECT codigo, estado FROM codigos_candidatos WHERE project_id = %s AND id = %s",
+                (project_id, candidate_id),
+            )
+            row = cur.fetchone()
+
+        if row:
+            candidate_code, candidate_state = row[0], row[1]
+            if candidate_code and candidate_state != "validado":
+                norm_candidate = _normalize_text(candidate_code)
+                threshold_pre = float(os.getenv("PREVALIDATE_DUPLICATE_THRESHOLD", "0.9"))
+                with clients.postgres.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT codigo
+                        FROM codigos_candidatos
+                        WHERE project_id = %s
+                          AND estado IN ('pendiente','validado')
+                          AND id <> %s
+                        """,
+                        (project_id, candidate_id),
+                    )
+                    rows = cur.fetchall()
+
+                for (other_code,) in rows:
+                    if not other_code:
+                        continue
+                    norm_other = _normalize_text(other_code)
+                    if norm_other == norm_candidate and other_code.strip() != candidate_code.strip():
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Código duplicado exacto detectado: '{other_code}'.",
+                        )
+                    max_len = max(len(norm_candidate), len(norm_other))
+                    if max_len == 0:
+                        continue
+                    if abs(len(norm_candidate) - len(norm_other)) > int((1 - threshold_pre) * max_len):
+                        continue
+                    distance = _levenshtein_distance(norm_candidate, norm_other)
+                    similarity = 1 - (distance / max_len)
+                    if similarity >= threshold_pre and distance > 0:
+                        if not _token_overlap_ok(candidate_code, other_code):
+                            continue
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Código muy similar detectado antes de validar: "
+                                f"'{other_code}' ({similarity:.0%})."
+                            ),
+                        )
+
         success = validate_candidate(
             clients.postgres,
             project_id=project_id,
@@ -3468,20 +3609,464 @@ async def api_merge_candidates(
     
     if not payload.source_ids:
         raise HTTPException(status_code=400, detail="source_ids no puede estar vacío")
+
+    if not payload.target_codigo or not payload.target_codigo.strip():
+        raise HTTPException(status_code=400, detail="target_codigo no puede estar vacío")
     
     clients = build_clients_or_error(settings)
     try:
-        count = merge_candidates(
+        from app.postgres_block import (  # local import to avoid module init cycles
+            ensure_api_idempotency_table,
+            get_idempotency_response,
+            store_idempotency_response,
+            preview_merge_candidates_by_ids,
+        )
+
+        endpoint_key = "POST /api/codes/candidates/merge"
+        ensure_api_idempotency_table(clients.postgres)
+
+        if payload.idempotency_key:
+            cached = get_idempotency_response(
+                clients.postgres,
+                project_id=project_id,
+                endpoint=endpoint_key,
+                idempotency_key=payload.idempotency_key,
+            )
+            if cached is not None:
+                return cached
+
+        if payload.dry_run:
+            preview = preview_merge_candidates_by_ids(
+                clients.postgres,
+                project_id=project_id,
+                source_ids=payload.source_ids,
+                target_codigo=payload.target_codigo,
+            )
+            resp = {
+                "success": (preview.get("would_merge", 0) > 0),
+                "dry_run": True,
+                "merged_count": int(preview.get("would_merge", 0)),
+                "details": preview,
+                "target_codigo": payload.target_codigo,
+            }
+        else:
+            count = merge_candidates(
+                clients.postgres,
+                project_id=project_id,
+                source_ids=payload.source_ids,
+                target_codigo=payload.target_codigo,
+                merged_by=user.user_id if user else None,
+                memo=payload.memo,
+            )
+            resp = {
+                "success": count > 0,
+                "dry_run": False,
+                "merged_count": count,
+                "target_codigo": payload.target_codigo,
+            }
+
+        if payload.idempotency_key:
+            store_idempotency_response(
+                clients.postgres,
+                project_id=project_id,
+                endpoint=endpoint_key,
+                idempotency_key=payload.idempotency_key,
+                response=resp,
+            )
+    finally:
+        clients.close()
+
+    return resp
+
+
+@app.post("/api/coding/candidates/merge")
+async def api_merge_candidates_legacy(
+    payload: MergeCandidatesRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Alias legacy (deprecado): usar /api/codes/candidates/merge."""
+    return await api_merge_candidates(payload=payload, settings=settings, user=user)
+
+
+class AutoMergePair(BaseModel):
+    """Par de códigos a fusionar."""
+    source_codigo: str = Field(..., description="Código fuente a fusionar")
+    target_codigo: str = Field(..., description="Código destino")
+
+
+class AutoMergeRequest(BaseModel):
+    """Request para auto-fusión masiva de duplicados."""
+    model_config = ConfigDict(extra="forbid")
+    
+    project: str = Field(..., description="ID del proyecto")
+    pairs: List[AutoMergePair] = Field(..., description="Lista de pares a fusionar")
+    memo: Optional[str] = Field(None, description="Memo común para auditoría (opcional)")
+    dry_run: bool = Field(False, description="Si true, no persiste cambios")
+    idempotency_key: Optional[str] = Field(None, description="Clave de idempotencia (opcional)")
+
+
+@app.post("/api/codes/candidates/auto-merge")
+async def api_auto_merge_candidates(
+    payload: AutoMergeRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Fusiona masivamente pares de códigos duplicados por nombre.
+    
+    Más robusto que merge por IDs porque busca directamente por nombre de código.
+    """
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    if not payload.pairs:
+        api_logger.info(
+            "api.auto_merge_candidates.empty",
+            project=payload.project,
+        )
+        return {"success": True, "total_merged": 0, "details": []}
+    
+    clients = build_clients_or_error(settings)
+    try:
+        from app.postgres_block import (
+            ensure_api_idempotency_table,
+            get_idempotency_response,
+            store_idempotency_response,
+            preview_merge_candidates_by_code,
+        )
+
+        endpoint_key = "POST /api/codes/candidates/auto-merge"
+        ensure_api_idempotency_table(clients.postgres)
+
+        if payload.idempotency_key:
+            cached = get_idempotency_response(
+                clients.postgres,
+                project_id=project_id,
+                endpoint=endpoint_key,
+                idempotency_key=payload.idempotency_key,
+            )
+            if cached is not None:
+                return cached
+
+        details: List[Dict[str, Any]] = []
+        total_merged = 0
+        api_logger.info(
+            "api.auto_merge_candidates.start",
+            project=payload.project,
+            pairs=len(payload.pairs),
+            user_id=user.user_id if user else None,
+        )
+        
+        for pair in payload.pairs:
+            if not pair.source_codigo or not pair.target_codigo:
+                api_logger.warning(
+                    "api.auto_merge_candidates.invalid_pair",
+                    project=payload.project,
+                    source=pair.source_codigo,
+                    target=pair.target_codigo,
+                )
+                details.append(
+                    {
+                        "source": pair.source_codigo,
+                        "target": pair.target_codigo,
+                        "merged_count": 0,
+                        "skipped": "invalid_pair",
+                    }
+                )
+                continue
+            if pair.source_codigo.strip().lower() == pair.target_codigo.strip().lower():
+                details.append({
+                    "source": pair.source_codigo,
+                    "target": pair.target_codigo,
+                    "merged_count": 0,
+                    "skipped": "self",
+                })
+                continue
+
+            if payload.dry_run:
+                preview = preview_merge_candidates_by_code(
+                    clients.postgres,
+                    project_id=project_id,
+                    source_codigo=pair.source_codigo,
+                    target_codigo=pair.target_codigo,
+                )
+                count = int(preview.get("would_merge", 0))
+                details.append({
+                    "source": pair.source_codigo,
+                    "target": pair.target_codigo,
+                    "merged_count": count,
+                    "dry_run": True,
+                    "details": preview,
+                })
+            else:
+                count = merge_candidates_by_code(
+                    clients.postgres,
+                    project_id=project_id,
+                    source_codigo=pair.source_codigo,
+                    target_codigo=pair.target_codigo,
+                    merged_by=user.user_id if user else None,
+                    memo=payload.memo,
+                )
+                details.append({
+                    "source": pair.source_codigo,
+                    "target": pair.target_codigo,
+                    "merged_count": count,
+                })
+            total_merged += count
+        api_logger.info(
+            "api.auto_merge_candidates.completed",
+            project=payload.project,
+            total_merged=total_merged,
+            pairs_processed=len(payload.pairs),
+        )
+
+        resp: Dict[str, Any] = {
+            "success": True if payload.dry_run else (total_merged > 0),
+            "dry_run": bool(payload.dry_run),
+            "total_merged": total_merged,
+            "pairs_processed": len(payload.pairs),
+            "details": details,
+        }
+
+        if payload.idempotency_key:
+            store_idempotency_response(
+                clients.postgres,
+                project_id=project_id,
+                endpoint=endpoint_key,
+                idempotency_key=payload.idempotency_key,
+                response=resp,
+            )
+
+        return resp
+    except Exception as exc:
+        api_logger.error(
+            "api.auto_merge_candidates.error",
+            error=str(exc),
+            project=payload.project,
+        )
+        raise HTTPException(status_code=500, detail=f"Error en auto-fusión: {str(exc)}") from exc
+    finally:
+        clients.close()
+
+
+
+# =============================================================================
+# HIPÓTESIS Y MUESTREO TEÓRICO (Grounded Theory)
+# =============================================================================
+
+class ValidateHypothesisRequest(BaseModel):
+    """Request para validar hipótesis con evidencia empírica."""
+    model_config = ConfigDict(extra="forbid")
+    
+    project: str = Field(..., description="ID del proyecto")
+    fragmento_id: str = Field(..., min_length=10, description="ID del fragmento que respalda la hipótesis")
+    cita: str = Field(..., min_length=10, description="Cita textual del fragmento")
+
+
+class RejectHypothesisRequest(BaseModel):
+    """Request para rechazar hipótesis por falta de evidencia."""
+    model_config = ConfigDict(extra="forbid")
+    
+    project: str = Field(..., description="ID del proyecto")
+    razon: str = Field(..., min_length=5, description="Razón metodológica del rechazo")
+
+
+@app.get("/api/codes/hypotheses")
+async def api_list_hypotheses(
+    project: str = Query(..., description="ID del proyecto"),
+    limit: int = Query(50, ge=1, le=200),
+    settings: AppSettings = Depends(get_settings),
+    _user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Lista hipótesis pendientes de muestreo teórico.
+    
+    En Grounded Theory, las hipótesis son proposiciones emergentes del análisis
+    estructural que requieren validación empírica antes de ser aceptadas.
+    
+    Según Charmaz (2014): "Theoretical sampling means sampling to develop 
+    or refine emerging theoretical categories... keeps them grounded in data."
+    """
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import list_hypothesis_codes, count_hypothesis_codes
+    
+    clients = build_clients_or_error(settings)
+    try:
+        hypotheses = list_hypothesis_codes(clients.postgres, project_id, limit)
+        total = count_hypothesis_codes(clients.postgres, project_id)
+    finally:
+        clients.close()
+    
+    return {
+        "hypotheses": hypotheses,
+        "total": total,
+        "project": project_id,
+        "methodology_note": (
+            "Estas hipótesis emergieron del análisis estructural (link prediction). "
+            "Requieren validación empírica: busca fragmentos que respalden cada hipótesis, "
+            "o rechaza aquellas sin evidencia para mantener el rigor metodológico."
+        ),
+    }
+
+
+@app.get("/api/codes/hypotheses/count")
+async def api_count_hypotheses(
+    project: str = Query(..., description="ID del proyecto"),
+    settings: AppSettings = Depends(get_settings),
+    _user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Cuenta hipótesis pendientes de muestreo teórico."""
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import count_hypothesis_codes
+    
+    clients = build_clients_or_error(settings)
+    try:
+        count = count_hypothesis_codes(clients.postgres, project_id)
+    finally:
+        clients.close()
+    
+    return {"count": count, "project": project_id}
+
+
+@app.post("/api/codes/hypotheses/{hypothesis_id}/validate-with-evidence")
+async def api_validate_hypothesis(
+    hypothesis_id: int,
+    payload: ValidateHypothesisRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Valida una hipótesis vinculándola a evidencia empírica.
+    
+    Este endpoint implementa el paso final del muestreo teórico en Grounded Theory:
+    el investigador encontró un fragmento que respalda la hipótesis, por lo que
+    esta se convierte en un código validado con su evidencia empírica correspondiente.
+    
+    Según Glaser & Strauss (1967): "Grounded theory is defined as the discovery 
+    of theory from data."
+    """
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import validate_hypothesis_with_evidence
+    
+    clients = build_clients_or_error(settings)
+    try:
+        result = validate_hypothesis_with_evidence(
             clients.postgres,
-            project_id=project_id,
-            source_ids=payload.source_ids,
-            target_codigo=payload.target_codigo,
-            merged_by=user.user_id if user else None,
+            hypothesis_id=hypothesis_id,
+            project=project_id,
+            fragmento_id=payload.fragmento_id,
+            cita=payload.cita,
+            validado_por=user.user_id if user else "investigador",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        clients.close()
+    
+    return result
+
+
+@app.post("/api/codes/hypotheses/{hypothesis_id}/reject")
+async def api_reject_hypothesis(
+    hypothesis_id: int,
+    payload: RejectHypothesisRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Rechaza una hipótesis después de muestreo teórico fallido.
+    
+    En Grounded Theory, las hipótesis que no encuentran evidencia empírica
+    deben ser rechazadas para mantener el rigor metodológico. El investigador
+    debe documentar la razón del rechazo.
+    """
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import reject_hypothesis
+    
+    clients = build_clients_or_error(settings)
+    try:
+        result = reject_hypothesis(
+            clients.postgres,
+            hypothesis_id=hypothesis_id,
+            project=project_id,
+            razon=payload.razon,
+            rechazado_por=user.user_id if user else "investigador",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        clients.close()
+    
+    return result
+
+
+@app.get("/api/codes/hypotheses/{hypothesis_id}/search-evidence")
+async def api_search_evidence_for_hypothesis(
+    hypothesis_id: int,
+    project: str = Query(..., description="ID del proyecto"),
+    limit: int = Query(10, ge=1, le=50),
+    settings: AppSettings = Depends(get_settings),
+    _user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Busca fragmentos que podrían servir como evidencia para una hipótesis.
+    
+    Realiza búsqueda semántica en los fragmentos existentes para encontrar
+    evidencia empírica que respalde la hipótesis.
+    """
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import list_hypothesis_codes, search_evidence_for_hypothesis
+    
+    clients = build_clients_or_error(settings)
+    try:
+        # Get hypothesis code
+        hypotheses = list_hypothesis_codes(clients.postgres, project_id, limit=100)
+        hypothesis = next((h for h in hypotheses if h["id"] == hypothesis_id), None)
+        
+        if not hypothesis:
+            raise HTTPException(404, f"Hipótesis {hypothesis_id} no encontrada")
+        
+        # Search for evidence
+        fragments = search_evidence_for_hypothesis(
+            clients.postgres,
+            project_id,
+            hypothesis["codigo"],
+            limit=limit,
         )
     finally:
         clients.close()
     
-    return {"success": count > 0, "merged_count": count, "target_codigo": payload.target_codigo}
+    return {
+        "hypothesis": hypothesis,
+        "potential_evidence": fragments,
+        "methodology_note": (
+            "Estos fragmentos contienen términos relacionados con la hipótesis. "
+            "Revisa si alguno respalda empíricamente la proposición."
+        ),
+    }
 
 
 # =============================================================================
@@ -3513,23 +4098,70 @@ def ensure_fuzzystrmatch(pg_conn) -> bool:
         return False
 
 
+def ensure_unaccent(pg_conn) -> bool:
+    """Habilita la extensión unaccent si no existe."""
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS unaccent;")
+        pg_conn.commit()
+        return True
+    except Exception as exc:
+        api_logger.warning("unaccent.not_available", error=str(exc))
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
 def _levenshtein_distance(s1: str, s2: str) -> int:
-    """Calcula distancia de Levenshtein en Python puro."""
-    if len(s1) < len(s2):
-        return _levenshtein_distance(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    
-    previous_row = range(len(s2) + 1)
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    return previous_row[-1]
+    """Calcula distancia de Levenshtein usando RapidFuzz (compatible con Azure)."""
+    return Levenshtein.distance(s1, s2)
+
+
+def _normalize_text(value: str) -> str:
+    """Normaliza texto: trim, lower y remueve acentos (Unicode)."""
+    if value is None:
+        return ""
+    trimmed = value.strip().lower()
+    normalized = unicodedata.normalize("NFKD", trimmed)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _tokenize_code(value: str) -> List[str]:
+    """Tokeniza un código normalizado en tokens alfanuméricos."""
+    if not value:
+        return []
+    normalized = _normalize_text(value)
+    return [tok for tok in re.split(r"[^a-z0-9]+", normalized) if tok]
+
+
+def _token_overlap_ok(a: str, b: str, min_jaccard: float = 0.5) -> bool:
+    """Valida solapamiento de tokens para evitar falsos positivos semánticos."""
+    ta = set(_tokenize_code(a))
+    tb = set(_tokenize_code(b))
+    if not ta or not tb:
+        return False
+    inter = ta.intersection(tb)
+    union = ta.union(tb)
+    if not union:
+        return False
+    jaccard = len(inter) / len(union)
+    if jaccard < min_jaccard:
+        return False
+
+    # Si difieren solo en un token, exigir similitud alta entre esos tokens
+    diff_a = list(ta - tb)
+    diff_b = list(tb - ta)
+    if len(diff_a) == 1 and len(diff_b) == 1:
+        tok_a, tok_b = diff_a[0], diff_b[0]
+        max_len = max(len(tok_a), len(tok_b))
+        if max_len == 0:
+            return False
+        tok_sim = 1 - (_levenshtein_distance(tok_a, tok_b) / max_len)
+        return tok_sim >= 0.8
+
+    return True
 
 
 def find_similar_codes_python_fallback(
@@ -3539,51 +4171,51 @@ def find_similar_codes_python_fallback(
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
     """
-    Fallback: Encuentra códigos similares usando Python puro.
-    
-    Usado cuando la extensión fuzzystrmatch no está disponible.
+    Encuentra códigos similares usando RapidFuzz (Levenshtein).
     """
     # Get unique codes from database
     sql = """
     SELECT DISTINCT codigo
     FROM codigos_candidatos
-    WHERE project_id = %s AND estado IN ('pendiente', 'validado')
+    WHERE project_id = %s AND estado IN ('pendiente', 'validado', 'hipotesis')
     """
     with pg_conn.cursor() as cur:
         cur.execute(sql, (project_id,))
         rows = cur.fetchall()
     
     codes = [row[0] for row in rows if row[0]]
+    normalized_codes = [_normalize_text(c) for c in codes]
+    rep_by_norm: Dict[str, str] = {}
+    for original, norm in zip(codes, normalized_codes):
+        rep_by_norm.setdefault(norm, original)
     
-    # Find duplicates using Python
+    # Find duplicates using Python (RapidFuzz)
     duplicates = []
     
-    # Check exact duplicates (same code with different entries)
-    sql_count = """
-    SELECT MIN(codigo) AS codigo, COUNT(*) as count
-    FROM codigos_candidatos
-    WHERE project_id = %s AND estado IN ('pendiente', 'validado')
-    GROUP BY LOWER(codigo)
-    HAVING COUNT(*) > 1
-    ORDER BY count DESC
-    LIMIT %s
-    """
-    with pg_conn.cursor() as cur:
-        cur.execute(sql_count, (project_id, limit))
-        exact_rows = cur.fetchall()
-    
-    for row in exact_rows:
+    # Check exact duplicates only when there are multiple distinct variants
+    counts: Dict[str, int] = {}
+    variants_by_norm: Dict[str, set[str]] = {}
+    for original, norm in zip(codes, normalized_codes):
+        counts[norm] = counts.get(norm, 0) + 1
+        variants_by_norm.setdefault(norm, set()).add(original.strip())
+    for norm, count in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+        if count <= 1:
+            continue
+        if len(variants_by_norm.get(norm, set())) <= 1:
+            continue
         duplicates.append({
-            "code1": row[0],
-            "code2": row[0],
+            "code1": rep_by_norm.get(norm, norm),
+            "code2": rep_by_norm.get(norm, norm),
             "distance": 0,
             "similarity": 1.0,
             "is_exact_duplicate": True,
-            "duplicate_count": row[1],
+            "duplicate_count": count,
         })
+        if len(duplicates) >= limit:
+            break
     
     # Calculate Levenshtein similarity for unique codes
-    unique_codes = list(set(c.lower() for c in codes))
+    unique_codes = list(set(_normalize_text(c) for c in codes))
     
     for i, c1 in enumerate(unique_codes):
         for c2 in unique_codes[i+1:]:
@@ -3598,9 +4230,11 @@ def find_similar_codes_python_fallback(
             similarity = 1 - (distance / max_len)
             
             if similarity >= threshold and distance > 0:
+                if not _token_overlap_ok(c1, c2):
+                    continue
                 duplicates.append({
-                    "code1": c1,
-                    "code2": c2,
+                    "code1": rep_by_norm.get(c1, c1),
+                    "code2": rep_by_norm.get(c2, c2),
                     "distance": distance,
                     "similarity": round(similarity, 3),
                     "is_exact_duplicate": False,
@@ -3623,6 +4257,7 @@ def find_similar_codes_posthoc(
     threshold: float = 0.80,
     limit: int = 50,
     include_exact: bool = True,
+    use_unaccent: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Encuentra pares de códigos candidatos similares usando Levenshtein.
@@ -3631,19 +4266,20 @@ def find_similar_codes_posthoc(
         include_exact: Si True, incluye duplicados exactos (distancia=0)
     """
     max_distance = int((1 - threshold) * 15)
+    normalize_expr = "unaccent(lower(trim(codigo)))" if use_unaccent else "lower(trim(codigo))"
     
     # Query para duplicados exactos (mismo código, diferentes entradas)
     exact_duplicates = []
     if include_exact:
-        sql_exact = """
+        sql_exact = f"""
         SELECT 
             MIN(codigo) AS codigo,
             COUNT(*) as count,
             array_agg(DISTINCT fuente_origen) as sources,
             array_agg(DISTINCT archivo) FILTER (WHERE archivo IS NOT NULL) as files
         FROM codigos_candidatos
-        WHERE project_id = %s AND estado IN ('pendiente', 'validado')
-        GROUP BY LOWER(codigo)
+        WHERE project_id = %s AND estado IN ('pendiente', 'validado', 'hipotesis')
+        GROUP BY {normalize_expr}
         HAVING COUNT(*) > 1
         ORDER BY count DESC
         LIMIT %s
@@ -3669,26 +4305,26 @@ def find_similar_codes_posthoc(
     # OPTIMIZACIÓN: Filtro de longitud para reducir O(N²) a O(N*k)
     # Solo comparamos códigos cuya diferencia de longitud sea <= max_distance
     # Esto evita comparar "Organización" (12 chars) con "Si" (2 chars)
-    sql_similar = """
+        sql_similar = f"""
     WITH unique_codes AS (
-        SELECT DISTINCT codigo, LENGTH(codigo) AS len
+                SELECT DISTINCT codigo, LENGTH({normalize_expr}) AS len, {normalize_expr} AS norm
         FROM codigos_candidatos
-        WHERE project_id = %s AND estado IN ('pendiente', 'validado')
+        WHERE project_id = %s AND estado IN ('pendiente', 'validado', 'hipotesis')
     )
     SELECT 
         c1.codigo AS code1,
         c2.codigo AS code2,
-        levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) AS distance,
+                levenshtein(c1.norm, c2.norm) AS distance,
         GREATEST(c1.len, c2.len) AS max_len,
-        1.0 - (levenshtein(LOWER(c1.codigo), LOWER(c2.codigo))::float / 
+                1.0 - (levenshtein(c1.norm, c2.norm)::float / 
                GREATEST(c1.len, c2.len)::float) AS similarity
     FROM unique_codes c1, unique_codes c2
-    WHERE c1.codigo < c2.codigo
+        WHERE c1.norm < c2.norm
       -- OPTIMIZACIÓN: Pre-filtro por longitud (evita Levenshtein innecesario)
       AND ABS(c1.len - c2.len) <= %s
       -- Solo calcular Levenshtein si pasa el filtro de longitud
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) <= %s
-      AND levenshtein(LOWER(c1.codigo), LOWER(c2.codigo)) > 0
+            AND levenshtein(c1.norm, c2.norm) <= %s
+            AND levenshtein(c1.norm, c2.norm) > 0
     ORDER BY similarity DESC
     LIMIT %s
     """
@@ -3740,21 +4376,21 @@ async def api_detect_duplicates(
         from app.postgres_block import ensure_candidate_codes_table
         ensure_candidate_codes_table(clients.postgres)
         
-        use_sql_levenshtein = ensure_fuzzystrmatch(clients.postgres)
-        
-        if use_sql_levenshtein:
-            duplicates = find_similar_codes_posthoc(
-                clients.postgres,
-                project_id,
-                threshold=payload.threshold,
-            )
-        else:
-            # Fallback: Use Python Levenshtein when extension not available
-            duplicates = find_similar_codes_python_fallback(
-                clients.postgres,
-                project_id,
-                threshold=payload.threshold,
-            )
+        # RapidFuzz no requiere extensiones en PostgreSQL (compatible con Azure)
+        duplicates = find_similar_codes_python_fallback(
+            clients.postgres,
+            project_id,
+            threshold=payload.threshold,
+            limit=50,
+        )
+
+        api_logger.info(
+            "api.detect_duplicates.completed",
+            project=payload.project,
+            threshold=payload.threshold,
+            count=len(duplicates),
+            method="rapidfuzz",
+        )
         
         return {
             "success": True,
@@ -3762,16 +4398,42 @@ async def api_detect_duplicates(
             "threshold": payload.threshold,
             "duplicates": duplicates,
             "count": len(duplicates),
-            "method": "sql" if use_sql_levenshtein else "python_fallback",
+            "method": "rapidfuzz",
         }
     except HTTPException:
         raise
     except Exception as exc:
         api_logger.error("api.detect_duplicates.error", error=str(exc), project=payload.project)
         raise HTTPException(status_code=500, detail=f"Error detectando duplicados: {str(exc)}") from exc
+        resp = {
+            "success": True,
+            "dry_run": bool(payload.dry_run),
+            "total_merged": total_merged,
+            "details": details,
+        }
+
+        if payload.idempotency_key:
+            store_idempotency_response(
+                clients.postgres,
+                project_id=project_id,
+                endpoint=endpoint_key,
+                idempotency_key=payload.idempotency_key,
+                response=resp,
+            )
+
+        return resp
     finally:
         clients.close()
 
+
+@app.post("/api/coding/candidates/auto-merge")
+async def api_auto_merge_candidates_legacy(
+    payload: AutoMergeRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Alias legacy (deprecado): usar /api/codes/candidates/auto-merge."""
+    return await api_auto_merge_candidates(payload=payload, settings=settings, user=user)
 
 # =============================================================================
 # POST-HOC DUPLICATE DETECTION FOR NEO4J - Códigos en el grafo
@@ -3825,7 +4487,7 @@ async def api_detect_duplicates_neo4j(
                 "total_codes": len(codes),
             }
         
-        # Find duplicates using Python Levenshtein
+        # Find duplicates using RapidFuzz Levenshtein
         duplicates = []
         unique_codes = list(set(codes))
         
@@ -4073,21 +4735,29 @@ async def api_promote_candidates(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     
-    if not payload.candidate_ids:
-        raise HTTPException(status_code=400, detail="candidate_ids no puede estar vacío")
+    candidate_ids = payload.candidate_ids or []
+    if not candidate_ids and not payload.promote_all_validated:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe enviar candidate_ids o establecer promote_all_validated=true",
+        )
     
     clients = build_clients_or_error(settings)
     try:
-        count = promote_to_definitive(
+        result = promote_to_definitive(
             clients.postgres,
             project_id=project_id,
-            candidate_ids=payload.candidate_ids,
+            candidate_ids=candidate_ids,
+            promote_all_validated=payload.promote_all_validated,
             promoted_by=user.user_id if user else None,
         )
     finally:
         clients.close()
-    
-    return {"success": count > 0, "promoted_count": count}
+
+    return {
+        "success": (result.get("promoted_count", 0) or 0) > 0,
+        **result,
+    }
 
 
 # =============================================================================
@@ -4390,7 +5060,11 @@ async def api_definitive_codes(
     settings: AppSettings = Depends(get_settings),
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
-    """Lista solo códigos validados (lista definitiva)."""
+    """Lista la 'lista definitiva' real (tabla analisis_codigos_abiertos).
+
+    Nota: la bandeja de candidatos validados vive en `codigos_candidatos` y se expone por
+    `/api/codes/candidates` con `estado=validado`.
+    """
     try:
         project_id = resolve_project(project, allow_create=False)
     except ValueError as exc:
@@ -4398,16 +5072,123 @@ async def api_definitive_codes(
     
     clients = build_clients_or_error(settings)
     try:
-        candidates = list_candidate_codes(
-            clients.postgres,
-            project=project_id,
-            estado="validado",
-            limit=limit,
-        )
+        from app.coding import list_open_codes
+        codes = list_open_codes(clients, project=project_id, limit=limit)
     finally:
         clients.close()
-    
-    return {"definitive_codes": candidates, "count": len(candidates)}
+
+    return {"definitive_codes": codes, "count": len(codes)}
+
+
+@app.get("/api/codes/catalog")
+async def api_codes_catalog(
+    project: str = Query(..., description="Proyecto requerido"),
+    limit: int = Query(500, ge=1, le=2000),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Lista el catálogo ontológico de códigos (status + canonical)."""
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    clients = build_clients_or_error(settings)
+    try:
+        from app.postgres_block import ensure_codes_catalog_table
+
+        ensure_codes_catalog_table(clients.postgres)
+        with clients.postgres.cursor() as cur:
+            cur.execute(
+                """
+                SELECT codigo, status, canonical_codigo, merged_at, merged_by, memo, created_at, updated_at
+                  FROM catalogo_codigos
+                 WHERE project_id = %s
+                 ORDER BY updated_at DESC NULLS LAST, codigo ASC
+                 LIMIT %s
+                """,
+                (project_id, limit),
+            )
+            rows = cur.fetchall() or []
+        clients.postgres.commit()
+    finally:
+        clients.close()
+
+    catalog = [
+        {
+            "codigo": r[0],
+            "status": r[1],
+            "canonical_codigo": r[2],
+            "merged_at": r[3].isoformat().replace("+00:00", "Z") if r[3] else None,
+            "merged_by": r[4],
+            "memo": r[5],
+            "created_at": r[6].isoformat().replace("+00:00", "Z") if r[6] else None,
+            "updated_at": r[7].isoformat().replace("+00:00", "Z") if r[7] else None,
+        }
+        for r in rows
+    ]
+    return {"catalog": catalog, "count": len(catalog)}
+
+
+class MergeDefinitiveCodesBody(BaseModel):
+    source_codigo: str
+    target_codigo: str
+    memo: Optional[str] = None
+
+
+@app.post("/api/codes/definitive/merge")
+async def api_merge_definitive_codes(
+    body: MergeDefinitiveCodesBody,
+    project: str = Query(..., description="Proyecto requerido"),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Fusiona códigos definitivos (mueve evidencia y marca status=merged)."""
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    clients = build_clients_or_error(settings)
+    try:
+        from app.postgres_block import merge_definitive_codes_by_code
+        from app.neo4j_block import mark_codigo_merged
+
+        result = merge_definitive_codes_by_code(
+            clients.postgres,
+            project_id=project_id,
+            source_codigo=body.source_codigo,
+            target_codigo=body.target_codigo,
+            merged_by=getattr(user, "email", None) or getattr(user, "username", None) or "user",
+            memo=body.memo,
+        )
+
+        # Best-effort: also mark merged in Neo4j so GDS projections can filter.
+        try:
+            mark_codigo_merged(
+                clients.neo4j,
+                settings.neo4j.database,
+                project_id=project_id,
+                source_codigo=body.source_codigo,
+                target_codigo=result.get("target") or body.target_codigo,
+                merged_by=getattr(user, "email", None) or getattr(user, "username", None) or "user",
+                memo=body.memo,
+            )
+        except Exception:
+            pass
+        return {"result": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as e:
+        api_logger.error(
+            "codes.definitive.merge_error",
+            error=str(e),
+            source=body.source_codigo,
+            target=body.target_codigo,
+        )
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        clients.close()
 
 
 @app.get("/api/codes/stats/sources")
@@ -4543,6 +5324,19 @@ class CheckBatchCodesRequest(BaseModel):
     threshold: float = Field(default=0.85, ge=0.5, le=1.0, description="Similarity threshold")
 
 
+class AiPlanMergeRequest(BaseModel):
+    """Request para generar propuestas de auto-merge con auditoría por run_id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str = Field(..., description="ID del proyecto")
+    codigos: List[str] = Field(..., description="Lista de códigos (candidatos) a analizar")
+    threshold: float = Field(default=0.92, ge=0.5, le=1.0, description="Umbral mínimo de similitud")
+    limit: int = Field(default=200, ge=1, le=2000, description="Máximo de pares sugeridos")
+    source: str = Field(default="ui", description="Origen del runner (ui|cli|script)")
+
+
+
 @app.post("/api/codes/check-batch")
 async def api_check_batch_codes(
     payload: CheckBatchCodesRequest,
@@ -4555,45 +5349,203 @@ async def api_check_batch_codes(
     Checks each proposed code against existing codes and returns
     similarity matches for deduplication UI.
     """
-    from app.code_normalization import find_similar_codes, get_existing_codes_for_project
+    import os
+    import time
+    import statistics
+    from collections import defaultdict
+
+    from app.code_normalization import (
+        find_similar_codes_with_stats,
+        get_existing_codes_for_project,
+        normalize_code,
+    )
     
     try:
         project_id = resolve_project(payload.project, allow_create=False)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     
+    started = time.perf_counter()
     clients = build_clients_or_error(settings)
     try:
+        api_logger.info(
+            "api.codes.check_batch.start",
+            project=project_id,
+            threshold=float(payload.threshold),
+            input_count=len(payload.codigos or []),
+        )
+
         # Get existing codes from DB
+        t0 = time.perf_counter()
         existing_codes = get_existing_codes_for_project(clients.postgres, project_id)
-        
-        results = []
-        for codigo in payload.codigos:
-            similar = find_similar_codes(
-                codigo,
+        t_fetch_ms = (time.perf_counter() - t0) * 1000.0
+
+        # ---------------------------------------------------------------------
+        # Pre-Hoc intra-batch dedup (evita "batch blindness")
+        # Agrupamos por clave normalizada (tildes/underscores/espacios)
+        # ---------------------------------------------------------------------
+        t1 = time.perf_counter()
+
+        groups: Dict[str, List[int]] = defaultdict(list)
+        empty_indexes: List[int] = []
+        for idx, codigo in enumerate(payload.codigos):
+            if not (codigo or "").strip():
+                empty_indexes.append(idx)
+                continue
+            norm_key = normalize_code(codigo)
+            groups[norm_key].append(idx)
+
+        empty_norm_key_count = len(groups.get("", [])) if "" in groups else 0
+
+        duplicate_groups = {k: idxs for k, idxs in groups.items() if len(idxs) > 1 and k}
+        batch_duplicates_total = sum(max(0, len(idxs) - 1) for idxs in duplicate_groups.values())
+
+        # Pre-computar similares una vez por grupo (eficiencia)
+        # Métricas agregadas del motor de similitud (para diagnóstico)
+        scan_stats = {
+            "groups_scanned": 0,
+            "comparisons": 0,
+            "skipped_len_prefilter": 0,
+            "skipped_similarity": 0,
+            "skipped_token_overlap": 0,
+            "kept": 0,
+            "slow_scans": 0,
+            "scan_elapsed_ms_sum": 0.0,
+        }
+
+        similar_by_norm: Dict[str, List[Tuple[str, float]]] = {}
+        for norm_key, idxs in groups.items():
+            if not norm_key:
+                similar_by_norm[norm_key] = []
+                continue
+            representative = payload.codigos[idxs[0]]
+
+            sims, st = find_similar_codes_with_stats(
+                representative,
                 existing_codes,
                 threshold=payload.threshold,
                 limit=3,
             )
-            
+            similar_by_norm[norm_key] = sims
+
+            scan_stats["groups_scanned"] += 1
+            scan_stats["comparisons"] += int(st.get("comparisons", 0))
+            scan_stats["skipped_len_prefilter"] += int(st.get("skipped_len_prefilter", 0))
+            scan_stats["skipped_similarity"] += int(st.get("skipped_similarity", 0))
+            scan_stats["skipped_token_overlap"] += int(st.get("skipped_token_overlap", 0))
+            scan_stats["kept"] += int(st.get("kept", 0))
+            scan_stats["scan_elapsed_ms_sum"] += float(st.get("elapsed_ms", 0.0) or 0.0)
+            if float(st.get("elapsed_ms", 0.0) or 0.0) >= 200.0:
+                scan_stats["slow_scans"] += 1
+
+        t_scan_ms = (time.perf_counter() - t1) * 1000.0
+
+        # Construir results en el mismo orden de entrada
+        t2 = time.perf_counter()
+        best_sims: List[float] = []
+        results: List[Dict[str, Any]] = []
+        for idx, codigo in enumerate(payload.codigos):
+            if idx in empty_indexes:
+                results.append(
+                    {
+                        "codigo": codigo,
+                        "has_similar": False,
+                        "similar": [],
+                        "duplicate_in_batch": False,
+                        "batch_group_size": 0,
+                    }
+                )
+                continue
+
+            norm_key = normalize_code(codigo)
+            group_size = len(groups.get(norm_key, []))
+            similar = similar_by_norm.get(norm_key, [])
+
             if similar:
-                results.append({
+                try:
+                    best_sims.append(float(similar[0][1]))
+                except Exception:
+                    pass
+
+            results.append(
+                {
                     "codigo": codigo,
-                    "has_similar": True,
+                    "has_similar": bool(similar),
                     "similar": [
                         {"existing": s[0], "similarity": round(s[1], 2)}
                         for s in similar
                     ],
-                })
-            else:
-                results.append({
-                    "codigo": codigo,
-                    "has_similar": False,
-                    "similar": [],
-                })
-        
+                    "duplicate_in_batch": group_size > 1,
+                    "batch_group_size": group_size,
+                }
+            )
+
+        t_results_ms = (time.perf_counter() - t2) * 1000.0
+
         has_any_similar = any(r["has_similar"] for r in results)
-        
+        matched_count = sum(1 for r in results if r.get("has_similar"))
+
+        # Distribución (sobre la mejor similitud por código) para calibración
+        best_sims_sorted = sorted(best_sims)
+        sim_stats: Dict[str, Any] = {}
+        if best_sims_sorted:
+            sim_stats = {
+                "min": best_sims_sorted[0],
+                "p50": round(float(statistics.median(best_sims_sorted)), 2),
+                "max": best_sims_sorted[-1],
+            }
+            # percentil 90 aproximado (sin numpy)
+            try:
+                p90_idx = int(round(0.9 * (len(best_sims_sorted) - 1)))
+                sim_stats["p90"] = best_sims_sorted[max(0, min(len(best_sims_sorted) - 1, p90_idx))]
+            except Exception:
+                pass
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        # Logging de muestras (opcional) para depuración puntual
+        should_log_samples = str(os.getenv("PREHOC_LOG_SAMPLES", "0")).strip() == "1"
+        sample_matches = None
+        if should_log_samples and results:
+            sample_matches = []
+            for r in results:
+                if r.get("has_similar"):
+                    sims = r.get("similar") or []
+                    if sims:
+                        sample_matches.append(
+                            {
+                                "codigo": str(r.get("codigo"))[:120],
+                                "best_existing": str(sims[0].get("existing"))[:120],
+                                "best_similarity": sims[0].get("similarity"),
+                            }
+                        )
+                if len(sample_matches) >= 3:
+                    break
+
+        api_logger.info(
+            "api.codes.check_batch.completed",
+            project=project_id,
+            threshold=float(payload.threshold),
+            input_count=len(payload.codigos or []),
+            empty_count=len(empty_indexes),
+            existing_count=len(existing_codes),
+            batch_unique_count=len(groups),
+            empty_norm_key_count=int(empty_norm_key_count),
+            batch_duplicate_groups=len(duplicate_groups),
+            batch_duplicates_total=batch_duplicates_total,
+            matched_count=matched_count,
+            has_any_similar=has_any_similar,
+            similarity_best_stats=sim_stats or None,
+            phase_ms={
+                "fetch_existing": round(t_fetch_ms, 2),
+                "scan_groups_total": round(t_scan_ms, 2),
+                "build_results": round(t_results_ms, 2),
+                "total": round(elapsed_ms, 2),
+            },
+            similarity_engine=scan_stats,
+            sample_matches=sample_matches,
+        )
+
         return {
             "project": project_id,
             "threshold": payload.threshold,
@@ -4601,7 +5553,208 @@ async def api_check_batch_codes(
             "has_any_similar": has_any_similar,
             "checked_count": len(payload.codigos),
             "existing_count": len(existing_codes),
+            # Campos adicionales (compatibles): métricas de intra-batch
+            "batch_unique_count": len(groups),
+            "batch_duplicate_groups": len(duplicate_groups),
+            "batch_duplicates_total": batch_duplicates_total,
         }
+    except Exception as exc:
+        api_logger.exception(
+            "api.codes.check_batch.failed",
+            project=project_id,
+            threshold=float(payload.threshold),
+            input_count=len(payload.codigos or []),
+            error=str(exc),
+        )
+        raise
+    finally:
+        clients.close()
+
+
+@app.post("/api/codes/candidates/ai/plan-merges")
+async def api_ai_plan_merges(
+    payload: AiPlanMergeRequest,
+    request: Request,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Runner IA (solo propuestas): sugiere pares source->target con alta confianza.
+
+    Persistencia:
+    - Guarda el plan completo (inputs + pares + meta) en Postgres con `run_id`.
+    - No ejecuta merges.
+    """
+    from collections import defaultdict
+
+    from app.code_normalization import find_similar_codes, get_existing_codes_for_project, normalize_code
+    from app.postgres_block import insert_ai_merge_plan
+
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not payload.codigos:
+        raise HTTPException(status_code=400, detail="codigos no puede estar vacío")
+
+    # Normalizar y deduplicar entrada conservando primera ocurrencia
+    raw = [str(c or "").strip() for c in payload.codigos]
+    raw = [c for c in raw if c]
+    if not raw:
+        raise HTTPException(status_code=400, detail="codigos no contiene valores válidos")
+
+    seen_lower = set()
+    deduped: List[str] = []
+    for c in raw:
+        k = c.lower()
+        if k in seen_lower:
+            continue
+        seen_lower.add(k)
+        deduped.append(c)
+
+    clients = build_clients_or_error(settings)
+    try:
+        existing_codes = get_existing_codes_for_project(clients.postgres, project_id)
+
+        # Agrupar por clave normalizada para evitar cómputo repetido
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for idx, codigo in enumerate(deduped):
+            norm_key = normalize_code(codigo)
+            groups[norm_key].append(idx)
+
+        # Calcular similitudes por grupo (solo el representante)
+        similar_by_norm: Dict[str, List[Tuple[str, float]]] = {}
+        for norm_key, idxs in groups.items():
+            if not norm_key:
+                similar_by_norm[norm_key] = []
+                continue
+            representative = deduped[idxs[0]]
+            similar_by_norm[norm_key] = find_similar_codes(
+                representative,
+                existing_codes,
+                threshold=float(payload.threshold),
+                limit=3,
+            )
+
+        # Construir pares sugeridos (best match) y deduplicar por source
+        pairs: List[Dict[str, Any]] = []
+        by_source: Dict[str, Dict[str, Any]] = {}
+        for codigo in deduped:
+            norm_key = normalize_code(codigo)
+            sims = similar_by_norm.get(norm_key, [])
+            if not sims:
+                continue
+            best_existing, best_sim = sims[0]
+            if not best_existing:
+                continue
+            if codigo.strip().lower() == str(best_existing).strip().lower():
+                continue
+            src_lower = codigo.strip().lower()
+            candidate = {
+                "source_codigo": codigo,
+                "target_codigo": best_existing,
+                "similarity": round(float(best_sim), 4),
+                "reason": "best_existing",
+            }
+            prev = by_source.get(src_lower)
+            if not prev or float(candidate["similarity"]) > float(prev.get("similarity", 0)):
+                by_source[src_lower] = candidate
+
+        pairs = list(by_source.values())
+        pairs.sort(key=lambda x: float(x.get("similarity", 0)), reverse=True)
+        if payload.limit and len(pairs) > int(payload.limit):
+            pairs = pairs[: int(payload.limit)]
+
+        run_id = str(uuid.uuid4())
+        meta = {
+            "request_id": getattr(getattr(request, "state", None), "request_id", None),
+            "session_id": getattr(getattr(request, "state", None), "session_id", None),
+            "existing_count": len(existing_codes),
+            "deduped_input_count": len(deduped),
+        }
+
+        insert_ai_merge_plan(
+            clients.postgres,
+            run_id=run_id,
+            project_id=project_id,
+            created_by=user.user_id if user else None,
+            source=str(payload.source or "ui"),
+            threshold=float(payload.threshold),
+            input_codigos=deduped,
+            pairs=pairs,
+            meta=meta,
+        )
+
+        api_logger.info(
+            "api.ai.plan_merges.created",
+            project=project_id,
+            run_id=run_id,
+            threshold=float(payload.threshold),
+            input_count=len(deduped),
+            pairs_count=len(pairs),
+            user_id=user.user_id if user else None,
+        )
+
+        return {
+            "project": project_id,
+            "run_id": run_id,
+            "threshold": float(payload.threshold),
+            "input_count": len(deduped),
+            "pairs_count": len(pairs),
+            "pairs": pairs,
+        }
+    except Exception as exc:
+        api_logger.error("api.ai.plan_merges.error", error=str(exc), project=payload.project)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        clients.close()
+
+
+@app.get("/api/codes/candidates/ai/plan-merges/{run_id}")
+async def api_ai_get_plan_merges(
+    run_id: str,
+    project: str = Query(..., description="ID del proyecto"),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Obtiene un plan IA por run_id (auditoría)."""
+    from app.postgres_block import get_ai_merge_plan
+
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    clients = build_clients_or_error(settings)
+    try:
+        plan = get_ai_merge_plan(clients.postgres, project_id=project_id, run_id=run_id)
+        if not plan:
+            raise HTTPException(status_code=404, detail="run_id no encontrado")
+        # Multi-tenant: require_auth ya limita org; aquí validamos proyecto.
+        return plan
+    finally:
+        clients.close()
+
+
+@app.get("/api/codes/candidates/ai/plan-merges")
+async def api_ai_list_plan_merges(
+    project: str = Query(..., description="ID del proyecto"),
+    limit: int = Query(20, ge=1, le=200),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Lista planes recientes (resumen) para auditoría."""
+    from app.postgres_block import list_ai_merge_plans
+
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    clients = build_clients_or_error(settings)
+    try:
+        rows = list_ai_merge_plans(clients.postgres, project_id=project_id, limit=limit)
+        return {"project": project_id, "plans": rows, "count": len(rows)}
     finally:
         clients.close()
 
@@ -4739,7 +5892,17 @@ async def api_coding_codes(
 ) -> Dict[str, Any]:
     try:
         project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
-        return {"codes": list_open_codes(clients, project_id, limit=limit, search=search, archivo=archivo)}
+        from app.coding import list_open_codes
+
+        return {
+            "codes": list_open_codes(
+                clients,
+                project_id,
+                limit=limit,
+                search=search,
+                archivo=archivo,
+            )
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -6148,9 +7311,9 @@ El JSON debe tener esta estructura exacta:
 
 {{
     "memo_sintesis": [
-        {"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3]},
-        {"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3]},
-        {"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2]}
+        {{"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3]}},
+        {{"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3]}},
+        {{"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2]}}
     ],
   "codigos_sugeridos": ["codigo_uno", "codigo_dos", "codigo_tres"],
   "refinamiento_busqueda": {{

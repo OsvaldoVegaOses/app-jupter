@@ -74,7 +74,7 @@ export function AuthPage({ onSuccess }: AuthPageProps) {
                 await register({
                     email,
                     password,
-                    full_name: fullName || undefined,
+                    name: fullName || undefined,
                 });
             }
             onSuccess?.();

@@ -971,7 +971,13 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
 
   const pollSuggestRunnerStatus = useCallback(async (taskId: string) => {
     try {
-      const status = await apiFetchJson<CodingSuggestRunnerStatusResponse>(`/api/coding/suggest/runner/status/${taskId}`);
+      // Sprint 31: Timeout de 60s para runner (en lugar de 30s default)
+      const status = await apiFetchJson<CodingSuggestRunnerStatusResponse>(
+        `/api/coding/suggest/runner/status/${taskId}`,
+        {},
+        undefined,
+        60000  // 60s timeout for runner operations
+      );
       setSuggestRunnerTask(status);
 
       if (status.status === "completed") {
@@ -981,7 +987,12 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
 
         // Fetch final result once
         if (!suggestRunnerResult) {
-          const result = await apiFetchJson<CodingSuggestRunnerResultResponse>(`/api/coding/suggest/runner/result/${taskId}`);
+          const result = await apiFetchJson<CodingSuggestRunnerResultResponse>(
+            `/api/coding/suggest/runner/result/${taskId}`,
+            {},
+            undefined,
+            60000  // 60s timeout for runner operations
+          );
           setSuggestRunnerResult(result);
           setSuggestions(Array.isArray(result.suggestions) ? result.suggestions : []);
           setSelectedSuggestionIds(new Set());
@@ -1029,28 +1040,33 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
       const lluviaValue =
         suggestLluvia === "any" ? undefined : suggestLluvia === "true";
 
-      const data = await apiFetchJson<CodingSuggestRunnerExecuteResponse>("/api/coding/suggest/runner/execute", {
-        method: "POST",
-        body: JSON.stringify({
-          project,
-          seed_fragment_id: suggestFragmentId.trim(),
-          steps: Math.max(1, Number(suggestRunnerSteps) || 1),
-          top_k: suggestTopK,
-          archivo: suggestArchivo.trim() || undefined,
-          area_tematica: suggestArea.trim() || undefined,
-          actor_principal: suggestActor.trim() || undefined,
-          requiere_protocolo_lluvia: lluviaValue,
-          include_coded: suggestIncludeCoded,
-          strategy: "best-score",
+      const data = await apiFetchJson<CodingSuggestRunnerExecuteResponse>(
+        "/api/coding/suggest/runner/execute",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            project,
+            seed_fragment_id: suggestFragmentId.trim(),
+            steps: Math.max(1, Number(suggestRunnerSteps) || 1),
+            top_k: suggestTopK,
+            archivo: suggestArchivo.trim() || undefined,
+            area_tematica: suggestArea.trim() || undefined,
+            actor_principal: suggestActor.trim() || undefined,
+            requiere_protocolo_lluvia: lluviaValue,
+            include_coded: suggestIncludeCoded,
+            strategy: "best-score",
 
-          // Runner completo (v2)
-          sweep_all_interviews: true,
-          llm_suggest: true,
-          llm_model: "chat",
-          save_memos: true,
-          submit_candidates: true,
-        }),
-      });
+            // Runner completo (v2)
+            sweep_all_interviews: true,
+            llm_suggest: true,
+            llm_model: "chat",
+            save_memos: true,
+            submit_candidates: true,
+          }),
+        },
+        undefined,
+        60000  // 60s timeout for runner operations
+      );
 
       await pollSuggestRunnerStatus(data.task_id);
       suggestRunnerIntervalRef.current = window.setInterval(() => pollSuggestRunnerStatus(data.task_id), 2000);
@@ -1089,13 +1105,18 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
     clearSuggestRunnerInterval();
 
     try {
-      const data = await apiFetchJson<CodingSuggestRunnerResumeResponse>("/api/coding/suggest/runner/resume", {
-        method: "POST",
-        body: JSON.stringify({
-          project,
-          task_id: suggestRunnerTask.task_id,
-        }),
-      });
+      const data = await apiFetchJson<CodingSuggestRunnerResumeResponse>(
+        "/api/coding/suggest/runner/resume",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            project,
+            task_id: suggestRunnerTask.task_id,
+          }),
+        },
+        undefined,
+        60000  // 60s timeout for runner operations
+      );
 
       await pollSuggestRunnerStatus(data.task_id);
       suggestRunnerIntervalRef.current = window.setInterval(() => pollSuggestRunnerStatus(data.task_id), 2000);

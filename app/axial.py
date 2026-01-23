@@ -113,6 +113,15 @@ def assign_axial_relation(
     log = logger or _logger
     rel_tipo = relacion.lower().strip()
     ensure_open_coding_table(clients.postgres)
+    from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigo
+
+    ensure_codes_catalog_table(clients.postgres)
+    original_codigo = codigo
+    codigo = resolve_canonical_codigo(clients.postgres, project or "default", codigo)
+    if codigo and original_codigo and codigo.strip().lower() != str(original_codigo).strip().lower():
+        # Keep UX/audit context without changing the contract.
+        prefix = f"[CANON:{codigo}; ORIG:{str(original_codigo).strip()}] "
+        memo = f"{prefix}{memo}" if memo else prefix.strip()
     if rel_tipo not in ALLOWED_REL_TYPES:
         raise AxialError(
             f"Tipo de relacion '{relacion}' invalido. Debe ser uno de: {', '.join(sorted(ALLOWED_REL_TYPES))}."
@@ -176,13 +185,15 @@ def _run_native_graph_analysis(
     IMPORTANTE: Filtra por project_id para garantizar aislamiento entre proyectos.
     """
     _logger.info("gds.fallback_native", algorithm=algorithm, project_id=project_id)
-    
+
     # 1. Fetch Graph - FILTRADO POR PROJECT_ID
     # Solo obtenemos nodos/relaciones del proyecto activo
     q = """
-    MATCH (s)-[:REL]->(t) 
+    MATCH (s)-[:REL]->(t)
     WHERE s.project_id = $project_id AND t.project_id = $project_id
-    RETURN elementId(s) as sid, s.nombre as sname, labels(s) as slabels, 
+      AND (NOT 'Codigo' IN labels(s) OR coalesce(s.status,'active') <> 'merged')
+      AND (NOT 'Codigo' IN labels(t) OR coalesce(t.status,'active') <> 'merged')
+    RETURN elementId(s) as sid, s.nombre as sname, labels(s) as slabels,
            elementId(t) as tid, t.nombre as tname, labels(t) as tlabels
     """
     try:
@@ -190,9 +201,11 @@ def _run_native_graph_analysis(
     except Exception:
         # Fallback for older Neo4j vs elementId
         q = """
-        MATCH (s)-[:REL]->(t) 
+        MATCH (s)-[:REL]->(t)
         WHERE s.project_id = $project_id AND t.project_id = $project_id
-        RETURN id(s) as sid, s.nombre as sname, labels(s) as slabels, 
+          AND (NOT 'Codigo' IN labels(s) OR coalesce(s.status,'active') <> 'merged')
+          AND (NOT 'Codigo' IN labels(t) OR coalesce(t.status,'active') <> 'merged')
+        RETURN id(s) as sid, s.nombre as sname, labels(s) as slabels,
                id(t) as tid, t.nombre as tname, labels(t) as tlabels
         """
         data = session.run(q, project_id=project_id).data()

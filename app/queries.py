@@ -573,8 +573,8 @@ def discover_search(
     # PASO 2: Intentar Discovery API Nativo (si use_native_first=True)
     # =========================================================================
     
-    # Umbral de calidad para anclas - evita envenenar búsqueda con fragmentos irrelevantes
-    ANCHOR_QUALITY_THRESHOLD = 0.55  # Score mínimo para considerar ancla válida
+    # Sprint 31: Umbral más permisivo para conceptos generales (era 0.55)
+    ANCHOR_QUALITY_THRESHOLD = 0.40  # Score mínimo para considerar ancla válida
     
     if use_native_first:
         try:
@@ -721,7 +721,12 @@ def discover_search(
     # PASO 3: Fallback - Búsqueda con vectores ponderados
     # =========================================================================
     
-    _logger.info("discover.using_fallback", reason="weighted vector search")
+    _logger.info(
+        "discover.using_fallback",
+        reason="weighted vector search",
+        positive_count=len(positive_texts),
+        project=project_id,
+    )
     
     try:
         # Calcular vector promedio de positivos
