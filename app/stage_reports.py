@@ -1,7 +1,7 @@
 """
-Generación de Informes Doctorales.
+Generación de Informes de Avance por Etapa.
 
-Este módulo genera informes formales de avance doctoral para las etapas 3 y 4
+Este módulo genera informes formales de avance analítico para las etapas 3 y 4
 del análisis cualitativo con Teoría Fundamentada.
 
 Etapa 3 (Codificación Abierta):
@@ -128,9 +128,9 @@ def _format_interviews_archive_appendix(interviews: List[Dict[str, Any]]) -> str
 # PROMPTS PARA GENERACIÓN LLM
 # =============================================================================
 
-STAGE3_PROMPT = """Eres un asistente experto en metodología de Teoría Fundamentada para investigación doctoral.
+STAGE3_PROMPT = """Eres un asistente experto en metodología de Teoría Fundamentada para investigación cualitativa.
 
-Tu tarea es generar un informe de avance doctoral para la ETAPA 3: CODIFICACIÓN ABIERTA.
+Tu tarea es generar un informe de avance analítico para la ETAPA 3: CODIFICACIÓN ABIERTA.
 
 DATOS DEL PROYECTO:
 - Proyecto: {project}
@@ -174,10 +174,10 @@ Resume los hallazgos principales de esta etapa.
 
 ## 7. Anexo: Artefactos recientes considerados
 Incluye una lista enumerada de **3 a 6** artefactos **del bloque ARTEFACTOS RECIENTES** que realmente utilizaste para fundamentar el informe.
-Para cada artefacto, incluye: (a) tipo (runner / informe por entrevista / informe doctoral / insight), (b) identificador (nombre de archivo o etiqueta), (c) 1 línea explicando cómo influyó.
+Para cada artefacto, incluye: (a) tipo (runner / informe por entrevista / informe de avance / insight), (b) identificador (nombre de archivo o etiqueta), (c) 1 línea explicando cómo influyó.
 
 REQUISITO:
-- Integra los ARTEFACTOS RECIENTES cuando aporten evidencia, progreso o contradicciones; si los usas, menciona explícitamente el tipo (runner / informe por entrevista / informe doctoral / insight) para trazabilidad.
+- Integra los ARTEFACTOS RECIENTES cuando aporten evidencia, progreso o contradicciones; si los usas, menciona explícitamente el tipo (runner / informe por entrevista / informe de avance / insight) para trazabilidad.
 
 REGLA DE AUDITORÍA:
 - Debe aparecer exactamente el encabezado: "## Anexo: Artefactos recientes considerados".
@@ -185,15 +185,15 @@ REGLA DE AUDITORÍA:
 
 FORMATO (CRÍTICO):
 - NO incluyas un título H1 ("# ...") ni portada ni metadatos del informe.
-- NO repitas "Informe de Avance Doctoral".
+- NO repitas "Informe de Avance Analítico".
 - Comienza directamente en "## 1. Metodología Aplicada" y continúa con el resto de secciones.
 
-Usa lenguaje académico formal apropiado para una tesis doctoral. Incluye citas textuales cuando sea relevante.
+Usa lenguaje académico formal apropiado para investigación cualitativa. Incluye citas textuales cuando sea relevante.
 """
 
-STAGE4_PROMPT = """Eres un asistente experto en metodología de Teoría Fundamentada para investigación doctoral.
+STAGE4_PROMPT = """Eres un asistente experto en metodología de Teoría Fundamentada para investigación cualitativa.
 
-Tu tarea es generar un informe de avance doctoral para la ETAPA 4: CODIFICACIÓN AXIAL.
+Tu tarea es generar un informe de avance analítico para la ETAPA 4: CODIFICACIÓN AXIAL.
 
 DATOS DEL PROYECTO:
 - Proyecto: {project}
@@ -246,10 +246,10 @@ Propón los próximos pasos para la codificación selectiva (Etapa 5).
 
 ## 7. Anexo: Artefactos recientes considerados
 Incluye una lista enumerada de **3 a 6** artefactos **del bloque ARTEFACTOS RECIENTES** que realmente utilizaste para fundamentar el informe.
-Para cada artefacto, incluye: (a) tipo (runner / informe por entrevista / informe doctoral / insight), (b) identificador (nombre de archivo o etiqueta), (c) 1 línea explicando cómo influyó.
+Para cada artefacto, incluye: (a) tipo (runner / informe por entrevista / informe de avance / insight), (b) identificador (nombre de archivo o etiqueta), (c) 1 línea explicando cómo influyó.
 
 REQUISITO:
-- Integra MEMOS y ARTEFACTOS RECIENTES cuando sea relevante; si los usas, menciona explícitamente el tipo (runner / informe por entrevista / informe doctoral / insight) para trazabilidad.
+- Integra MEMOS y ARTEFACTOS RECIENTES cuando sea relevante; si los usas, menciona explícitamente el tipo (runner / informe por entrevista / informe de avance / insight) para trazabilidad.
 
 REGLA DE AUDITORÍA:
 - Debe aparecer exactamente el encabezado: "## Anexo: Artefactos recientes considerados".
@@ -257,10 +257,10 @@ REGLA DE AUDITORÍA:
 
 FORMATO (CRÍTICO):
 - NO incluyas un título H1 ("# ...") ni portada ni metadatos del informe.
-- NO repitas "Informe de Avance Doctoral".
+- NO repitas "Informe de Avance Analítico".
 - Comienza directamente en "## 1. Modelo Relacional Emergente" y continúa con el resto de secciones.
 
-Usa lenguaje académico formal apropiado para una tesis doctoral.
+Usa lenguaje académico formal apropiado para investigación cualitativa.
 """
 
 
@@ -353,7 +353,7 @@ def _get_memos(pg, project: str) -> str:
             memos.append(f"**[Código Candidato]**\n  {memo}")
         
     except Exception as e:
-        _logger.warning("doctoral.memos.db_error", error=str(e))
+        _logger.warning("stage_reports.memos.db_error", error=str(e))
     
     # 3. Memos de archivos .md en notes/{project}/
     try:
@@ -375,7 +375,7 @@ def _get_memos(pg, project: str) -> str:
                         filename = md_file.stem[:40]
                         memos.append(f"**[Archivo: {filename}]**\n  {synthesis[:250]}...")
     except Exception as e:
-        _logger.warning("doctoral.memos.file_error", error=str(e))
+        _logger.warning("stage_reports.memos.file_error", error=str(e))
     
     if not memos:
         return "(No hay memos registrados. Genera análisis con IA en Discovery o GraphRAG.)"
@@ -545,12 +545,12 @@ def generate_stage3_report(
     project: str,
 ) -> Dict[str, Any]:
     """
-    Genera informe doctoral para Etapa 3: Codificación Abierta.
+    Genera informe de avance analítico para Etapa 3: Codificación Abierta.
     
     Returns:
         Dict con 'content' (Markdown) y metadatos
     """
-    _logger.info("doctoral.stage3.generating", project=project)
+    _logger.info("stage_reports.stage3.generating", project=project)
     
     pg = clients.postgres
     
@@ -600,7 +600,7 @@ def generate_stage3_report(
         response = clients.aoai.chat.completions.create(
             model=settings.azure.deployment_chat,
             messages=[
-                {"role": "system", "content": "Eres un experto en metodología cualitativa doctoral. Respondes SOLO con JSON válido."},
+                {"role": "system", "content": "Eres un experto en metodología cualitativa. Respondes SOLO con JSON válido."},
                 {"role": "user", "content": prompt_json},
             ],
             max_completion_tokens=3000,
@@ -616,13 +616,13 @@ def generate_stage3_report(
             memo_statements = []
             structured = False
     except Exception as e:
-        _logger.error("doctoral.stage3.llm_error", error=str(e))
+        _logger.error("stage_reports.stage3.llm_error", error=str(e))
         content = f"# Error generando informe\n\nError: {e}"
         memo_statements = []
         structured = False
     
     # Agregar encabezado
-    header = f"""# Informe de Avance Doctoral - Etapa 3: Codificación Abierta
+    header = f"""# Informe de Avance Analítico - Etapa 3: Codificación Abierta
 
 **Proyecto:** {project}  
 **Fecha de generación:** {datetime.now().strftime("%Y-%m-%d %H:%M")}  
@@ -638,7 +638,7 @@ def generate_stage3_report(
     # Append printable archive appendix (deterministic, not LLM-generated)
     full_content = full_content.rstrip() + "\n\n---\n\n" + _format_interviews_archive_appendix(interviews)
     
-    _logger.info("doctoral.stage3.completed", project=project, chars=len(full_content))
+    _logger.info("stage_reports.stage3.completed", project=project, chars=len(full_content))
     
     return {
         "stage": "stage3",
@@ -660,12 +660,12 @@ def generate_stage4_report(
     project: str,
 ) -> Dict[str, Any]:
     """
-    Genera informe doctoral para Etapa 4: Codificación Axial.
+    Genera informe de avance analítico para Etapa 4: Codificación Axial.
     
     Returns:
         Dict con 'content' (Markdown) y metadatos
     """
-    _logger.info("doctoral.stage4.generating", project=project)
+    _logger.info("stage_reports.stage4.generating", project=project)
     
     pg = clients.postgres
     
@@ -733,7 +733,7 @@ def generate_stage4_report(
         response = clients.aoai.chat.completions.create(
             model=settings.azure.deployment_chat,
             messages=[
-                {"role": "system", "content": "Eres un experto en metodología cualitativa doctoral. Respondes SOLO con JSON válido."},
+                {"role": "system", "content": "Eres un experto en metodología cualitativa. Respondes SOLO con JSON válido."},
                 {"role": "user", "content": prompt_json},
             ],
             max_completion_tokens=3000,
@@ -749,13 +749,13 @@ def generate_stage4_report(
             memo_statements = []
             structured = False
     except Exception as e:
-        _logger.error("doctoral.stage4.llm_error", error=str(e))
+        _logger.error("stage_reports.stage4.llm_error", error=str(e))
         content = f"# Error generando informe\n\nError: {e}"
         memo_statements = []
         structured = False
     
     # Agregar encabezado
-    header = f"""# Informe de Avance Doctoral - Etapa 4: Codificación Axial
+    header = f"""# Informe de Avance Analítico - Etapa 4: Codificación Axial
 
 **Proyecto:** {project}  
 **Fecha de generación:** {datetime.now().strftime("%Y-%m-%d %H:%M")}  
@@ -776,7 +776,7 @@ def generate_stage4_report(
         interviews = []
     full_content = full_content.rstrip() + "\n\n---\n\n" + _format_interviews_archive_appendix(interviews)
     
-    _logger.info("doctoral.stage4.completed", project=project, chars=len(full_content))
+    _logger.info("stage_reports.stage4.completed", project=project, chars=len(full_content))
     
     return {
         "stage": "stage4",

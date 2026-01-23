@@ -6618,8 +6618,8 @@ def _assert_doctoral_task_access(*, task_id: str, task: Dict[str, Any], user: Us
 
 
 def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, settings: AppSettings) -> None:
-    """Background worker for doctoral report generation."""
-    from app.doctoral_reports import generate_stage3_report, generate_stage4_report
+    """Background worker for stage report generation."""
+    from app.stage_reports import generate_stage3_report, generate_stage4_report
     from app.postgres_block import save_doctoral_report, update_report_job
     from app.blob_storage import CONTAINER_REPORTS, upload_local_path
 
@@ -6669,7 +6669,7 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
                 content_type="text/markdown",
             )
         except Exception as exc:
-            api_logger.warning("doctoral.report.blob_upload_failed", error=str(exc)[:200], task_id=task_id)
+            api_logger.warning("stage_reports.report.blob_upload_failed", error=str(exc)[:200], task_id=task_id)
 
         # Persist DB record for history
         report_id = save_doctoral_report(
@@ -6695,7 +6695,7 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             clients.postgres,
             task_id=task_id,
             status="completed",
-            message="Informe doctoral generado",
+            message="Informe de avance generado",
             result=final_result,
             result_path=str(file_path),
             finished_at=datetime.now().isoformat(),
@@ -6712,7 +6712,7 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             )
         except Exception:
             pass
-        api_logger.error("doctoral.report.job_error", error=str(exc), task_id=task_id)
+        api_logger.error("stage_reports.report.job_error", error=str(exc), task_id=task_id)
     finally:
         clients.close()
 
@@ -6833,7 +6833,7 @@ async def api_generate_doctoral_report(
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
-    Genera informe doctoral formal para Etapa 3 o Etapa 4.
+    Genera informe de avance analítico para Etapa 3 o Etapa 4.
     
     - stage3: Codificación Abierta (códigos, saturación, memos)
     - stage4: Codificación Axial (categorías, comunidades, núcleo)
@@ -6841,7 +6841,7 @@ async def api_generate_doctoral_report(
     El informe se guarda tanto en archivo como en la base de datos para
     trazabilidad y análisis histórico.
     """
-    from app.doctoral_reports import generate_stage3_report, generate_stage4_report
+    from app.stage_reports import generate_stage3_report, generate_stage4_report
     from app.postgres_block import save_doctoral_report
     
     try:
@@ -6880,7 +6880,7 @@ async def api_generate_doctoral_report(
         result["report_id"] = report_id
         
         api_logger.info(
-            "doctoral.report.generated",
+            "stage_reports.report.generated",
             stage=payload.stage,
             project=payload.project,
             path=str(file_path),
@@ -6892,7 +6892,7 @@ async def api_generate_doctoral_report(
     except HTTPException:
         raise
     except Exception as exc:
-        api_logger.error("doctoral.report.error", error=str(exc))
+        api_logger.error("stage_reports.report.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
