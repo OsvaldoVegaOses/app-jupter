@@ -515,3 +515,40 @@ class TestBackendAPIEpistemicMode:
         
         assert "epistemic_mode" in source
         assert "create_project_db" in source
+
+
+# =============================================================================
+# TICKET-EM05: Documentation Tests
+# =============================================================================
+
+class TestDocumentation:
+    """Tests for epistemic mode documentation (EM05)."""
+    
+    def test_methodology_guide_exists(self):
+        """Methodology guide should exist."""
+        guide_path = Path(__file__).parent.parent / "docs" / "02-metodologia" / "guia_modos_epistemicos.md"
+        assert guide_path.exists(), "guia_modos_epistemicos.md should exist"
+    
+    def test_guide_covers_both_modes(self):
+        """Guide should document both epistemic modes."""
+        guide_path = Path(__file__).parent.parent / "docs" / "02-metodologia" / "guia_modos_epistemicos.md"
+        content = guide_path.read_text(encoding="utf-8")
+        
+        assert "Constructivista" in content
+        assert "Post-positivista" in content
+        assert "Charmaz" in content
+        assert "Glaser" in content
+    
+    def test_guide_has_selection_criteria(self):
+        """Guide should help users choose a mode."""
+        guide_path = Path(__file__).parent.parent / "docs" / "02-metodologia" / "guia_modos_epistemicos.md"
+        content = guide_path.read_text(encoding="utf-8")
+        
+        assert "Cuándo elegir" in content or "Guía de Selección" in content
+    
+    def test_guide_documents_lock_behavior(self):
+        """Guide should explain mode locking."""
+        guide_path = Path(__file__).parent.parent / "docs" / "02-metodologia" / "guia_modos_epistemicos.md"
+        content = guide_path.read_text(encoding="utf-8")
+        
+        assert "lock" in content.lower() or "bloqueado" in content.lower()
