@@ -142,7 +142,7 @@ from app.coding import (
     unassign_open_code,
     CodingError,
 )
-from app.axial import run_gds_analysis, AxialError
+from app.axial import run_gds_analysis, AxialError, AxialNotReadyError
 from app.documents import load_fragments
 from app.ingestion import ingest_documents
 from app.project_state import (
@@ -6374,6 +6374,16 @@ async def api_run_gds_analysis(
             persist=payload.persist,
         )
         return results
+    except AxialNotReadyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "axial_not_ready",
+                "project_id": exc.project_id,
+                "blocking_reasons": exc.blocking_reasons,
+                "message": str(exc),
+            },
+        ) from exc
     except AxialError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

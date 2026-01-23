@@ -7144,3 +7144,135 @@ def save_project_stage_db(
         "updated_at": row[6].isoformat() if row[6] else None,
     }
 
+
+def check_axial_ready(pg: PGConnection, project_id: str) -> Tuple[bool, List[str]]:
+    """
+    Verifica si la infraestructura ontológica está lista para operaciones axiales.
+    
+    Ejecuta las mismas validaciones que `/api/admin/code-id/status`:
+    - Columnas requeridas existen
+    - No hay `code_id` faltantes
+    - No hay `canonical_code_id` faltantes para códigos no canónicos
+    - No hay divergencias entre texto y ID
+    - No hay ciclos no triviales en la cadena canónica
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto a validar
+        
+    Returns:
+        Tuple[bool, List[str]]: (axial_ready, blocking_reasons)
+        - axial_ready: True si puede proceder con operaciones axiales
+        - blocking_reasons: Lista de razones de bloqueo (vacía si ready)
+        
+    Example:
+        >>> ready, reasons = check_axial_ready(pg, "jd-007")
+        >>> if not ready:
+        ...     raise HTTPException(409, detail={"blocking_reasons": reasons})
+    """
+    blocking_reasons: List[str] = []
+    
+    # 1. Verificar que las columnas requeridas existen
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'catalogo_codigos'
+        """)
+        columns = {row[0] for row in cur.fetchall()}
+    
+    has_code_id = "code_id" in columns
+    has_canonical_code_id = "canonical_code_id" in columns
+    supported = has_code_id and has_canonical_code_id
+    
+    if not supported:
+        blocking_reasons.append("supported=false")
+        return False, blocking_reasons
+    
+    # 2. Verificar missing_code_id
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos 
+            WHERE project_id = %s AND code_id IS NULL
+        """, (project_id,))
+        missing_code_id = int((cur.fetchone() or [0])[0] or 0)
+    
+    if missing_code_id > 0:
+        blocking_reasons.append("missing_code_id")
+    
+    # 3. Verificar missing_canonical_code_id para no-canónicos
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos 
+            WHERE project_id = %s 
+              AND canonical_codigo IS NOT NULL 
+              AND canonical_codigo != codigo
+              AND canonical_code_id IS NULL
+        """, (project_id,))
+        missing_canonical = int((cur.fetchone() or [0])[0] or 0)
+    
+    if missing_canonical > 0:
+        blocking_reasons.append("missing_canonical_code_id")
+    
+    # 4. Verificar divergencias texto vs ID
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos c
+            WHERE c.project_id = %s
+              AND c.canonical_code_id IS NOT NULL
+              AND c.canonical_codigo IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalogo_codigos t
+                  WHERE t.project_id = c.project_id
+                    AND t.code_id = c.canonical_code_id
+                    AND LOWER(TRIM(t.codigo)) = LOWER(TRIM(c.canonical_codigo))
+              )
+        """, (project_id,))
+        divergences = int((cur.fetchone() or [0])[0] or 0)
+    
+    if divergences > 0:
+        blocking_reasons.append("divergences_text_vs_id")
+    
+    # 5. Detectar ciclos no triviales (profundidad > 2)
+    with pg.cursor() as cur:
+        cur.execute("""
+            WITH RECURSIVE walk AS (
+              SELECT project_id,
+                     code_id,
+                     canonical_code_id,
+                     ARRAY[code_id] AS path,
+                     FALSE AS cycle
+                FROM catalogo_codigos
+               WHERE project_id = %s
+                 AND code_id IS NOT NULL
+                 AND canonical_code_id IS NOT NULL
+              UNION ALL
+              SELECT w.project_id,
+                     c.code_id,
+                     c.canonical_code_id,
+                     w.path || c.code_id,
+                     (c.code_id = ANY(w.path)) AS cycle
+                FROM walk w
+                JOIN catalogo_codigos c
+                  ON c.project_id = w.project_id
+                 AND c.code_id = w.canonical_code_id
+               WHERE w.cycle = FALSE
+                 AND array_length(w.path, 1) < 25
+                 AND c.code_id IS NOT NULL
+            )
+            SELECT COUNT(DISTINCT n)::INT
+              FROM (
+                  SELECT unnest(path) AS n
+                    FROM walk
+                   WHERE cycle = TRUE
+                     AND array_length(path, 1) > 2
+              ) s
+        """, (project_id,))
+        cycle_nodes = int((cur.fetchone() or [0])[0] or 0)
+    
+    if cycle_nodes > 0:
+        blocking_reasons.append("cycles_non_trivial")
+    
+    axial_ready = len(blocking_reasons) == 0
+    return axial_ready, blocking_reasons
+

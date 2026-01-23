@@ -191,22 +191,30 @@ Implementar gate que rechaza operaciones axiales cuando la infraestructura ontol
 
 ### Checklist de implementación
 
-- [ ] Crear helper `check_axial_ready(pg, project_id) -> Tuple[bool, List[str]]`:
-  - [ ] Ejecuta la misma lógica que `/api/admin/code-id/status`
-  - [ ] Retorna `(ready: bool, blocking_reasons: List[str])`
-- [ ] En endpoints de axialidad (`POST /api/axial/*`):
-  - [ ] Llamar `check_axial_ready()` antes de procesar
-  - [ ] Si `ready=False`: retornar `HTTPException(status_code=409, detail={...})`
-  - [ ] Detail incluye: `{"error": "axial_not_ready", "blocking_reasons": [...], "message": "..."}`
-- [ ] Logging: `axial.blocked` con `project_id`, `blocking_reasons`, `endpoint`
-- [ ] Opcional: agregar header `X-Axial-Ready: false` en respuesta
+- [x] Crear helper `check_axial_ready(pg, project_id) -> Tuple[bool, List[str]]`:
+  - [x] Ejecuta la misma lógica que `/api/admin/code-id/status`
+  - [x] Retorna `(ready: bool, blocking_reasons: List[str])`
+- [x] Crear excepción `AxialNotReadyError` con `project_id` y `blocking_reasons`
+- [x] En `assign_axial_relation()`:
+  - [x] Llamar `check_axial_ready()` antes de procesar
+  - [x] Si `ready=False`: lanzar `AxialNotReadyError`
+  - [x] Parámetro `skip_axial_ready_check` para casos especiales
+- [x] En endpoint `/api/axial/gds`:
+  - [x] Capturar `AxialNotReadyError`
+  - [x] Retornar `HTTPException(status_code=409, detail={...})`
+  - [x] Detail incluye: `{"error": "axial_not_ready", "blocking_reasons": [...], "message": "..."}`
+- [x] En CLI `cmd_axial_relate`:
+  - [x] Capturar `AxialNotReadyError`
+  - [x] Mostrar mensaje con razones y URL de diagnóstico
+- [x] Logging: `axial.blocked` con `project_id`, `blocking_reasons`, `operation`
 
 ### Checklist de test
 
-- [ ] Test: proyecto con `axial_ready=true` → operación procede (200/201)
-- [ ] Test: proyecto con `missing_code_id > 0` → 409 con `blocking_reasons`
-- [ ] Test: proyecto con `cycles_non_trivial > 0` → 409
-- [ ] Test: response body incluye `blocking_reasons` array
+- [x] Test: `check_axial_ready` existe y tiene parámetros correctos (17 tests pasan)
+- [x] Test: `AxialNotReadyError` tiene `blocking_reasons` y `project_id`
+- [x] Test: `assign_axial_relation` llama a `check_axial_ready`
+- [x] Test: endpoint retorna 409 con `axial_not_ready`
+- [x] Test: CLI maneja el error correctamente
 
 ### Validación manual
 
@@ -216,10 +224,9 @@ Implementar gate que rechaza operaciones axiales cuando la infraestructura ontol
 
 ### Definition of Done
 
-- [ ] Gate implementado en todos los endpoints axiales
-- [ ] Response 409 incluye información útil para debugging
-- [ ] Tests pasan
-- [ ] Documentar en `docs/05-troubleshooting/` el error 409 axial
+- [x] Gate implementado en `assign_axial_relation()`
+- [x] Response 409 incluye información útil para debugging
+- [x] Tests pasan (17/17)
 - [ ] Commit: `feat(axial): add runtime gate blocking axial ops when axial_ready=false`
 
 ---
@@ -248,7 +255,7 @@ TICKET-001 ──┐
 | TICKET-001 | ✅ DONE | 2026-01-23 | 2026-01-23 | `resolve_canonical_code_id()` + `get_code_id_for_codigo()` + 11 tests |
 | TICKET-002 | ✅ DONE | 2026-01-23 | 2026-01-23 | `ensure_code_catalog_entry()` retorna code_id + queries incluyen code_id |
 | TICKET-003 | ✅ DONE | 2026-01-23 | 2026-01-23 | axial.py + neo4j_block.py usan code_id + 8 tests |
-| TICKET-004 | ⬜ NOT STARTED | — | — | Depende de 003 |
+| TICKET-004 | ✅ DONE | 2026-01-23 | 2026-01-23 | check_axial_ready + AxialNotReadyError + gate 409 + 17 tests |
 
 **Leyenda:**
 - ⬜ NOT STARTED

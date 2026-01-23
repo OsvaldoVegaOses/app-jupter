@@ -69,11 +69,33 @@ from .postgres_block import (
     upsert_axial_relationships,
     get_code_id_for_codigo,
     resolve_canonical_code_id,
+    check_axial_ready,
 )
 
 
 class AxialError(Exception):
     """Error específico para operaciones de codificación axial."""
+
+
+class AxialNotReadyError(Exception):
+    """Error cuando la infraestructura ontológica no está lista para axialidad.
+    
+    Se lanza cuando `check_axial_ready()` retorna False, indicando que
+    hay problemas estructurales que deben resolverse antes de operar.
+    
+    Attributes:
+        blocking_reasons: Lista de razones de bloqueo (ej: 'missing_code_id')
+        project_id: ID del proyecto afectado
+    """
+    def __init__(self, project_id: str, blocking_reasons: List[str]):
+        self.project_id = project_id
+        self.blocking_reasons = blocking_reasons
+        message = (
+            f"Proyecto '{project_id}' no está listo para operaciones axiales. "
+            f"Razones de bloqueo: {', '.join(blocking_reasons)}. "
+            f"Use GET /api/admin/code-id/status para diagnóstico."
+        )
+        super().__init__(message)
 
 
 # Tipos de relación válidos para codificación axial
@@ -111,14 +133,28 @@ def assign_axial_relation(
     memo: Optional[str] = None,
     project: Optional[str] = None,
     logger: Optional[structlog.BoundLogger] = None,
+    skip_axial_ready_check: bool = False,
 ) -> Dict[str, object]:
     log = logger or _logger
+    project_id = project or "default"
+    
+    # Gate: verificar axial_ready antes de proceder
+    if not skip_axial_ready_check:
+        axial_ready, blocking_reasons = check_axial_ready(clients.postgres, project_id)
+        if not axial_ready:
+            log.warning(
+                "axial.blocked",
+                project_id=project_id,
+                blocking_reasons=blocking_reasons,
+                operation="assign_axial_relation",
+            )
+            raise AxialNotReadyError(project_id, blocking_reasons)
+    
     rel_tipo = relacion.lower().strip()
     ensure_open_coding_table(clients.postgres)
     from app.postgres_block import ensure_codes_catalog_table, resolve_canonical_codigo
 
     ensure_codes_catalog_table(clients.postgres)
-    project_id = project or "default"
     original_codigo = codigo
     codigo = resolve_canonical_codigo(clients.postgres, project_id, codigo)
     

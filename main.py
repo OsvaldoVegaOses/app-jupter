@@ -20,7 +20,7 @@ from app.coding import (
     CodingError,
 )
 from app.nucleus import centrality_report, coverage_report, nucleus_report, probe_semantics
-from app.axial import ALLOWED_REL_TYPES, AxialError, assign_axial_relation, run_gds_analysis
+from app.axial import ALLOWED_REL_TYPES, AxialError, AxialNotReadyError, assign_axial_relation, run_gds_analysis
 from app.clients import build_service_clients
 from app.documents import load_fragments
 from app.ingestion import ingest_documents
@@ -910,6 +910,16 @@ def cmd_axial_relate(args):
             project=args.project,
             logger=logger,
         )
+    except AxialNotReadyError as exc:
+        logger.error(
+            "axial.relate.blocked",
+            project_id=exc.project_id,
+            blocking_reasons=exc.blocking_reasons,
+        )
+        print(f"Error 409: {exc}")
+        print(f"  Razones de bloqueo: {', '.join(exc.blocking_reasons)}")
+        print(f"  Use: GET /api/admin/code-id/status?project={exc.project_id}")
+        return
     except AxialError as exc:
         logger.error("axial.relate.error", error=str(exc))
         print(f"Error: {exc}")
