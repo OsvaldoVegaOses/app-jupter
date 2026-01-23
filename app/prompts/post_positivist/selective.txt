@@ -1,0 +1,46 @@
+ETAPA: CODIFICACIÓN SELECTIVA (Enfoque Glaser/Strauss)
+
+OBJETIVO:
+Identificar la CATEGORÍA CENTRAL que integra todas las demás en una teoría sustantiva.
+
+PRINCIPIOS:
+- La categoría central es el concepto que tiene mayor poder explicativo
+- Debe conectarse sistemáticamente con todas las demás categorías
+- La teoría resultante debe ser parsimoniosa y densa
+
+CRITERIOS PARA CATEGORÍA CENTRAL (Strauss):
+1. Centralidad: Todas las categorías se relacionan con ella
+2. Frecuencia: Aparece recurrentemente en los datos
+3. Facilidad de conexión: Las relaciones son lógicas y consistentes
+4. Implicaciones teóricas: Permite desarrollo hacia teoría formal
+5. Variación: Explica casos típicos y atípicos
+
+INSTRUCCIONES:
+1. Lista las categorías axiales desarrolladas
+2. Identifica cuál tiene mayor poder integrativo
+3. Verifica conexiones sistemáticas con todas las demás
+4. Formula la teoría sustantiva como proposiciones
+5. Evalúa densidad y parsimonia
+
+LÍNEA ARGUMENTAL (storyline):
+Narrativa coherente que conecta todas las categorías alrededor de la central.
+
+EJEMPLO:
+{
+  "categoria_central": "gestion_de_la_alteridad_vecinal",
+  "definicion": "Proceso mediante el cual los residentes establecidos desarrollan estrategias para manejar la presencia de nuevos grupos poblacionales percibidos como diferentes.",
+  "linea_argumental": "Ante el cambio demográfico (condición), los residentes experimentan percepción de invasión (fenómeno), lo que activa estrategias de evitación y fortalecimiento interno (acción), resultando en fragmentación social (consecuencia).",
+  "categorias_integradas": [
+    {"categoria": "percepcion_de_invasion", "relacion": "fenomeno_central"},
+    {"categoria": "estrategias_de_evitacion", "relacion": "accion"},
+    {"categoria": "fragmentacion_social", "relacion": "consecuencia"}
+  ],
+  "proposiciones_teoricas": [
+    "A mayor velocidad del cambio demográfico, mayor percepción de invasión",
+    "La percepción de invasión activa estrategias defensivas territoriales",
+    "Las estrategias de evitación profundizan la fragmentación social"
+  ],
+  "saturacion_alcanzada": true,
+  "densidad_teorica": "alta",
+  "casos_negativos_explicados": 2
+}

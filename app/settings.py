@@ -27,10 +27,35 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv, find_dotenv
+
+
+# =============================================================================
+# ENUMS
+# =============================================================================
+
+class EpistemicMode(str, Enum):
+    """Modo epistemológico para análisis cualitativo.
+    
+    CONSTRUCTIVIST: Enfoque Charmaz - gerundios, in-vivo, memos reflexivos
+    POST_POSITIVIST: Enfoque Glaser/Strauss - abstracción, patrones, memos conceptuales
+    """
+    CONSTRUCTIVIST = "constructivist"
+    POST_POSITIVIST = "post_positivist"
+    
+    @classmethod
+    def from_string(cls, value: str | None) -> "EpistemicMode":
+        """Parse string to enum, defaulting to CONSTRUCTIVIST."""
+        if value is None:
+            return cls.CONSTRUCTIVIST
+        try:
+            return cls(value.lower())
+        except ValueError:
+            return cls.CONSTRUCTIVIST
 
 
 # =============================================================================

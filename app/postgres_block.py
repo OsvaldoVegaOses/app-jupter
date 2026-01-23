@@ -6828,7 +6828,7 @@ def ensure_projects_table(pg: PGConnection) -> None:
 def list_projects_db(pg: PGConnection, org_id: Optional[str] = None, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Lista proyectos desde PostgreSQL."""
     base_sql = """
-    SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+    SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
     FROM proyectos
     """
     conditions = []
@@ -6860,6 +6860,7 @@ def list_projects_db(pg: PGConnection, org_id: Optional[str] = None, owner_id: O
             "config": row[5] or {},
             "created_at": row[6].isoformat() if row[6] else None,
             "updated_at": row[7].isoformat() if row[7] else None,
+            "epistemic_mode": row[8] or "constructivist",
         }
         for row in rows
     ]
@@ -6876,13 +6877,13 @@ def get_project_db(pg: PGConnection, project_id: str, org_id: Optional[str] = No
     """
     if org_id:
         sql = """
-        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
         FROM proyectos WHERE id = %s AND org_id = %s
         """
         params = (project_id, org_id)
     else:
         sql = """
-        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
         FROM proyectos WHERE id = %s
         """
         params = (project_id,)
@@ -6902,6 +6903,7 @@ def get_project_db(pg: PGConnection, project_id: str, org_id: Optional[str] = No
         "config": row[5] or {},
         "created_at": row[6].isoformat() if row[6] else None,
         "updated_at": row[7].isoformat() if row[7] else None,
+        "epistemic_mode": row[8] or "constructivist",
     }
 
 
@@ -7051,6 +7053,109 @@ def ensure_default_project_db(pg: PGConnection) -> None:
             "UPDATE proyectos SET org_id = 'default_org' WHERE id = 'default' AND (org_id IS NULL OR org_id = '')"
         )
     pg.commit()
+
+
+# =============================================================================
+# Epistemic Mode (per-project methodology configuration)
+# =============================================================================
+
+def get_project_epistemic_mode(pg: PGConnection, project_id: str) -> "EpistemicMode":
+    """Get the epistemic mode configured for a project.
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        
+    Returns:
+        EpistemicMode (defaults to CONSTRUCTIVIST if not set or invalid)
+    """
+    from app.settings import EpistemicMode
+    
+    query = "SELECT epistemic_mode FROM proyectos WHERE id = %s"
+    with pg.cursor() as cur:
+        cur.execute(query, (project_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            return EpistemicMode.from_string(row[0])
+    return EpistemicMode.CONSTRUCTIVIST
+
+
+def set_project_epistemic_mode(
+    pg: PGConnection, 
+    project_id: str, 
+    mode: "EpistemicMode"
+) -> Tuple[bool, str]:
+    """Set epistemic mode for a project.
+    
+    Fails if project already has axial relations (mode lock enforcement).
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        mode: EpistemicMode to set
+        
+    Returns:
+        Tuple[success: bool, message: str]
+    """
+    from app.settings import EpistemicMode
+    
+    # Check for existing axial relations (lock de modo)
+    check_axial = """
+        SELECT COUNT(*) FROM axial_relationships 
+        WHERE project_id = %s
+    """
+    with pg.cursor() as cur:
+        cur.execute(check_axial, (project_id,))
+        result = cur.fetchone()
+        axial_count = result[0] if result else 0
+        
+        if axial_count > 0:
+            _logger.warning(
+                "epistemic_mode.change_blocked",
+                project_id=project_id,
+                axial_count=axial_count,
+                reason="project_has_axial_relations",
+            )
+            return False, f"Cannot change epistemic_mode: project has {axial_count} axial relations"
+        
+        # Safe to update
+        update = """
+            UPDATE proyectos 
+            SET epistemic_mode = %s, updated_at = NOW()
+            WHERE id = %s
+            RETURNING epistemic_mode
+        """
+        cur.execute(update, (mode.value, project_id))
+        updated = cur.fetchone()
+        
+        if updated is None:
+            return False, f"Project {project_id} not found"
+        
+        pg.commit()
+        
+        _logger.info(
+            "epistemic_mode.updated",
+            project_id=project_id,
+            mode=mode.value,
+        )
+        return True, f"epistemic_mode set to {mode.value}"
+
+
+def has_axial_relations(pg: PGConnection, project_id: str) -> bool:
+    """Check if a project has any axial relations (for mode lock check).
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        
+    Returns:
+        True if project has at least one axial relation
+    """
+    query = "SELECT COUNT(*) > 0 FROM axial_relationships WHERE project_id = %s"
+    with pg.cursor() as cur:
+        cur.execute(query, (project_id,))
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
 # =============================================================================

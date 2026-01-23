@@ -1,0 +1,47 @@
+ETAPA: MEMO REFLEXIVO (Enfoque Constructivista)
+
+OBJETIVO:
+Documentar el proceso analítico con transparencia sobre el posicionamiento
+del investigador y las decisiones metodológicas.
+
+TIPOS DE MEMO:
+1. MEMO DE CÓDIGO: Explora significados de un código específico
+2. MEMO TEÓRICO: Conecta códigos/categorías en proposiciones
+3. MEMO REFLEXIVO: Examina tu rol como investigador
+4. MEMO METODOLÓGICO: Documenta decisiones de proceso
+
+ESTRUCTURA DEL MEMO REFLEXIVO:
+1. Posicionamiento: ¿Desde dónde analizo?
+2. Decisiones: ¿Qué elegí enfatizar y qué dejé fuera?
+3. Tensiones: ¿Qué contradicciones encuentro?
+4. Preguntas: ¿Qué necesito explorar más?
+
+INSTRUCCIONES:
+1. Identifica el tipo de memo apropiado
+2. Escribe en primera persona cuando sea reflexivo
+3. Vincula a evidencia específica cuando aplique
+4. Registra fecha y contexto
+
+EJEMPLO MEMO REFLEXIVO:
+{
+  "tipo": "reflexivo",
+  "fecha": "2026-01-23",
+  "titulo": "Tensión entre mi lectura y las voces de los participantes",
+  "contenido": "Al codificar las entrevistas sobre cambio demográfico, noto que mi propia experiencia como residente urbano puede estar influyendo en cómo interpreto la 'nostalgia'. Los participantes mayores usan este registro, pero ¿estoy proyectando mi propia ambivalencia hacia el cambio?",
+  "preguntas_emergentes": [
+    "¿Cómo hablan los participantes más jóvenes del mismo fenómeno?",
+    "¿La nostalgia es un código in-vivo o una interpretación mía?"
+  ],
+  "accion_siguiente": "Revisar fragmentos de participantes < 40 años buscando variaciones"
+}
+
+EJEMPLO MEMO TEÓRICO:
+{
+  "tipo": "teorico",
+  "fecha": "2026-01-23",
+  "titulo": "Conexión entre resistencia y adaptación",
+  "contenido": "Las categorías 'resistiendo_cambio' y 'adaptandose_nuevos_vecinos' aparecían como opuestas, pero los datos sugieren que coexisten en los mismos participantes. Esto podría indicar un proceso de negociación más que una posición fija.",
+  "codigos_relacionados": ["resistiendo_cambio", "adaptandose_nuevos_vecinos"],
+  "proposicion": "La identidad comunitaria se negocia activamente, no se mantiene o pierde de forma binaria.",
+  "evidencia": [3, 7, 12, 15]
+}

@@ -1,0 +1,51 @@
+ETAPA: CODIFICACIÓN ABIERTA (Enfoque Glaser/Strauss)
+
+OBJETIVO:
+Generar códigos conceptuales que abstraigan los PATRONES presentes en los datos.
+
+FORMATO DE CÓDIGOS:
+- Usar SUSTANTIVOS ABSTRACTOS: "presion_infraestructura", "identidad_cultural", "tension_vecinal"
+- Preferir conceptos analíticos sobre descripciones literales
+- Máximo 3-4 palabras por código (snake_case)
+- Los códigos deben trascender el caso particular hacia lo general
+
+INSTRUCCIONES:
+1. Lee el fragmento buscando patrones y regularidades
+2. Identifica conceptos que puedan aplicar a otros casos
+3. Formula códigos como sustantivos que capturen la esencia
+4. Busca propiedades y dimensiones de cada concepto
+
+MEMO CONCEPTUAL (obligatorio):
+- Definición operacional del código
+- Propiedades identificables
+- Dimensiones (variaciones posibles)
+- Condiciones bajo las cuales ocurre
+
+EJEMPLO DE SALIDA:
+{
+  "etapa3_matriz_abierta": [
+    {
+      "codigo": "sobrecarga_laboral",
+      "cita": "ya no doy más con todo esto",
+      "fragmento_idx": 5,
+      "fuente": "Entrevistado/a",
+      "propiedades": ["intensidad", "duracion", "fuente"]
+    },
+    {
+      "codigo": "agotamiento_recursos",
+      "cita": "no hay tiempo ni energia",
+      "fragmento_idx": 5,
+      "fuente": "Entrevistado/a",
+      "propiedades": ["tipo_recurso", "grado_deplecion"]
+    }
+  ],
+  "memo_conceptual": {
+    "codigo": "sobrecarga_laboral",
+    "definicion": "Estado en que las demandas exceden los recursos disponibles del individuo",
+    "propiedades": [
+      {"nombre": "intensidad", "rango": "leve a severa"},
+      {"nombre": "duracion", "rango": "temporal a cronica"},
+      {"nombre": "fuente", "variantes": ["laboral", "familiar", "multiple"]}
+    ]
+  }
+}
