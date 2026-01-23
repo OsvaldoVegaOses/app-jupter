@@ -9657,15 +9657,15 @@ async def api_admin_cleanup_all_data(
                 counts["postgres"] += cur.rowcount
             clients.postgres.commit()
         
-        # 2. Qdrant cleanup
+        # 2. Qdrant cleanup - use global collection with project_id filter
         try:
-            collection = f"project_{project_id}".replace("-", "_")
+            # Use settings.qdrant.collection (global collection) instead of per-project collection
             clients.qdrant.delete(
-                collection_name=collection,
+                collection_name=settings.qdrant.collection,
                 points_selector=models.Filter(
                     must=[
                         models.FieldCondition(
-                            key="metadata.project_id",
+                            key="project_id",
                             match=models.MatchValue(value=project_id),
                         )
                     ]
