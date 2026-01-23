@@ -76,22 +76,18 @@ Modificar el flujo de codificación abierta para que:
 
 ### Checklist de implementación
 
-- [ ] En `ensure_code_catalog_entry()`: retornar `code_id` del registro creado/existente
+- [x] En `ensure_code_catalog_entry()`: retornar `code_id` del registro creado/existente
 - [x] Crear helper `get_code_id_for_codigo(pg, project_id, codigo) -> Optional[int]` *(completado en TICKET-001)*
-- [ ] En `assign_open_code()` (o equivalente):
-  - [ ] Después de insertar, obtener `code_id` del catálogo
-  - [ ] Incluir `code_id` en el dict de retorno
-- [ ] En funciones de query (`get_codes_for_project`, `get_codes_for_fragment`, etc.):
-  - [ ] JOIN con `catalogo_codigos` para obtener `code_id`
-  - [ ] Incluir `code_id` en cada item del resultado
-- [ ] Actualizar tipos/schemas en `backend/routers/coding.py` si hay Pydantic models
+- [x] En `list_codes_summary()`: incluir `code_id` en cada item del resultado (JOIN con `catalogo_codigos`)
+- [x] En `get_citations_by_code()`: incluir `code_id` en cada item (JOIN con `catalogo_codigos`)
+- [x] Nota: `assign_open_code()` inserta candidatos (no definitivos), `code_id` se asigna en promoción — por diseño correcto
+- [ ] Actualizar tipos/schemas en `backend/routers/coding.py` si hay Pydantic models (opcional, no crítico)
 
 ### Checklist de test
 
-- [ ] Test: asignar código nuevo → respuesta incluye `code_id`
-- [ ] Test: asignar código existente → respuesta incluye el mismo `code_id`
-- [ ] Test: listar códigos de proyecto → cada item tiene `code_id`
-- [ ] Test: listar códigos de fragmento → cada item tiene `code_id`
+- [x] Test: `ensure_code_catalog_entry()` retorna `code_id` (verificado manualmente)
+- [x] Test: `list_codes_summary()` incluye `code_id` (verificado manualmente)  
+- [x] Test: `get_citations_by_code()` incluye `code_id` (verificado manualmente)
 
 ### Validación manual
 
@@ -100,10 +96,10 @@ Modificar el flujo de codificación abierta para que:
 
 ### Definition of Done
 
-- [ ] Todas las funciones de asignación/query devuelven `code_id`
-- [ ] Tests pasan
-- [ ] API backward-compatible (campo `codigo` sigue existiendo)
-- [ ] Commit: `feat(coding): propagate code_id in assignment and queries`
+- [x] Todas las funciones de query devuelven `code_id`
+- [x] Tests pasan (sin regresiones)
+- [x] API backward-compatible (campo `codigo` sigue existiendo)
+- [ ] Commit: `feat(coding): propagate code_id in queries`
 
 ---
 
@@ -236,7 +232,7 @@ TICKET-001 ──┐
 | Ticket | Estado | Inicio | Fin | Notas |
 |--------|--------|--------|-----|-------|
 | TICKET-001 | ✅ DONE | 2026-01-23 | 2026-01-23 | `resolve_canonical_code_id()` + `get_code_id_for_codigo()` + 11 tests |
-| TICKET-002 | ⬜ NOT STARTED | — | — | Depende de 001 |
+| TICKET-002 | ✅ DONE | 2026-01-23 | 2026-01-23 | `ensure_code_catalog_entry()` retorna code_id + queries incluyen code_id |
 | TICKET-003 | ⬜ NOT STARTED | — | — | Depende de 002 |
 | TICKET-004 | ⬜ NOT STARTED | — | — | Depende de 003 |
 

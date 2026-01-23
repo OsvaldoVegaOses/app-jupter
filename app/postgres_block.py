@@ -1729,21 +1729,35 @@ def ensure_code_catalog_entry(
     codigo: str,
     *,
     status: str = "active",
-) -> None:
-    """Crea (si falta) una fila en `catalogo_codigos` para un código."""
+) -> Optional[int]:
+    """Crea (si falta) una fila en `catalogo_codigos` para un código.
+    
+    Returns:
+        El code_id del registro (existente o creado), o None si codigo es vacío.
+    """
     if not codigo or not str(codigo).strip():
-        return
+        return None
 
     ensure_codes_catalog_table(pg)
+    codigo_clean = str(codigo).strip()
+    
     with pg.cursor() as cur:
+        # INSERT con RETURNING para obtener code_id
         cur.execute(
             """
             INSERT INTO catalogo_codigos (project_id, codigo, status)
             VALUES (%s, %s, %s)
-            ON CONFLICT (project_id, codigo) DO NOTHING
+            ON CONFLICT (project_id, codigo) DO UPDATE SET updated_at = NOW()
+            RETURNING code_id
             """,
-            (project_id, str(codigo).strip(), status),
+            (project_id, codigo_clean, status),
         )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    
+    # Fallback: consultar el code_id existente
+    return get_code_id_for_codigo(pg, project_id, codigo_clean)
 
 
 def resolve_canonical_codigo(
@@ -2814,14 +2828,18 @@ def get_fragment_context(pg: PGConnection, fragment_id: str, project: Optional[s
 
 
 def get_citations_by_code(pg: PGConnection, codigo: str, project: Optional[str] = None) -> List[Dict[str, Any]]:
+    project_id = project or "default"
     sql = """
-    SELECT fragmento_id, codigo, archivo, cita, fuente, memo, created_at
-      FROM analisis_codigos_abiertos
-     WHERE codigo = %s AND project_id = %s
-     ORDER BY created_at DESC
+    SELECT aca.fragmento_id, aca.codigo, aca.archivo, aca.cita, aca.fuente, aca.memo, aca.created_at,
+           cc.code_id
+      FROM analisis_codigos_abiertos aca
+      LEFT JOIN catalogo_codigos cc
+        ON cc.project_id = aca.project_id AND cc.codigo = aca.codigo
+     WHERE aca.codigo = %s AND aca.project_id = %s
+     ORDER BY aca.created_at DESC
     """
     with pg.cursor() as cur:
-        cur.execute(sql, (codigo, project or "default"))
+        cur.execute(sql, (codigo, project_id))
         rows = cur.fetchall()
     return [
         {
@@ -2832,6 +2850,7 @@ def get_citations_by_code(pg: PGConnection, codigo: str, project: Optional[str] 
             "fuente": r[4],
             "memo": r[5],
             "created_at": r[6].isoformat().replace("+00:00", "Z") if r[6] else None,
+            "code_id": int(r[7]) if r[7] is not None else None,
         }
         for r in rows
     ]
@@ -3141,7 +3160,7 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
         archivo: Filtrar códigos que aparecen en este archivo de entrevista
         
     Returns:
-        Lista de códigos con citas, fragmentos y fechas
+        Lista de códigos con citas, fragmentos, fechas y code_id
     """
     clauses: List[str] = []
     params: List[Any] = []
@@ -3161,12 +3180,13 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
                      MIN(aca.created_at) AS primera_cita,
                      MAX(aca.created_at) AS ultima_cita,
            COALESCE(cc.status, 'active') AS status,
-           cc.canonical_codigo
+           cc.canonical_codigo,
+           cc.code_id
       FROM analisis_codigos_abiertos aca
       LEFT JOIN catalogo_codigos cc
         ON cc.project_id = aca.project_id AND cc.codigo = aca.codigo
       {where}
-     GROUP BY aca.codigo, cc.status, cc.canonical_codigo
+     GROUP BY aca.codigo, cc.status, cc.canonical_codigo, cc.code_id
          ORDER BY MAX(aca.created_at) DESC NULLS LAST, aca.codigo ASC
      LIMIT %s
     """
@@ -3183,6 +3203,7 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
             "ultima_cita": row[4].isoformat().replace("+00:00", "Z") if row[4] else None,
             "status": row[5],
             "canonical_codigo": row[6],
+            "code_id": int(row[7]) if row[7] is not None else None,
         }
         for row in rows
     ]
