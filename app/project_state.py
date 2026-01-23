@@ -290,6 +290,7 @@ def create_project(
     description: Optional[str] = None,
     org_id: Optional[str] = None,
     owner_id: Optional[str] = None,
+    epistemic_mode: str = "constructivist",
 ) -> Dict[str, Any]:
     """
     Crea un nuevo proyecto.
@@ -300,6 +301,7 @@ def create_project(
         description: Descripción opcional
         org_id: ID de la organización propietaria (multi-tenant)
         owner_id: ID del usuario que crea el proyecto
+        epistemic_mode: Modo epistémico (constructivist | post_positivist)
         
     Returns:
         Dict con datos del proyecto creado
@@ -330,6 +332,7 @@ def create_project(
         description=(description or "").strip() or None,
         org_id=org_id,
         owner_id=owner_id,
+        epistemic_mode=epistemic_mode,
     )
 
 

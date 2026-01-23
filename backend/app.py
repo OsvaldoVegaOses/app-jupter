@@ -1228,6 +1228,7 @@ class ProjectCreateRequest(BaseModel):
 
     name: str
     description: Optional[str] = None
+    epistemic_mode: Optional[str] = "constructivist"  # constructivist | post_positivist
 
 
 # =============================================================================
@@ -1320,6 +1321,7 @@ async def api_create_project(
             payload.description,
             org_id=user.organization_id,
             owner_id=user.user_id,  # Asignar al usuario creador
+            epistemic_mode=payload.epistemic_mode or "constructivist",
         )
         api_logger.info(
             "project.create.db_success",

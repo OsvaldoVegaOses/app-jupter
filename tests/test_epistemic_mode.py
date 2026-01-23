@@ -432,3 +432,86 @@ class TestAnalysisIntegration:
         
         assert "QUAL_SYSTEM_PROMPT" in source  # Fallback prompt should still exist
         assert "epistemic_mode.load_failed" in source  # Warning log for fallback
+
+
+# =============================================================================
+# TICKET-EM04: UI Selector + Badge Tests
+# =============================================================================
+
+class TestUIComponents:
+    """Tests for UI components (EM04)."""
+    
+    def test_epistemic_mode_badge_component_exists(self):
+        """EpistemicModeBadge.tsx should exist."""
+        badge_path = Path(__file__).parent.parent / "frontend" / "src" / "components" / "common" / "EpistemicModeBadge.tsx"
+        assert badge_path.exists(), "EpistemicModeBadge.tsx should exist"
+    
+    def test_epistemic_mode_selector_component_exists(self):
+        """EpistemicModeSelector.tsx should exist."""
+        selector_path = Path(__file__).parent.parent / "frontend" / "src" / "components" / "common" / "EpistemicModeSelector.tsx"
+        assert selector_path.exists(), "EpistemicModeSelector.tsx should exist"
+    
+    def test_badge_has_both_mode_styles(self):
+        """Badge should have styles for both modes."""
+        badge_path = Path(__file__).parent.parent / "frontend" / "src" / "components" / "common" / "EpistemicModeBadge.tsx"
+        source = badge_path.read_text(encoding="utf-8")
+        
+        assert "constructivist" in source.lower()
+        assert "post_positivist" in source.lower()
+        assert "Charmaz" in source
+        assert "Glaser" in source or "Strauss" in source
+    
+    def test_selector_has_radio_options(self):
+        """Selector should have radio inputs for both modes."""
+        selector_path = Path(__file__).parent.parent / "frontend" / "src" / "components" / "common" / "EpistemicModeSelector.tsx"
+        source = selector_path.read_text(encoding="utf-8")
+        
+        assert 'type="radio"' in source
+        assert "constructivist" in source.lower()
+        assert "post_positivist" in source.lower()
+    
+    def test_app_imports_epistemic_components(self):
+        """App.tsx should import epistemic components."""
+        app_path = Path(__file__).parent.parent / "frontend" / "src" / "App.tsx"
+        source = app_path.read_text(encoding="utf-8")
+        
+        assert "EpistemicModeBadge" in source
+        assert "EpistemicModeSelector" in source
+    
+    def test_project_entry_type_has_epistemic_mode(self):
+        """ProjectEntry type should include epistemic_mode."""
+        types_path = Path(__file__).parent.parent / "frontend" / "src" / "types.ts"
+        source = types_path.read_text(encoding="utf-8")
+        
+        assert "epistemic_mode" in source
+        assert "EpistemicMode" in source
+
+
+class TestBackendAPIEpistemicMode:
+    """Tests for backend API epistemic mode support."""
+    
+    def test_project_create_request_has_epistemic_mode(self):
+        """ProjectCreateRequest should include epistemic_mode."""
+        app_path = Path(__file__).parent.parent / "backend" / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+        
+        # Find the ProjectCreateRequest class and check it has epistemic_mode
+        assert "class ProjectCreateRequest" in source
+        assert "epistemic_mode" in source
+    
+    def test_create_project_db_accepts_epistemic_mode(self):
+        """create_project_db should accept epistemic_mode parameter."""
+        postgres_path = Path(__file__).parent.parent / "app" / "postgres_block.py"
+        source = postgres_path.read_text(encoding="utf-8")
+        
+        # Check function signature includes epistemic_mode
+        assert 'epistemic_mode: str = "constructivist"' in source or \
+               "epistemic_mode=" in source
+    
+    def test_create_project_passes_epistemic_mode(self):
+        """create_project should pass epistemic_mode to create_project_db."""
+        project_state_path = Path(__file__).parent.parent / "app" / "project_state.py"
+        source = project_state_path.read_text(encoding="utf-8")
+        
+        assert "epistemic_mode" in source
+        assert "create_project_db" in source

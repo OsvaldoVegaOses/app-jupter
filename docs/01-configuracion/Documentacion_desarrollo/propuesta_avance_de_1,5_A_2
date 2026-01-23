@@ -1,0 +1,132 @@
+---
+
+## 0) Punto de partida: decisiones ya cerradas (para no perder tiempo)
+
+1. **Arquitectura “source of truth”**: PostgreSQL manda como *ledger*; Neo4j es **proyección**; Qdrant es **memoria semántica**. 
+2. **Fase 1.5 (infra, no análisis)**: transición de *canon por texto* (`canonical_codigo`) a identidad estable por **`code_id` / `canonical_code_id`**, con guardrails: **dry-run por defecto**, confirmación explícita, **advisory locks** y logging estructurado por project+session. 
+3. **Contrato normativo de `axial_ready`**: solo bloquea por `missing_code_id`, `missing_canonical_code_id`, `divergences_text_vs_id`, `cycles_non_trivial_nodes`; **NO** bloquea `self-canonical` ni `ontology_freeze`. 
+4. Observabilidad operativa: logs JSONL `logs/<project>/<session>/app.jsonl` + panel Ops post-ejecución y re-run seguro. 
+
+Esto define el “suelo firme” del roadmap.
+
+---
+
+## 1) Ponerme al día con el debate teórico (y traducirlo a producto)
+
+Leí los PDFs del “debate teórico” y lo sintetizo en **lo que cambia el software** (no solo la discusión):
+
+### Núcleo común (GT “mínimo compartido”)
+
+* Comparación constante, muestreo teórico, memoing, saturación teórica.
+* Trazabilidad: cada afirmación analítica debe poder “volver” a evidencia (fragmentos/citas).
+
+### Diferencia que SÍ impacta diseño (modo epistemológico)
+
+**Post-positivista / GT clásica (Glaser/Strauss; y Strauss/Corbin en axialidad):**
+
+* Busca patrones/regularidades con un tono más “objetivante”.
+* Axialidad tiende a un **paradigma relacional** (condiciones/acciones/consecuencias).
+* “Calidad” se narra más tipo validez/confiabilidad.
+
+**Constructivista (Charmaz):**
+
+* Reconoce múltiples realidades; investigador como co-constructor.
+* Codificación inicial privilegia **in-vivo** y **gerundios/procesos**; memos más reflexivos (posicionamiento, interacción, contexto).
+* “Calidad” más tipo credibilidad, resonancia, utilidad; énfasis ético/contextual.
+
+### Traducción directa a producto (lo que el copiloto debe hacer)
+
+* Tener un **“modo epistemológico por proyecto”** (post-positivista vs constructivista) que cambie:
+
+  * prompts/plantillas (cómo codifica, cómo memoiza, cómo formula teoría),
+  * formato de salidas (p.ej., gerundios + in-vivo en constructivista),
+  * lenguaje UI (evitar que Ops parezca “análisis”).
+* Mantener invariantes transversales: **evidencia obligatoria**, separación de *observación vs interpretación*, y **audit trail**.
+
+---
+
+## 2) Ponerme al día con el código (mapa real de lo que hay)
+
+Con lo que venía en `backend.zip` + `app.zip`:
+
+### Backend (FastAPI)
+
+* Routerización por etapas/funcionalidades (ingest, analysis, coding, discovery, neo4j, etc.).
+* Router **admin** ya implementa lo crítico de Fase 1.5: status/inconsistencias/backfill/repair, freeze, advisory locks, y lectura de logs Ops.
+
+### Core (`app/`)
+
+* Persistencia: `postgres_block.py`, `neo4j_block.py`, `qdrant_block.py`.
+* Flujo analítico: `analysis.py` (prompt y persistencia), `coding.py` (abierta + comparación constante), `axial.py` (relaciones + evidencia + graph algos).
+* Ya existe persistencia de **memos epistemológicos** en Postgres (`analysis_memos` con `memo_statements` JSONB).
+
+---
+
+## 3) Evaluación del estado actual (qué está sólido y qué impide “finalizar”)
+
+### Lo sólido (alto valor ya ganado)
+
+* La separación **ledger vs proyección** está clara y operativizada. 
+* Guardrails operativos y observabilidad (logs + panel Ops) están pensados para minimizar riesgo humano. 
+* En backend admin, el contrato de `axial_ready` y el freeze operativo están explícitos. 
+
+### El “bloqueador” para finalizar (lo que hoy huele a desalineación)
+
+**La Fase 1.5 está implementada en admin, pero el core aún opera principalmente en “canon por texto”.**
+Ejemplo: en `app.postgres_block.py` la tabla `catalogo_codigos` se define con `codigo/canonical_codigo` (texto), mientras el contrato productivo requiere `code_id/canonical_code_id` para estabilidad. Eso abre riesgo de:
+
+* drift texto↔ID,
+* merges difíciles de auditar,
+* axialidad que depende de nombres en vez de identidad estable.
+
+En otras palabras: **el sistema está cerca**, pero falta cerrar la identidad end-to-end para que `axial_ready` sea algo más que un “check admin”.
+
+---
+
+## 4) Paso siguiente propuesto (una jugada clara para destrabar el cierre)
+
+### “Epic de cierre”: **Identidad por ID end-to-end + gate real de axialidad**
+
+Objetivo: que **todo** (open coding → catálogo → axial → Neo4j) opere con `code_id` como identidad, manteniendo `codigo` como *label*.
+
+**Orden recomendado (para minimizar retrabajo):**
+
+1. **Postgres schema + compatibilidad**
+
+   * Migración/alter segura: agregar `code_id`, `canonical_code_id` en `catalogo_codigos` (sin romper legado).
+   * Ajustar `ensure_codes_catalog_table()` para **no recrear** un esquema viejo si ya existe el nuevo.
+   * Alinear índices/constraints con el contrato de `axial_ready`. 
+
+2. **Core: “resolver canónico” por ID**
+
+   * Reemplazar `resolve_canonical_codigo()` (texto) por `resolve_canonical_code_id()` (ID), y exponer ambos (id + label) hacia arriba.
+   * En `coding.py` / candidatos / validación: guardar y propagar `code_id`.
+
+3. **Axialidad con evidencia + IDs**
+
+   * `axial.py`: que las relaciones se persistan por `code_id` y que el memo preserve el label humano (y la trazabilidad).
+   * Gate en runtime: si `axial_ready=false`, no permitir iniciar flujos axiales (tal como el “trabajo inmediato típico” indica). 
+
+4. **Neo4j como proyección estable**
+
+   * Sync desde Postgres: nodos y relaciones con `code_id`/`canonical_code_id` como propiedades clave, y `codigo` como display.
+
+5. **Capa epistemológica (para cumplir post-positivista + constructivista)**
+
+   * `project_config`: agregar `epistemic_mode: "post_positivist" | "constructivist"`.
+   * Plantillas de prompts:
+
+     * constructivista: gerundios/in-vivo + memo reflexivo explícito,
+     * post-positivista: mayor abstracción + estructura más “paradigmática”.
+   * Mantener la separación ya existente de *OBSERVATION vs INTERPRETATION* y exigir evidencia cuando aplique.
+
+### Criterio de “listo para cerrar”
+
+* Un proyecto puede pasar de ingest → codificación abierta → validación → axialidad **sin drift**, y `axial_ready` refleja exactamente los bloqueos normados. 
+* Freeze bloquea mutaciones (backfill/repair) sin contaminar readiness. 
+* Ops permite auditar/re-ejecutar con confirmación dura. 
+
+---
+
+Si yo tuviera que elegir **un solo “próximo paso”** para mover todo, es este:
+**cerrar la Fase 1.5 en el core (Postgres + resolución canónica + payloads) para que `axial_ready` sea un gate real y la axialidad deje de depender de texto.** Esto reduce riesgo técnico *y* evita confusiones epistemológicas (infra ≠ análisis).

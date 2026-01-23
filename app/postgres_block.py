@@ -6934,8 +6934,13 @@ def create_project_db(
     org_id: Optional[str] = None,
     owner_id: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
+    epistemic_mode: str = "constructivist",
 ) -> Dict[str, Any]:
     """Crea un nuevo proyecto en PostgreSQL."""
+    # Validar epistemic_mode
+    if epistemic_mode not in ("constructivist", "post_positivist"):
+        epistemic_mode = "constructivist"
+    
     default_config = {
         "discovery_threshold": 0.30,
         "analysis_temperature": 0.3,
@@ -6944,12 +6949,12 @@ def create_project_db(
     final_config = {**default_config, **(config or {})}
     
     sql = """
-    INSERT INTO proyectos (id, name, description, org_id, owner_id, config)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    RETURNING id, name, description, org_id, owner_id, config, created_at, updated_at
+    INSERT INTO proyectos (id, name, description, org_id, owner_id, config, epistemic_mode)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    RETURNING id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
     """
     with pg.cursor() as cur:
-        cur.execute(sql, (project_id, name, description, org_id, owner_id, Json(final_config)))
+        cur.execute(sql, (project_id, name, description, org_id, owner_id, Json(final_config), epistemic_mode))
         row = cur.fetchone()
     pg.commit()
     if row is None:
@@ -6964,6 +6969,7 @@ def create_project_db(
         "config": row[5],
         "created_at": row[6].isoformat() if row[6] else None,
         "updated_at": row[7].isoformat() if row[7] else None,
+        "epistemic_mode": row[8] if len(row) > 8 else "constructivist",
     }
 
 
