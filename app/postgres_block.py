@@ -1857,6 +1857,147 @@ def resolve_canonical_codigos_bulk(
     return current
 
 
+def resolve_canonical_code_id(
+    pg: PGConnection,
+    project_id: str,
+    code_id: int,
+    *,
+    max_hops: int = 10,
+) -> Optional[int]:
+    """Resuelve un code_id hacia su canónico siguiendo `canonical_code_id`.
+
+    A diferencia de resolve_canonical_codigo (que opera por texto), esta función
+    usa la identidad estable por ID, que es el camino preferido para Fase 1.5+.
+
+    Args:
+        pg: Conexión PostgreSQL.
+        project_id: ID del proyecto.
+        code_id: ID del código a resolver.
+        max_hops: Máximo de saltos para evitar loops infinitos.
+
+    Returns:
+        El code_id canónico final, o None si:
+        - El code_id no existe en el catálogo.
+        - Se detecta un ciclo.
+
+    Example:
+        >>> # Código canónico (sin puntero) → retorna sí mismo
+        >>> resolve_canonical_code_id(pg, "jd-007", 42)
+        42
+
+        >>> # Código merged (42 → 100) → retorna canónico
+        >>> resolve_canonical_code_id(pg, "jd-007", 42)
+        100
+
+        >>> # Código inexistente → None
+        >>> resolve_canonical_code_id(pg, "jd-007", 99999)
+        None
+    """
+    if code_id is None:
+        return None
+
+    ensure_codes_catalog_table(pg)
+
+    current = int(code_id)
+    seen: set[int] = set()
+
+    for _ in range(max_hops):
+        if current in seen:
+            # Ciclo detectado
+            _logger.warning(
+                "resolve_canonical_code_id.cycle_detected project=%s code_id=%s cycle_at=%s path=%s",
+                project_id, code_id, current, list(seen),
+            )
+            return None
+        seen.add(current)
+
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                SELECT code_id, canonical_code_id, status
+                  FROM catalogo_codigos
+                 WHERE project_id = %s AND code_id = %s
+                """,
+                (project_id, current),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            # code_id no existe
+            if current == code_id:
+                # El ID original no existe
+                return None
+            # Llegamos a un puntero que no existe (inconsistencia)
+            _logger.warning(
+                "resolve_canonical_code_id.dangling_pointer project=%s original_code_id=%s dangling_id=%s",
+                project_id, code_id, current,
+            )
+            return None
+
+        db_code_id, canonical_code_id, status = row[0], row[1], row[2]
+
+        # Caso 1: Es canónico (canonical_code_id es NULL)
+        if canonical_code_id is None:
+            return int(db_code_id)
+
+        # Caso 2: Self-canonical (canonical_code_id = code_id) — estado esperado
+        if int(canonical_code_id) == int(db_code_id):
+            return int(db_code_id)
+
+        # Caso 3: Merged/superseded — seguir la cadena
+        if status in ("merged", "superseded"):
+            current = int(canonical_code_id)
+            continue
+
+        # Caso 4: Activo con canonical_code_id (inusual pero válido)
+        # Podría ser un alias temporal; retornamos el target
+        return int(canonical_code_id)
+
+    # Se excedió max_hops — posible ciclo largo o cadena muy profunda
+    _logger.warning(
+        "resolve_canonical_code_id.max_hops_exceeded project=%s code_id=%s max_hops=%s",
+        project_id, code_id, max_hops,
+    )
+    return None
+
+
+def get_code_id_for_codigo(
+    pg: PGConnection,
+    project_id: str,
+    codigo: str,
+) -> Optional[int]:
+    """Obtiene el code_id para un código por su label (texto).
+
+    Útil para transición: cuando se recibe texto y se necesita operar por ID.
+
+    Args:
+        pg: Conexión PostgreSQL.
+        project_id: ID del proyecto.
+        codigo: Label del código (texto).
+
+    Returns:
+        El code_id si existe, None si no.
+    """
+    if not codigo or not str(codigo).strip():
+        return None
+
+    ensure_codes_catalog_table(pg)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT code_id
+              FROM catalogo_codigos
+             WHERE project_id = %s AND lower(codigo) = lower(%s)
+            """,
+            (project_id, str(codigo).strip()),
+        )
+        row = cur.fetchone()
+
+    if row and row[0] is not None:
+        return int(row[0])
+    return None
+
 
 def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     """
