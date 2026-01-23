@@ -371,3 +371,64 @@ class TestDifferentiationBetweenModes:
         assert const_text != post_text
         assert "Charmaz" in const_text
         assert "Glaser" in post_text or "Strauss" in post_text
+
+
+# =============================================================================
+# TICKET-EM03: Integration in analysis.py Tests
+# =============================================================================
+
+class TestAnalysisIntegration:
+    """Tests for epistemic mode integration in analysis.py."""
+    
+    def test_analysis_imports_epistemic_mode(self):
+        """analysis.py should import EpistemicMode and related functions."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        assert "from .settings import AppSettings, EpistemicMode" in source
+        assert "from .prompts.loader import get_system_prompt" in source
+        assert "get_project_epistemic_mode" in source
+    
+    def test_analyze_interview_text_uses_epistemic_mode(self):
+        """analyze_interview_text should use epistemic mode for prompt selection."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        # Should get epistemic mode from project
+        assert "epistemic_mode = get_project_epistemic_mode" in source or \
+               "get_project_epistemic_mode(clients.pg, project_id)" in source
+        
+        # Should get differentiated prompt
+        assert "get_system_prompt(epistemic_mode" in source
+    
+    def test_analyze_interview_text_has_meta_output(self):
+        """analyze_interview_text should include _meta in output."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        assert 'out["_meta"]' in source
+        assert '"epistemic_mode"' in source
+        assert '"prompt_version"' in source
+    
+    def test_cognitive_metadata_includes_epistemic_mode(self):
+        """cognitive_metadata should include epistemic_mode."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        assert '"epistemic_mode": epistemic_mode.value' in source
+    
+    def test_analysis_logs_epistemic_mode(self):
+        """analysis.py should log epistemic_mode on start."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        assert "analysis.started" in source
+        assert "epistemic_mode=" in source
+    
+    def test_analysis_has_fallback_to_default_prompt(self):
+        """analysis.py should fallback to QUAL_SYSTEM_PROMPT if load fails."""
+        analysis_path = Path(__file__).parent.parent / "app" / "analysis.py"
+        source = analysis_path.read_text(encoding="utf-8")
+        
+        assert "QUAL_SYSTEM_PROMPT" in source  # Fallback prompt should still exist
+        assert "epistemic_mode.load_failed" in source  # Warning log for fallback
