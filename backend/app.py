@@ -7455,6 +7455,7 @@ REGLAS:
 
 # =============================================================================
 # Sprint 24: Discovery Navigation Log - Muestreo Teórico
+# E3-1.2: Extended for E3 actions traceability
 # =============================================================================
 
 class LogNavigationRequest(BaseModel):
@@ -7466,8 +7467,13 @@ class LogNavigationRequest(BaseModel):
     codigos_sugeridos: Optional[List[str]] = Field(default=None, description="AI suggested codes")
     refinamientos_aplicados: Optional[Dict[str, Any]] = Field(default=None, description="Applied refinements")
     ai_synthesis: Optional[str] = Field(default=None, description="AI synthesis text")
-    action_taken: str = Field(default="search", description="Action: search, refine, send_codes")
+    action_taken: str = Field(default="search", description="Action: search, refine, send_codes, e3_suggest, e3_send_candidates, e3_validate, e3_reject, e3_promote")
     busqueda_origen_id: Optional[str] = Field(default=None, description="Parent search UUID")
+    # E3-1.2: Additional fields for E3 traceability
+    seed_fragmento_id: Optional[str] = Field(default=None, description="Seed fragment ID for E3 suggestions")
+    scope_archivo: Optional[str] = Field(default=None, description="Interview file scope filter")
+    top_k: Optional[int] = Field(default=None, description="Number of similar fragments requested")
+    include_coded: Optional[bool] = Field(default=None, description="Whether to include already coded fragments")
 
 
 @app.post("/api/discovery/log-navigation")
@@ -7478,6 +7484,7 @@ async def api_log_discovery_navigation(
 ) -> Dict[str, Any]:
     """
     Sprint 24: Log a discovery navigation step for theoretical sampling traceability.
+    E3-1.2: Extended with E3 action types and fields.
     """
     from app.postgres_block import log_discovery_navigation
     
@@ -7495,6 +7502,11 @@ async def api_log_discovery_navigation(
             ai_synthesis=payload.ai_synthesis,
             action_taken=payload.action_taken,
             busqueda_origen_id=payload.busqueda_origen_id,
+            # E3-1.2: Pass E3 fields
+            seed_fragmento_id=payload.seed_fragmento_id,
+            scope_archivo=payload.scope_archivo,
+            top_k=payload.top_k,
+            include_coded=payload.include_coded,
         )
         
         api_logger.info(
@@ -7502,6 +7514,7 @@ async def api_log_discovery_navigation(
             project=payload.project,
             action=payload.action_taken,
             busqueda_id=busqueda_id,
+            scope_archivo=payload.scope_archivo,
         )
         
         return {

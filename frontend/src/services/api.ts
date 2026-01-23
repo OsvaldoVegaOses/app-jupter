@@ -1941,8 +1941,13 @@ export interface LogNavigationRequest {
   codigos_sugeridos?: string[];
   refinamientos_aplicados?: Record<string, any>;
   ai_synthesis?: string;
-  action_taken: "search" | "refine" | "send_codes";
+  action_taken: "search" | "refine" | "send_codes" | "e3_suggest" | "e3_send_candidates" | "e3_validate" | "e3_reject" | "e3_promote";
   busqueda_origen_id?: string;
+  // E3-1.2: Campos adicionales para trazabilidad E3
+  seed_fragmento_id?: string;
+  scope_archivo?: string;
+  top_k?: number;
+  include_coded?: boolean;
 }
 
 export interface NavigationHistoryEntry {

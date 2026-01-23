@@ -486,6 +486,11 @@ def log_discovery_navigation(
     ai_synthesis: Optional[str] = None,
     action_taken: str = "search",
     busqueda_origen_id: Optional[str] = None,
+    # E3-1.2: Additional fields for E3 traceability
+    seed_fragmento_id: Optional[str] = None,
+    scope_archivo: Optional[str] = None,
+    top_k: Optional[int] = None,
+    include_coded: Optional[bool] = None,
 ) -> str:
     """
     Registra una navegación de búsqueda Discovery para trazabilidad.
@@ -499,13 +504,28 @@ def log_discovery_navigation(
         codigos_sugeridos: Códigos sugeridos por IA (si aplica)
         refinamientos_aplicados: Refinamientos aplicados desde IA
         ai_synthesis: Texto de síntesis IA
-        action_taken: Acción realizada ('search', 'refine', 'send_codes')
+        action_taken: Acción realizada ('search', 'refine', 'send_codes', 'e3_*')
         busqueda_origen_id: UUID de búsqueda padre (si es refinamiento)
+        seed_fragmento_id: E3 - Fragmento semilla para sugerencias
+        scope_archivo: E3 - Filtro de scope por archivo
+        top_k: E3 - Cantidad de fragmentos similares solicitados
+        include_coded: E3 - Incluir fragmentos ya codificados
         
     Returns:
         UUID de la nueva entrada
     """
     ensure_discovery_navigation_table(pg)
+    
+    # E3-1.2: Merge E3 fields into refinamientos_aplicados for storage
+    merged_refinements = dict(refinamientos_aplicados or {})
+    if seed_fragmento_id is not None:
+        merged_refinements["seed_fragmento_id"] = seed_fragmento_id
+    if scope_archivo is not None:
+        merged_refinements["scope_archivo"] = scope_archivo
+    if top_k is not None:
+        merged_refinements["top_k"] = top_k
+    if include_coded is not None:
+        merged_refinements["include_coded"] = include_coded
     
     sql = """
     INSERT INTO discovery_navigation_log (
@@ -534,7 +554,7 @@ def log_discovery_navigation(
                 target_text,
                 fragments_count,
                 codigos_sugeridos or [],
-                Json(refinamientos_aplicados) if refinamientos_aplicados else None,
+                Json(merged_refinements) if merged_refinements else None,
                 ai_synthesis,
                 action_taken,
             ),

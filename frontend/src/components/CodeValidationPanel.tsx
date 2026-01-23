@@ -27,6 +27,7 @@ import {
     detectDuplicates,
     checkBatchCodes,
     revertValidatedCandidates,
+    logDiscoveryNavigation,
     CandidateCode,
     CandidateStats,
     BacklogHealth,
@@ -276,6 +277,19 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
     const handleValidate = async (id: number) => {
         try {
             await validateCandidate(id, project);
+            // E3-1.2: Log validation action
+            try {
+                const candidate = candidates.find(c => c.id === id);
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: candidate ? [candidate.codigo] : [],
+                    negativos: [],
+                    target_text: candidate?.cita || null,
+                    fragments_count: 1,
+                    codigos_sugeridos: [],
+                    action_taken: "e3_validate",
+                });
+            } catch { /* non-blocking */ }
             await loadCandidates();
             await loadStats();
         } catch (err) {
@@ -287,6 +301,19 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
         const memo = prompt("Razón del rechazo (opcional):");
         try {
             await rejectCandidate(id, project, memo || undefined);
+            // E3-1.2: Log rejection action
+            try {
+                const candidate = candidates.find(c => c.id === id);
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: [],
+                    negativos: candidate ? [candidate.codigo] : [],
+                    target_text: candidate?.cita || null,
+                    fragments_count: 1,
+                    codigos_sugeridos: [],
+                    action_taken: "e3_reject",
+                });
+            } catch { /* non-blocking */ }
             await loadCandidates();
             await loadStats();
         } catch (err) {
@@ -296,27 +323,69 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
     const handleBatchValidate = async () => {
         if (selected.size === 0) return;
+        // E3-4.1: Confirmación antes de batch validate
+        if (!confirm(`¿Validar ${selected.size} candidato(s) seleccionado(s)?\n\nEsta acción marca los candidatos como listos para promoción.`)) {
+            return;
+        }
+        let successCount = 0;
+        const validatedCodes: string[] = [];
         for (const id of selected) {
             try {
                 await validateCandidate(id, project);
+                const candidate = candidates.find(c => c.id === id);
+                if (candidate) validatedCodes.push(candidate.codigo);
+                successCount++;
             } catch (err) {
                 console.error(`Error validating ${id}:`, err);
             }
         }
+        // E3-1.2: Log batch validation
+        try {
+            await logDiscoveryNavigation({
+                project,
+                positivos: validatedCodes,
+                negativos: [],
+                target_text: null,
+                fragments_count: successCount,
+                codigos_sugeridos: [],
+                action_taken: "e3_validate",
+            });
+        } catch { /* non-blocking */ }
         await loadCandidates();
         await loadStats();
     };
 
     const handleBatchReject = async () => {
         if (selected.size === 0) return;
+        // E3-4.1: Confirmación antes de batch reject
+        if (!confirm(`¿Rechazar ${selected.size} candidato(s) seleccionado(s)?\n\nEsta acción es reversible desde el historial.`)) {
+            return;
+        }
         const memo = prompt("Razón del rechazo (opcional):");
+        let successCount = 0;
+        const rejectedCodes: string[] = [];
         for (const id of selected) {
             try {
                 await rejectCandidate(id, project, memo || undefined);
+                const candidate = candidates.find(c => c.id === id);
+                if (candidate) rejectedCodes.push(candidate.codigo);
+                successCount++;
             } catch (err) {
                 console.error(`Error rejecting ${id}:`, err);
             }
         }
+        // E3-1.2: Log batch rejection
+        try {
+            await logDiscoveryNavigation({
+                project,
+                positivos: [],
+                negativos: rejectedCodes,
+                target_text: null,
+                fragments_count: successCount,
+                codigos_sugeridos: [],
+                action_taken: "e3_reject",
+            });
+        } catch { /* non-blocking */ }
         await loadCandidates();
         await loadStats();
     };
@@ -368,6 +437,20 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
             const promoted = result.promoted_count ?? 0;
             const eligible = (result.eligible_total ?? null);
             const skipped = (result.skipped_total ?? null);
+
+            // E3-1.2: Log promotion action
+            try {
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: [],
+                    negativos: [],
+                    target_text: null,
+                    fragments_count: promoted,
+                    codigos_sugeridos: [],
+                    ai_synthesis: `promoted=${promoted}, skipped=${skipped ?? 0}`,
+                    action_taken: "e3_promote",
+                });
+            } catch { /* non-blocking */ }
 
             const details: string[] = [];
             if (typeof eligible === "number") details.push(`elegibles: ${eligible}`);
