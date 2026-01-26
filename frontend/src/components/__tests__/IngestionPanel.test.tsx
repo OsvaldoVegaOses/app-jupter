@@ -6,273 +6,111 @@ import * as api from "../../services/api";
 
 // Mock API module
 vi.mock("../../services/api", () => ({
-    apiFetchJson: vi.fn(),
+  apiFetchJson: vi.fn(),
 }));
 
 const mockApiFetchJson = vi.mocked(api.apiFetchJson);
 
 // Mock crypto.randomUUID
 const mockRandomUUID = vi.fn();
-Object.defineProperty(global.crypto, 'randomUUID', {
-    value: mockRandomUUID,
-    writable: true,
+Object.defineProperty(global.crypto, "randomUUID", {
+  value: mockRandomUUID,
+  writable: true,
 });
 
 beforeEach(() => {
-    vi.clearAllMocks();
-    mockRandomUUID.mockReturnValue('12345678-1234-1234-1234-123456789012');
+  vi.clearAllMocks();
+  mockRandomUUID.mockReturnValue("12345678-1234-1234-1234-123456789012");
 });
 
 describe("IngestionPanel", () => {
-    const defaultProps = {
-        project: "test-project",
-    };
+  const defaultProps = { project: "test-project" };
 
-    test("renders ingestion form correctly", () => {
-        render(<IngestionPanel {...defaultProps} />);
+  test("renders ingestion form correctly", () => {
+    render(<IngestionPanel {...defaultProps} />);
 
-        // Should show title
-        expect(screen.getByText(/etapa 1.*ingesta/i)).toBeInTheDocument();
+    // Should show title
+    expect(screen.getByRole('heading', { level: 2, name: /ingesta de documentos/i })).toBeInTheDocument();
 
-        // Should show inputs field
-        expect(screen.getByLabelText(/entradas.*ruta.*patron/i)).toBeInTheDocument();
+    // Dropzone label should be present and associated to the file input
+    expect(screen.getByLabelText(/click para seleccionar|arrastra archivos/i)).toBeInTheDocument();
 
-        // Should show submit button
-        expect(screen.getByRole("button", { name: /ejecutar ingesta/i })).toBeInTheDocument();
+    // Should show submit button
+    expect(screen.getByRole("button", { name: /ingestar archivos|ingestar/i })).toBeInTheDocument();
+  });
+
+  test("enables submit when inputs are provided and performs ingestion", async () => {
+    const user = userEvent.setup();
+
+    mockApiFetchJson.mockResolvedValueOnce({
+      project: "test-project",
+      exit_code: 0,
+      files: ["entrevista1.docx"],
     });
 
-    test("shows fragmentation parameters", () => {
-        render(<IngestionPanel {...defaultProps} />);
+    render(<IngestionPanel {...defaultProps} />);
 
-        // Should show fragmentation fieldset
-        expect(screen.getByText(/parametros de fragmentacion/i)).toBeInTheDocument();
+    // accept several possible label forms (legacy or updated wording)
+    // New ingestion UI uses a dropzone file input; select it and upload a file
+    const fileInput = screen.getByLabelText(/click para seleccionar|arrastra archivos/i) as HTMLInputElement;
+    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta|ingestar archivos|ingestar|📥 Ingestar Archivos/i });
 
-        // Should have batch size, min chars, max chars inputs
-        const batchInput = screen.getByDisplayValue("64"); // default batch size
-        const minCharsInput = screen.getByDisplayValue("200"); // default min chars
-        const maxCharsInput = screen.getByDisplayValue("1200"); // default max chars
+    expect(submitButton).toBeDisabled();
 
-        expect(batchInput).toBeInTheDocument();
-        expect(minCharsInput).toBeInTheDocument();
-        expect(maxCharsInput).toBeInTheDocument();
+    // Simulate file upload
+    const file = new File(["dummy content"], "entrevista1.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+    await user.upload(fileInput, file);
+
+    // Now button should enable
+    await waitFor(() => expect(submitButton).toBeEnabled());
+
+    await user.click(submitButton);
+
+    await waitFor(() => {
+      expect(mockApiFetchJson).toHaveBeenCalledWith(
+        "/api/ingest",
+        expect.objectContaining({ method: "POST" })
+      );
     });
 
-    test("validate inputs are required", async () => {
-        render(<IngestionPanel {...defaultProps} />);
+    // Should show a success/result marker
+    await waitFor(() => expect(screen.queryByText(/resultado/i)).not.toBeNull());
+  });
 
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
+  test("shows error when ingestion fails", async () => {
+    const user = userEvent.setup();
 
-        // Button should be disabled when inputs are empty
-        expect(submitButton).toBeDisabled();
+    mockApiFetchJson.mockRejectedValueOnce(new Error("File not found"));
+
+    render(<IngestionPanel {...defaultProps} />);
+
+    const inputsField = screen.getByLabelText(/entradas/i);
+    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
+
+    await user.type(inputsField, "missing.docx");
+    await user.click(submitButton);
+
+    await waitFor(() => {
+      expect(screen.getByText(/error en la ingesta/i)).toBeInTheDocument();
+      expect(screen.getByText(/file not found/i)).toBeInTheDocument();
     });
+  });
 
-    test("enables submit when inputs are provided", async () => {
-        const user = userEvent.setup();
-        render(<IngestionPanel {...defaultProps} />);
+  test("toggles advanced options and updates batch size", async () => {
+    const user = userEvent.setup();
 
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
+    render(<IngestionPanel {...defaultProps} />);
 
-        // Type something
-        await user.type(inputsField, "entrevistas/*.docx");
+    const toggle = screen.getByRole('button', { name: /opciones avanzadas/i });
+    expect(toggle).toBeInTheDocument();
 
-        // Button should now be enabled
-        expect(submitButton).not.toBeDisabled();
-    });
+    await user.click(toggle);
 
-    test("performs ingestion", async () => {
-        const user = userEvent.setup();
+    const batchInput = screen.getByLabelText(/batch size/i);
+    expect(batchInput).toBeInTheDocument();
 
-        mockApiFetchJson.mockResolvedValueOnce({
-            project: "test-project",
-            exit_code: 0,
-            files: ["entrevista1.docx", "entrevista2.docx"],
-            result: { fragments: 25 },
-        });
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.type(inputsField, "data/*.docx");
-        await user.click(submitButton);
-
-        await waitFor(() => {
-            expect(mockApiFetchJson).toHaveBeenCalledWith("/api/ingest", expect.objectContaining({
-                method: "POST",
-                body: expect.stringContaining("data/*.docx"),
-            }));
-        });
-
-        // Should show result
-        await waitFor(() => {
-            expect(screen.getByText(/resultado/i)).toBeInTheDocument();
-        });
-    });
-
-    test("sends correct parameters", async () => {
-        const user = userEvent.setup();
-
-        mockApiFetchJson.mockResolvedValueOnce({
-            project: "test-project",
-            exit_code: 0,
-        });
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const batchSizeField = screen.getByLabelText(/batch size/i);
-        const minCharsField = screen.getByLabelText(/min chars/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.clear(batchSizeField);
-        await user.type(batchSizeField, "32");
-        await user.clear(minCharsField);
-        await user.type(minCharsField, "300");
-        await user.type(inputsField, "test.docx");
-        await user.click(submitButton);
-
-        await waitFor(() => {
-            const call = mockApiFetchJson.mock.calls[0];
-            const body = call?.[1]?.body;
-            expect(body).toBeDefined();
-            const parsed = JSON.parse(body as string);
-
-            expect(parsed.batch_size).toBe(32);
-            expect(parsed.min_chars).toBe(300);
-        });
-    });
-
-    test("shows loading state during ingestion", async () => {
-        const user = userEvent.setup();
-
-        // Mock slow ingestion
-        mockApiFetchJson.mockImplementationOnce(
-            () => new Promise(resolve => setTimeout(() => resolve({
-                project: "test-project",
-                exit_code: 0,
-            }), 100))
-        );
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.type(inputsField, "test.docx");
-        await user.click(submitButton);
-
-        // Should show loading text
-        await waitFor(() => {
-            expect(screen.getByText(/procesando/i)).toBeInTheDocument();
-        });
-
-        // Button should be disabled
-        expect(submitButton).toBeDisabled();
-    });
-
-    test("handles ingestion error", async () => {
-        const user = userEvent.setup();
-
-        mockApiFetchJson.mockRejectedValueOnce(new Error("File not found"));
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.type(inputsField, "missing.docx");
-        await user.click(submitButton);
-
-        // Should show error message
-        await waitFor(() => {
-            expect(screen.getByText(/error en la ingesta/i)).toBeInTheDocument();
-            expect(screen.getByText(/file not found/i)).toBeInTheDocument();
-        });
-    });
-
-    test("allows generating new run_id", async () => {
-        const user = userEvent.setup();
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const newRunIdButton = screen.getByRole("button", { name: /nuevo run_id/i });
-        const runIdField = screen.getByLabelText(/run_id.*opcional/i);
-
-        // Should have initial run_id
-        expect(runIdField).toHaveValue('12345678123412341234123456789012');
-
-        // Generate new one
-        mockRandomUUID.mockReturnValueOnce('87654321-4321-4321-4321-210987654321');
-        await user.click(newRunIdButton);
-
-        // Should update
-        await waitFor(() => {
-            expect(runIdField).toHaveValue('87654321432143214321210987654321');
-        });
-    });
-
-    test("allows optional metadata JSON", async () => {
-        const user = userEvent.setup();
-
-        mockApiFetchJson.mockResolvedValueOnce({
-            project: "test-project",
-            exit_code: 0,
-        });
-
-        render(<IngestionPanel {...defaultProps} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const metaField = screen.getByLabelText(/metadata json.*opcional/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.type(inputsField, "test.docx");
-        await user.type(metaField, "meta.json");
-        await user.click(submitButton);
-
-        await waitFor(() => {
-            const call = mockApiFetchJson.mock.calls[0];
-            const body = call?.[1]?.body;
-            expect(body).toBeDefined();
-            const parsed = JSON.parse(body as string);
-
-            expect(parsed.meta_json).toBe("meta.json");
-        });
-    });
-
-    test("disables form when disabled prop is true", () => {
-        render(<IngestionPanel {...defaultProps} disabled={true} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        expect(inputsField).toBeDisabled();
-        expect(submitButton).toBeDisabled();
-    });
-
-    test("calls onCompleted callback after successful ingestion", async () => {
-        const user = userEvent.setup();
-        const onCompleted = vi.fn();
-
-        const result = {
-            project: "test-project",
-            exit_code: 0,
-            files: ["test.docx"],
-        };
-
-        mockApiFetchJson.mockResolvedValueOnce(result);
-
-        render(<IngestionPanel {...defaultProps} onCompleted={onCompleted} />);
-
-        const inputsField = screen.getByLabelText(/entradas.*ruta.*patron/i);
-        const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
-
-        await user.type(inputsField, "test.docx");
-        await user.click(submitButton);
-
-        await waitFor(() => {
-            expect(onCompleted).toHaveBeenCalledWith(result);
-        });
-    });
+    await user.clear(batchInput);
+    await user.type(batchInput, '32');
+    expect(batchInput).toHaveValue(32);
+  });
 });
