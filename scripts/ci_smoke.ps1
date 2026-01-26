@@ -37,7 +37,12 @@ try {
 
 Write-Output "3) Tenant SDK upload (smoke)"
 try {
-    & .\.venv\Scripts\python.exe scripts\smoke_tenant_upload.py
+    # Skip tenant upload when organization id is not provided in env/secrets
+    if (-not $env:API_KEY_ORG_ID -and -not $env:ORG_ID) {
+        Write-Output "Skipping tenant SDK upload: organization id not configured (API_KEY_ORG_ID or ORG_ID)"
+    } else {
+        & .\.venv\Scripts\python.exe scripts\smoke_tenant_upload.py
+    }
 } catch {
     Write-Error "smoke_tenant_upload failed: $_"
     Exit 4
