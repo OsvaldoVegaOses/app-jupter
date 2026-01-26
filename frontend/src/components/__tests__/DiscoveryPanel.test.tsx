@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { DiscoveryPanel } from "../DiscoveryPanel";
@@ -27,32 +27,58 @@ describe("DiscoveryPanel", () => {
         project: "test-project",
     };
 
-    test("renders discovery form correctly", () => {
+    // Helper to get the control inside the labeled field (prefer label queries)
+    function getFieldControl(labelRegex: RegExp, role: 'textbox' | 'spinbutton' = 'textbox') {
+        // Try label-based association first (when `label` is associated with control)
+        const labeled = within(document.body).queryAllByLabelText(labelRegex, { selector: 'input,textarea,select' }) as HTMLElement[];
+        if (labeled && labeled.length > 0) return labeled[0] as any;
+
+        // Try placeholder as a fallback (some inputs render placeholder instead of associated label)
+        const byPlaceholder = within(document.body).queryAllByPlaceholderText?.(labelRegex) as HTMLElement[] | undefined;
+        if (byPlaceholder && byPlaceholder.length > 0) return byPlaceholder[0] as any;
+
+        // Fallback: find all nodes that match the label text and pick the one
+        // that sits next to an actual form control inside the known field wrapper.
+        const candidates = screen.queryAllByText(labelRegex);
+        for (const label of candidates) {
+            // prefer actual <label> elements
+            if (label.tagName === 'LABEL') {
+                const field = label.closest('.discovery-panel__field') || label.parentElement;
+                if (!field) continue;
+                const control = (field.querySelector('input,textarea,select') as HTMLElement) || null;
+                if (control) return control as any;
+            }
+            // otherwise try to find a nearby wrapper that contains a control
+            const field = label.closest('.discovery-panel__field') || label.parentElement;
+            if (!field) continue;
+            const control = (field.querySelector('input,textarea,select') as HTMLElement) || null;
+            if (control) return control as any;
+        }
+
+        throw new Error('field not found for ' + labelRegex);
+    }
+
+    test("renders discovery form correctly", async () => {
         render(<DiscoveryPanel {...defaultProps} />);
 
-        // Should show input fields
-        expect(screen.getByPlaceholderText(/conceptos positivos/i)).toBeInTheDocument();
-        expect(screen.getByPlaceholderText(/conceptos negativos/i)).toBeInTheDocument();
-        expect(screen.getByLabelText(/texto target/i)).toBeInTheDocument();
+        // Should show labels (form structure)
+        expect(await screen.findByText(/conceptos positivos/i)).toBeInTheDocument();
+        expect(await screen.findByText(/conceptos negativos/i)).toBeInTheDocument();
+        expect(await screen.findByText(/texto objetivo/i)).toBeInTheDocument();
 
-        // Should show top-k selector
-        expect(screen.getByLabelText(/cantidad de resultados/i)).toBeInTheDocument();
+        // Should show top-k selector (number input)
+        expect(await screen.findByRole('spinbutton')).toBeInTheDocument();
 
         // Should show search button
-        expect(screen.getByRole("button", { name: /buscar/i })).toBeInTheDocument();
+        expect(await screen.findByRole("button", { name: /buscar/i })).toBeInTheDocument();
     });
 
     test("validates positive text is required", async () => {
-        const user = userEvent.setup();
         render(<DiscoveryPanel {...defaultProps} />);
 
         const searchButton = screen.getByRole("button", { name: /buscar/i });
-        await user.click(searchButton);
-
-        // Should show validation error
-        await waitFor(() => {
-            expect(screen.getByText(/ingresa al menos un concepto positivo/i)).toBeInTheDocument();
-        });
+        // Button should be disabled when no positive concepts
+        expect(searchButton).toBeDisabled();
 
         // Should not call API
         expect(mockDiscoverSearch).not.toHaveBeenCalled();
@@ -82,8 +108,8 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
-        const searchButton = screen.getByRole("button", { name: /buscar/i });
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
+        const searchButton = await screen.findByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "participación comunitaria");
         await user.click(searchButton);
@@ -99,9 +125,7 @@ describe("DiscoveryPanel", () => {
         });
 
         // Should show results
-        await waitFor(() => {
-            expect(screen.getByText(/test fragment content/i)).toBeInTheDocument();
-        });
+        expect(await screen.findByText(/test fragment content/i)).toBeInTheDocument();
     });
 
     test("performs search with positive and negative concepts", async () => {
@@ -120,11 +144,11 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
-        const negativeInput = screen.getByPlaceholderText(/conceptos negativos/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
+        const negativeInput = getFieldControl(/conceptos negativos/i, 'textbox');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
-        await user.type(positiveInput, "liderazgo\\norganización");
+        await user.type(positiveInput, "liderazgo\norganización");
         await user.type(negativeInput, "autoritarismo");
         await user.click(searchButton);
 
@@ -155,12 +179,13 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
-        const topKSelect = screen.getByLabelText(/cantidad de resultados/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
+        const topKSelect = screen.getByRole('spinbutton');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "motivación");
-        await user.selectOptions(topKSelect, "20");
+        await user.clear(topKSelect);
+        await user.type(topKSelect, "20");
         await user.click(searchButton);
 
         await waitFor(() => {
@@ -188,7 +213,7 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "test");
@@ -207,7 +232,7 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "test");
@@ -243,7 +268,7 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "test");
@@ -280,7 +305,7 @@ describe("DiscoveryPanel", () => {
 
         render(<DiscoveryPanel {...defaultProps} onSelectFragment={onSelectFragment} />);
 
-        const positiveInput = screen.getByPlaceholderText(/conceptos positivos/i);
+        const positiveInput = getFieldControl(/conceptos positivos/i, 'textbox');
         const searchButton = screen.getByRole("button", { name: /buscar/i });
 
         await user.type(positiveInput, "test");
