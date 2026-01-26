@@ -44,7 +44,7 @@ app/
 main.py              # CLI entry point (ingest/search/coding/axial/...)
 scripts/healthcheck.py  # Service connectivity checks
 scripts/gds_analysis.py # Standalone GDS runner for the axial graph
-docs/data_dictionary.md # Data dictionary
+docs/02-configuracion/data_dictionary.md # Data dictionary
 ```
 
 ## Prerequisites
@@ -276,7 +276,7 @@ Integra este script (ajustando la ruta del log según tu despliegue) en cron/CI 
 7. Document findings and decisions in `docs/reflexividad.md` (evidence positiva y negativa).
 
 ## Documentation
-- `docs/data_dictionary.md`: Data dictionary for tables/payloads.
+- `docs/02-configuracion/data_dictionary.md`: Data dictionary for tables/payloads.
 - `docs/reflexividad.md`: Template for the reflexivity diary and governance notes.
 
 ## Relationship to the Notebook

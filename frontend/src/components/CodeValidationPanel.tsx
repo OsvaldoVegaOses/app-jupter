@@ -430,7 +430,7 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
         const notaEvidencia =
             "\n\nNota: solo se promueven candidatos validados con evidencia (fragmento_id válido).";
-        if (!confirm(`¿Promover ${totalPorPromover} candidato(s) validados (pendientes) a la lista definitiva?${notaEvidencia}`)) return;
+        if (!confirm(`¿Promover ${totalPorPromover} candidato(s) validados a la Lista Definitiva?${notaEvidencia}`)) return;
         try {
             const result = await promoteCandidates(project, { promoteAllValidated: true });
 
@@ -455,10 +455,18 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
             const details: string[] = [];
             if (typeof eligible === "number") details.push(`elegibles: ${eligible}`);
             if (typeof skipped === "number" && skipped > 0) details.push(`omitidos (sin evidencia): ${skipped}`);
+            
+            // Neo4j sync metrics
+            const neo4jMerged = result.neo4j_merged ?? 0;
+            const neo4jMissing = result.neo4j_missing_fragments ?? 0;
+            const neo4jInfo = neo4jMerged > 0 
+                ? `\n🔗 Neo4j: ${neo4jMerged} relación(es) sincronizada(s)${neo4jMissing > 0 ? `, ${neo4jMissing} fragmento(s) pendiente(s)` : ''}`
+                : '';
 
             alert(
                 `✅ ${promoted} fila(s) promovida(s) a la lista definitiva.` +
-                (details.length ? `\n(${details.join(" · ")})` : "")
+                (details.length ? `\n(${details.join(" · ")})` : "") +
+                neo4jInfo
             );
             await loadCandidates();
             await loadStats();
@@ -938,7 +946,10 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                 if (toPromote.length > 0) {
                     try {
                         const promoteResult = await promoteCandidates(project, { candidateIds: toPromote.map(c => c.id) });
-                        alert(`✅ ${promoteResult.promoted_count} códigos promovidos a la Lista Definitiva.`);
+                        const neo4jInfo = (promoteResult.neo4j_merged ?? 0) > 0
+                            ? `\n🔗 Neo4j: ${promoteResult.neo4j_merged} relación(es) sincronizada(s)`
+                            : '';
+                        alert(`✅ ${promoteResult.promoted_count} códigos promovidos a la Lista Definitiva.${neo4jInfo}`);
                         await loadCandidates();
                         await loadStats();
                     } catch (err) {
@@ -1229,6 +1240,31 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                     </label>
                 </div>
             </div>
+
+            {/* Promote Button - Visible */}
+            {stats && ((stats.validated_unpromoted_total ?? 0) > 0) && (
+                <button
+                    onClick={handlePromote}
+                    disabled={loading}
+                    style={{
+                        background: loading ? "#9ca3af" : "linear-gradient(135deg, #059669, #10b981)",
+                        color: "white",
+                        border: "none",
+                        padding: "10px 20px",
+                        borderRadius: "8px",
+                        cursor: loading ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.95rem",
+                        marginBottom: "1rem",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                    }}
+                    title="Promueve todos los códigos validados (no promovidos aún) a la lista definitiva y sincroniza con Neo4j"
+                >
+                    ⬆️ Promover {stats.validated_unpromoted_total} códigos validados a Lista Definitiva
+                </button>
+            )}
 
             {/* Batch Actions */}
             {filterEstado === "pendiente" && selected.size > 0 && (
@@ -2015,7 +2051,7 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                         className="btn btn--promote"
                         disabled={!stats || ((stats.validated_unpromoted_total ?? (stats.totals?.validado ?? 0)) <= 0)}
                     >
-                        ⬆️ Promover {stats.validated_unpromoted_total ?? stats.totals.validado} códigos (pendientes) a Lista Definitiva
+                        ⬆️ Promover {stats.validated_unpromoted_total ?? stats.totals.validado} códigos validados a Lista Definitiva
                     </button>
                 </div>
             )}

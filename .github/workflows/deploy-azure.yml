@@ -1,0 +1,71 @@
+name: Deploy to Azure Container Apps
+
+on:
+  workflow_run:
+    workflows: ["Build and Push to ACR"]
+    types: [completed]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      ACR_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+      RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
+      TAG: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure with service principal
+        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure via OIDC
+        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        uses: azure/login@v2
+        with:
+          enable-oidc: true
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure ACR registry credentials set on Container Apps (if ACR username provided)
+        if: ${{ secrets.ACR_USERNAME != '' }}
+        run: |
+          ACR_USER=${{ secrets.ACR_USERNAME }}
+          ACR_PASS=${{ secrets.ACR_PASSWORD }}
+          ACR_SERVER=${{ secrets.ACR_LOGIN_SERVER }}
+          # set registry credentials for axial-api (and other apps if present)
+          az containerapp registry set -g "$RG" -n axial-api --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
+          az containerapp registry set -g "$RG" -n axial-worker --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
+          az containerapp registry set -g "$RG" -n axial-web --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
+
+      - name: Update Container Apps images
+        run: |
+          ACR_SERVER=${{ secrets.ACR_LOGIN_SERVER }}
+          echo "Updating axial-api -> $ACR_SERVER/axial-api:$TAG"
+          az containerapp update -g "$RG" -n axial-api --image "$ACR_SERVER/axial-api:$TAG"
+          # update optional apps if they exist
+          az containerapp show -g "$RG" -n axial-worker >/dev/null 2>&1 && az containerapp update -g "$RG" -n axial-worker --image "$ACR_SERVER/axial-worker:$TAG" || echo "axial-worker not found, skipping"
+          az containerapp show -g "$RG" -n axial-web >/dev/null 2>&1 && az containerapp update -g "$RG" -n axial-web --image "$ACR_SERVER/axial-web:$TAG" || echo "axial-web not found, skipping"
+
+      - name: Inject secrets and env (storage + flags)
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" ]; then
+            az containerapp secret set -g "$RG" -n axial-api --secrets AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" || true
+          fi
+          az containerapp update -g "$RG" -n axial-api --set-env-vars \
+            ARTIFACTS_ALLOW_LOCAL_FALLBACK=false \
+            ALLOW_BLOB_LEGACY_READ=false \
+            ALLOW_ORGLESS_TASKS=false || true
+
+      - name: Show updated config and recent logs
+        run: |
+          az containerapp show -g "$RG" -n axial-api --query properties.configuration || true
+          az containerapp logs show -g "$RG" -n axial-api --since 5m || true

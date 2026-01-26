@@ -10,6 +10,7 @@
 import React, { useState, useCallback, useMemo } from "react";
 import { predictLinks, getCommunityLinks, analyzePredictions, LinkSuggestion, saveLinkPredictions, saveAnalysisReport, submitCandidate, checkBatchCodes, BatchCheckResult, EpistemicStatement } from "../services/api";
 import { EpistemicBadge } from "./common/Analysis";
+import { LinkPredictionValidationPanel } from "./LinkPredictionValidationPanel";
 
 interface LinkPredictionPanelProps {
   project: string;
@@ -907,6 +908,14 @@ export function LinkPredictionPanel({
           color: #7c3aed;
         }
       `}</style>
+      
+      {/* Bandeja de validación de predicciones guardadas */}
+      <LinkPredictionValidationPanel 
+        project={project} 
+        onRelationValidated={() => {
+          // Las relaciones validadas se sincronizan a Neo4j automáticamente
+        }} 
+      />
     </div>
   );
 }

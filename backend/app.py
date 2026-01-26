@@ -4731,7 +4731,12 @@ async def api_promote_candidates(
     settings: AppSettings = Depends(get_settings),
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
-    """Promueve códigos candidatos validados a la lista definitiva."""
+    """
+    Promueve códigos candidatos validados a la lista definitiva.
+    
+    Si SYNC_NEO4J_ON_PROMOTE=true (default), sincroniza las relaciones
+    TIENE_CODIGO en Neo4j usando batch UNWIND.
+    """
     try:
         project_id = resolve_project(payload.project, allow_create=False)
     except ValueError as exc:
@@ -4745,7 +4750,10 @@ async def api_promote_candidates(
         )
     
     clients = build_clients_or_error(settings)
+    neo4j_result = {"neo4j_merged": 0, "neo4j_missing_fragments": 0}
+    
     try:
+        # 1. Promover en PostgreSQL
         result = promote_to_definitive(
             clients.postgres,
             project_id=project_id,
@@ -4753,12 +4761,55 @@ async def api_promote_candidates(
             promote_all_validated=payload.promote_all_validated,
             promoted_by=user.user_id if user else None,
         )
+        
+        # 2. Sincronizar Neo4j si está habilitado y hay datos para sync
+        neo4j_sync_rows = result.pop("neo4j_sync_rows", [])
+        
+        if settings.sync_neo4j_on_promote and neo4j_sync_rows:
+            try:
+                from app.neo4j_block import merge_fragment_codes_bulk
+                
+                sync_result = merge_fragment_codes_bulk(
+                    driver=clients.neo4j,
+                    database=settings.neo4j.database,
+                    rows=neo4j_sync_rows,
+                    project_id=project_id,
+                )
+                neo4j_result = {
+                    "neo4j_merged": sync_result.get("merged_count", 0),
+                    "neo4j_missing_fragments": sync_result.get("missing_fragments", 0),
+                }
+                
+                # Log para observabilidad
+                if sync_result.get("missing_fragments", 0) > 0:
+                    api_logger.warning(
+                        "promote.neo4j_sync.missing_fragments",
+                        project_id=project_id,
+                        missing_count=sync_result["missing_fragments"],
+                        missing_ids=sync_result.get("missing_fragment_ids", [])[:10],  # Limitar log
+                    )
+                
+                api_logger.info(
+                    "promote.neo4j_sync.success",
+                    project_id=project_id,
+                    merged=neo4j_result["neo4j_merged"],
+                    missing=neo4j_result["neo4j_missing_fragments"],
+                )
+            except Exception as e:
+                # Neo4j sync es best-effort, no falla la promoción
+                api_logger.error(
+                    "promote.neo4j_sync.error",
+                    project_id=project_id,
+                    error=str(e),
+                )
+                neo4j_result = {"neo4j_merged": 0, "neo4j_missing_fragments": 0, "neo4j_error": str(e)[:200]}
     finally:
         clients.close()
 
     return {
         "success": (result.get("promoted_count", 0) or 0) > 0,
         **result,
+        **neo4j_result,
     }
 
 
@@ -4767,7 +4818,7 @@ async def api_promote_candidates(
 # =============================================================================
 
 class LinkPredictionSaveRequest(BaseModel):
-    """Request para guardar sugerencias de Link Prediction como candidatos."""
+    """Request para guardar sugerencias de Link Prediction."""
     model_config = ConfigDict(extra="forbid")
     
     project: str = Field(..., description="Proyecto")
@@ -4784,10 +4835,10 @@ async def api_save_link_predictions(
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
-    Guarda sugerencias de Link Prediction en la Bandeja de Candidatos.
+    Guarda sugerencias de Link Prediction en la tabla link_predictions.
     
-    Las sugerencias se insertan como códigos candidatos con fuente_origen="link_prediction"
-    para ser validadas por el investigador.
+    Las predicciones son hipótesis de relaciones axiales entre códigos.
+    Se validan en el panel de Codificación Axial.
     """
     try:
         project_id = resolve_project(payload.project, allow_create=False)
@@ -4797,48 +4848,235 @@ async def api_save_link_predictions(
     if not payload.suggestions:
         raise HTTPException(status_code=400, detail="suggestions no puede estar vacío")
     
-    # Convertir sugerencias a formato de candidatos
-    candidates = []
-    for suggestion in payload.suggestions:
-        # Usar target como código (la relación sugerida)
-        codigo = suggestion.get("target", "")
+    from app.postgres_block import insert_link_predictions
+    
+    # Convertir sugerencias a formato de link_predictions
+    predictions = []
+    for i, suggestion in enumerate(payload.suggestions):
         source = suggestion.get("source", "")
+        target = suggestion.get("target", "")
         score = suggestion.get("score", 0.0)
-        algorithm = suggestion.get("algorithm", "unknown")
+        algorithm = suggestion.get("algorithm", "common_neighbors")
         reason = suggestion.get("reason", "")
         
-        if not codigo:
+        if not source or not target:
             continue
             
-        candidates.append({
+        predictions.append({
             "project_id": project_id,
-            "codigo": codigo,
-            "cita": f"Relación sugerida: {source} → {codigo}",
-            "fragmento_id": None,  # Link Prediction no tiene fragmento específico
-            "archivo": None,
-            "fuente_origen": "link_prediction",
-            "fuente_detalle": f"Algoritmo: {algorithm}. {reason}",
-            "score_confianza": min(max(score, 0.0), 1.0),  # Normalizar entre 0 y 1
-            "memo": f"Sugerido por Link Prediction ({algorithm})",
+            "source_code": source,
+            "target_code": target,
+            "relation_type": "asociado_con",
+            "algorithm": algorithm,
+            "score": min(max(score, 0.0), 1.0),
+            "rank": i + 1,
+            "memo": reason if reason else f"Sugerido por {algorithm}",
         })
     
-    if not candidates:
+    if not predictions:
         raise HTTPException(status_code=400, detail="No se encontraron sugerencias válidas")
     
     clients = build_clients_or_error(settings)
     try:
-        insert_candidate_codes(clients.postgres, candidates)
+        count = insert_link_predictions(clients.postgres, predictions)
     finally:
         clients.close()
     
     api_logger.info(
         "link_prediction.saved",
         project=project_id,
-        count=len(candidates),
+        count=count,
         user=user.user_id,
     )
     
-    return {"success": True, "saved_count": len(candidates)}
+    return {"success": True, "saved_count": count}
+
+
+@app.get("/api/link-predictions")
+async def api_get_link_predictions(
+    project: str = Query(..., description="Proyecto"),
+    estado: Optional[str] = Query(None, description="Filtrar por estado"),
+    algorithm: Optional[str] = Query(None, description="Filtrar por algoritmo"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Obtiene predicciones de relaciones para el panel de Codificación Axial.
+    """
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    
+    from app.postgres_block import (
+        count_link_predictions,
+        get_link_predictions,
+        get_link_predictions_stats,
+    )
+    
+    clients = build_clients_or_error(settings)
+    try:
+        predictions = get_link_predictions(
+            clients.postgres,
+            project_id,
+            estado=estado,
+            algorithm=algorithm,
+            limit=limit,
+            offset=offset,
+        )
+        total = count_link_predictions(
+            clients.postgres,
+            project_id,
+            estado=estado,
+            algorithm=algorithm,
+        )
+        stats = get_link_predictions_stats(clients.postgres, project_id)
+    finally:
+        clients.close()
+    
+    return {
+        "items": predictions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "stats": stats,
+        "project": project_id,
+    }
+
+
+class LinkPredictionUpdateRequest(BaseModel):
+    """Request para actualizar estado de predicción."""
+    model_config = ConfigDict(extra="forbid")
+    
+    estado: str = Field(..., description="Nuevo estado: pendiente, validado, rechazado")
+    memo: Optional[str] = Field(None, description="Nota opcional")
+    relation_type: Optional[str] = Field(None, description="Tipo de relación para crear en Neo4j")
+
+
+@app.patch("/api/link-predictions/{prediction_id}")
+async def api_update_link_prediction(
+    prediction_id: int,
+    payload: LinkPredictionUpdateRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Actualiza el estado de una predicción.
+    
+    Si estado='validado', crea la relación axial en Neo4j.
+    """
+    if payload.estado not in ("pendiente", "validado", "rechazado"):
+        raise HTTPException(status_code=400, detail="estado debe ser: pendiente, validado, rechazado")
+    
+    from app.postgres_block import update_link_prediction_estado, get_link_prediction_by_id
+    from app.neo4j_block import merge_axial_relationship
+    
+    clients = build_clients_or_error(settings)
+    try:
+        # Obtener predicción actual
+        prediction = get_link_prediction_by_id(clients.postgres, prediction_id)
+        if not prediction:
+            raise HTTPException(status_code=404, detail="Predicción no encontrada")
+        
+        # Actualizar estado
+        success = update_link_prediction_estado(
+            clients.postgres,
+            prediction_id,
+            payload.estado,
+            validado_por=user.user_id,
+            memo=payload.memo,
+            relation_type=payload.relation_type,
+        )
+        
+        neo4j_synced = False
+        # Si se valida, crear relación en Neo4j
+        if success and payload.estado == "validado" and clients.neo4j:
+            rel_type = payload.relation_type or prediction.get("relation_type", "asociado_con")
+            try:
+                merge_axial_relationship(
+                    driver=clients.neo4j,
+                    database=settings.neo4j.database,
+                    project_id=prediction["project_id"],
+                    source_code=prediction["source_code"],
+                    target_code=prediction["target_code"],
+                    relation_type=rel_type,
+                )
+                neo4j_synced = True
+            except Exception as e:
+                api_logger.warning(
+                    "link_prediction.neo4j_sync_failed",
+                    prediction_id=prediction_id,
+                    error=str(e),
+                )
+    finally:
+        clients.close()
+    
+    return {
+        "success": success,
+        "prediction_id": prediction_id,
+        "estado": payload.estado,
+        "neo4j_synced": neo4j_synced,
+    }
+
+
+class LinkPredictionBatchUpdateRequest(BaseModel):
+    """Request para actualizar múltiples predicciones."""
+    model_config = ConfigDict(extra="forbid")
+    
+    project: str = Field(..., description="Proyecto")
+    prediction_ids: List[int] = Field(..., description="IDs de predicciones")
+    estado: str = Field(..., description="Nuevo estado")
+
+
+@app.post("/api/link-predictions/batch-update")
+async def api_batch_update_link_predictions(
+    payload: LinkPredictionBatchUpdateRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Actualiza el estado de múltiples predicciones.
+    """
+    if payload.estado not in ("pendiente", "validado", "rechazado"):
+        raise HTTPException(status_code=400, detail="estado debe ser: pendiente, validado, rechazado")
+    
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    from app.postgres_block import batch_update_link_predictions_estado, get_link_predictions_by_ids
+    from app.neo4j_block import merge_axial_relationships_bulk
+    
+    clients = build_clients_or_error(settings)
+    try:
+        count = batch_update_link_predictions_estado(
+            clients.postgres,
+            project_id,
+            payload.prediction_ids,
+            payload.estado,
+            validado_por=user.user_id,
+        )
+        neo4j_synced = 0
+        if payload.estado == "validado" and clients.neo4j:
+            predictions = get_link_predictions_by_ids(clients.postgres, project_id, payload.prediction_ids)
+            neo4j_synced = merge_axial_relationships_bulk(
+                driver=clients.neo4j,
+                database=settings.neo4j.database,
+                project_id=project_id,
+                rows=predictions,
+            )
+    finally:
+        clients.close()
+    
+    return {
+        "success": True,
+        "updated_count": count,
+        "estado": payload.estado,
+        "neo4j_synced": neo4j_synced,
+    }
 
 
 # =============================================================================
@@ -10463,4 +10701,3 @@ async def api_admin_integrity_check(
 
 
 # Force reload
-

@@ -17,6 +17,14 @@
 ### Modo Epistémico
 *   ~~**Prompts hardcoded en `coding.py`**~~: ✅ **RESUELTO** - `suggest_code_from_fragments()` ahora usa `get_system_prompt()` del loader con modo epistémico diferenciado.
 
+### Sincronización Neo4j
+*   ~~**Neo4j no recibe códigos promovidos**~~: ✅ **RESUELTO** (2026-01-23) - Implementado sync automático al promover:
+    - Nueva función `merge_fragment_codes_bulk()` en `app/neo4j_block.py` con UNWIND batch
+    - Endpoint `/api/codes/candidates/promote` ahora sincroniza a Neo4j
+    - Feature flag `SYNC_NEO4J_ON_PROMOTE=true` (default)
+    - Métricas en respuesta: `neo4j_merged`, `neo4j_missing_fragments`
+    - UI actualizado para mostrar métricas de sincronización
+
 ## 2. Brechas de Producto (Should-Have)
 
 ### Frontend (UX)

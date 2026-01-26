@@ -4743,6 +4743,418 @@ def ensure_candidate_codes_table(pg: PGConnection) -> None:
                 _candidate_codes_table_promote_migrated = True
 
 
+# =============================================================================
+# LINK PREDICTIONS TABLE (Codificación Axial)
+# =============================================================================
+
+_link_predictions_table_created = False
+
+
+def ensure_link_predictions_table(pg: PGConnection) -> None:
+    """
+    Crea la tabla link_predictions para almacenar predicciones de relaciones axiales.
+    
+    Las predicciones de Link Prediction son hipótesis de relaciones entre códigos,
+    no códigos con citas. Pertenecen metodológicamente a la Codificación Axial.
+    
+    Estados: pendiente, validado, rechazado
+    Al validar: se crea la relación axial en Neo4j
+    """
+    global _link_predictions_table_created
+    if _link_predictions_table_created:
+        return
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_predictions (
+                id SERIAL PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                source_code TEXT NOT NULL,
+                target_code TEXT NOT NULL,
+                relation_type TEXT NOT NULL DEFAULT 'asociado_con',
+                algorithm TEXT NOT NULL DEFAULT 'common_neighbors',
+                score FLOAT NOT NULL DEFAULT 0.0,
+                rank INTEGER,
+                estado TEXT NOT NULL DEFAULT 'pendiente',
+                validado_por TEXT,
+                validado_en TIMESTAMPTZ,
+                memo TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                
+                CONSTRAINT uq_lp_project_codes UNIQUE (project_id, source_code, target_code, algorithm)
+            );
+            
+            CREATE INDEX IF NOT EXISTS ix_lp_project_estado 
+                ON link_predictions(project_id, estado);
+            CREATE INDEX IF NOT EXISTS ix_lp_project_source 
+                ON link_predictions(project_id, source_code);
+            CREATE INDEX IF NOT EXISTS ix_lp_project_target 
+                ON link_predictions(project_id, target_code);
+            """
+        )
+    pg.commit()
+    _link_predictions_table_created = True
+
+
+def insert_link_predictions(
+    pg: PGConnection,
+    predictions: List[Dict[str, Any]],
+) -> int:
+    """
+    Inserta predicciones de relaciones en la tabla link_predictions.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        predictions: Lista de dicts con:
+            - project_id, source_code, target_code
+            - relation_type (default: 'asociado_con')
+            - algorithm (ej: 'common_neighbors', 'adamic_adar')
+            - score, rank (opcionales)
+            - memo (opcional)
+    
+    Returns:
+        Número de predicciones insertadas
+    """
+    ensure_link_predictions_table(pg)
+    if not predictions:
+        return 0
+    
+    sql = """
+    INSERT INTO link_predictions (
+        project_id, source_code, target_code, relation_type,
+        algorithm, score, rank, memo
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (project_id, source_code, target_code, algorithm) DO UPDATE SET
+        score = EXCLUDED.score,
+        rank = EXCLUDED.rank,
+        memo = COALESCE(EXCLUDED.memo, link_predictions.memo),
+        updated_at = NOW()
+    """
+    
+    count = 0
+    with pg.cursor() as cur:
+        for p in predictions:
+            if not p.get("source_code") or not p.get("target_code"):
+                continue
+            cur.execute(
+                sql,
+                (
+                    p.get("project_id", "default"),
+                    p["source_code"],
+                    p["target_code"],
+                    p.get("relation_type", "asociado_con"),
+                    p.get("algorithm", "common_neighbors"),
+                    p.get("score", 0.0),
+                    p.get("rank"),
+                    p.get("memo"),
+                ),
+            )
+            count += 1
+    pg.commit()
+    return count
+
+
+def get_link_predictions(
+    pg: PGConnection,
+    project_id: str,
+    estado: Optional[str] = None,
+    algorithm: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene predicciones de relaciones para un proyecto.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto
+        estado: Filtrar por estado (pendiente, validado, rechazado)
+        limit: Máximo de resultados
+        offset: Desplazamiento para paginación
+    
+    Returns:
+        Lista de predicciones
+    """
+    ensure_link_predictions_table(pg)
+    
+    sql = """
+    SELECT id, project_id, source_code, target_code, relation_type,
+           algorithm, score, rank, estado, validado_por, validado_en,
+           memo, created_at, updated_at
+    FROM link_predictions
+    WHERE project_id = %s
+    """
+    params: List[Any] = [project_id]
+    
+    if estado:
+        sql += " AND estado = %s"
+        params.append(estado)
+
+    if algorithm:
+        sql += " AND algorithm = %s"
+        params.append(algorithm)
+
+    sql += " ORDER BY score DESC, created_at DESC LIMIT %s OFFSET %s"
+    params.extend([limit, offset])
+    
+    with pg.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    
+    return [
+        {
+            "id": r[0],
+            "project_id": r[1],
+            "source_code": r[2],
+            "target_code": r[3],
+            "relation_type": r[4],
+            "algorithm": r[5],
+            "score": r[6],
+            "rank": r[7],
+            "estado": r[8],
+            "validado_por": r[9],
+            "validado_en": r[10].isoformat() if r[10] else None,
+            "memo": r[11],
+            "created_at": r[12].isoformat() if r[12] else None,
+            "updated_at": r[13].isoformat() if r[13] else None,
+        }
+        for r in rows
+    ]
+
+
+def count_link_predictions(
+    pg: PGConnection,
+    project_id: str,
+    estado: Optional[str] = None,
+    algorithm: Optional[str] = None,
+) -> int:
+    """
+    Cuenta predicciones de relaciones para un proyecto (con filtros opcionales).
+    """
+    ensure_link_predictions_table(pg)
+
+    sql = "SELECT COUNT(*) FROM link_predictions WHERE project_id = %s"
+    params: List[Any] = [project_id]
+
+    if estado:
+        sql += " AND estado = %s"
+        params.append(estado)
+
+    if algorithm:
+        sql += " AND algorithm = %s"
+        params.append(algorithm)
+
+    with pg.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        r = cur.fetchone()
+        return int(r[0] or 0) if r else 0
+
+
+def get_link_predictions_stats(
+    pg: PGConnection,
+    project_id: str,
+) -> Dict[str, Any]:
+    """
+    Obtiene estadísticas de predicciones de relaciones.
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT estado, COUNT(*) 
+            FROM link_predictions 
+            WHERE project_id = %s 
+            GROUP BY estado
+            """,
+            (project_id,),
+        )
+        totals = {r[0]: r[1] for r in cur.fetchall()}
+        
+        cur.execute(
+            """
+            SELECT algorithm, COUNT(*) 
+            FROM link_predictions 
+            WHERE project_id = %s 
+            GROUP BY algorithm
+            """,
+            (project_id,),
+        )
+        by_algorithm = {r[0]: r[1] for r in cur.fetchall()}
+    
+    return {
+        "totals": totals,
+        "by_algorithm": by_algorithm,
+        "total": sum(totals.values()),
+    }
+
+
+def update_link_prediction_estado(
+    pg: PGConnection,
+    prediction_id: int,
+    estado: str,
+    validado_por: Optional[str] = None,
+    memo: Optional[str] = None,
+    relation_type: Optional[str] = None,
+) -> bool:
+    """
+    Actualiza el estado de una predicción.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        prediction_id: ID de la predicción
+        estado: Nuevo estado (pendiente, validado, rechazado)
+        validado_por: Usuario que valida
+        memo: Nota opcional
+    
+    Returns:
+        True si se actualizó
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE link_predictions
+            SET estado = %s,
+                relation_type = COALESCE(%s, relation_type),
+                validado_por = COALESCE(%s, validado_por),
+                validado_en = CASE WHEN %s IN ('validado', 'rechazado') THEN NOW() ELSE validado_en END,
+                memo = COALESCE(%s, memo),
+                updated_at = NOW()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (estado, relation_type, validado_por, estado, memo, prediction_id),
+        )
+        result = cur.fetchone()
+    pg.commit()
+    return result is not None
+
+
+def batch_update_link_predictions_estado(
+    pg: PGConnection,
+    project_id: str,
+    prediction_ids: List[int],
+    estado: str,
+    validado_por: Optional[str] = None,
+) -> int:
+    """
+    Actualiza el estado de múltiples predicciones.
+    """
+    ensure_link_predictions_table(pg)
+    if not prediction_ids:
+        return 0
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE link_predictions
+            SET estado = %s,
+                validado_por = COALESCE(%s, validado_por),
+                validado_en = CASE WHEN %s IN ('validado', 'rechazado') THEN NOW() ELSE validado_en END,
+                updated_at = NOW()
+            WHERE project_id = %s AND id = ANY(%s)
+            """,
+            (estado, validado_por, estado, project_id, prediction_ids),
+        )
+        count = cur.rowcount
+    pg.commit()
+    return count
+
+
+def get_link_predictions_by_ids(
+    pg: PGConnection,
+    project_id: str,
+    prediction_ids: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene predicciones por IDs (filtradas por proyecto).
+    """
+    ensure_link_predictions_table(pg)
+    if not prediction_ids:
+        return []
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, source_code, target_code, relation_type,
+                   algorithm, score, rank, estado, validado_por, validado_en,
+                   memo, created_at, updated_at
+            FROM link_predictions
+            WHERE project_id = %s AND id = ANY(%s)
+            """,
+            (project_id, prediction_ids),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": r[0],
+            "project_id": r[1],
+            "source_code": r[2],
+            "target_code": r[3],
+            "relation_type": r[4],
+            "algorithm": r[5],
+            "score": r[6],
+            "rank": r[7],
+            "estado": r[8],
+            "validado_por": r[9],
+            "validado_en": r[10].isoformat() if r[10] else None,
+            "memo": r[11],
+            "created_at": r[12].isoformat() if r[12] else None,
+            "updated_at": r[13].isoformat() if r[13] else None,
+        }
+        for r in rows
+    ]
+
+
+def get_link_prediction_by_id(
+    pg: PGConnection,
+    prediction_id: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene una predicción por ID.
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, source_code, target_code, relation_type,
+                   algorithm, score, rank, estado, validado_por, validado_en,
+                   memo, created_at, updated_at
+            FROM link_predictions
+            WHERE id = %s
+            """,
+            (prediction_id,),
+        )
+        r = cur.fetchone()
+    
+    if not r:
+        return None
+    
+    return {
+        "id": r[0],
+        "project_id": r[1],
+        "source_code": r[2],
+        "target_code": r[3],
+        "relation_type": r[4],
+        "algorithm": r[5],
+        "score": r[6],
+        "rank": r[7],
+        "estado": r[8],
+        "validado_por": r[9],
+        "validado_en": r[10].isoformat() if r[10] else None,
+        "memo": r[11],
+        "created_at": r[12].isoformat() if r[12] else None,
+        "updated_at": r[13].isoformat() if r[13] else None,
+    }
+
+
 def count_pending_candidates(pg: PGConnection, project_id: str) -> int:
     """
     Cuenta códigos candidatos pendientes de validación para un proyecto.
@@ -6210,12 +6622,21 @@ def promote_to_definitive(
     eligible_total = promoted_count
     skipped_total = max(validated_total - eligible_total, 0) if promote_all_validated else 0
 
+    # Construir lista de pares (fragment_id, canonical_codigo) para sync Neo4j
+    # open_rows: (project_id, fragmento_id, codigo, archivo, cita, fuente, memo, code_id)
+    neo4j_sync_rows = [
+        {"fragment_id": r[1], "codigo": r[2]}
+        for r in open_rows
+        if r[1] and r[2]
+    ]
+
     return {
         "mode": mode,
         "validated_total": validated_total,
         "eligible_total": eligible_total,
         "promoted_count": promoted_count,
         "skipped_total": skipped_total,
+        "neo4j_sync_rows": neo4j_sync_rows,
     }
 
 
@@ -7442,4 +7863,3 @@ def check_axial_ready(pg: PGConnection, project_id: str) -> Tuple[bool, List[str
     
     axial_ready = len(blocking_reasons) == 0
     return axial_ready, blocking_reasons
-

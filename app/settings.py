@@ -198,6 +198,7 @@ class AppSettings:
         postgres: Configuración de PostgreSQL
         embed_dims: Dimensiones del modelo de embeddings (se infiere si no se especifica)
         api_key: API key para autenticación de la API REST (opcional)
+        sync_neo4j_on_promote: Si True, sincroniza Neo4j al promover candidatos (default: True)
     """
     azure: AzureSettings
     qdrant: QdrantSettings
@@ -205,6 +206,7 @@ class AppSettings:
     postgres: PostgresSettings
     embed_dims: Optional[int]
     api_key: Optional[str]
+    sync_neo4j_on_promote: bool = True
 
     def masked(self) -> "AppSettings":
         """Retorna una copia con todas las credentials enmascaradas para logging seguro."""
@@ -215,6 +217,7 @@ class AppSettings:
             postgres=self.postgres.masked(),
             embed_dims=self.embed_dims,
             api_key=mask(self.api_key),
+            sync_neo4j_on_promote=self.sync_neo4j_on_promote,
         )
 
 
@@ -335,6 +338,9 @@ def load_settings(env_file: Optional[str | os.PathLike[str]] = None) -> AppSetti
     embed_dims_raw = os.getenv("EMBED_DIMS")
     embed_dims = int(embed_dims_raw) if embed_dims_raw else None
 
+    # Feature flags
+    sync_neo4j_on_promote = os.getenv("SYNC_NEO4J_ON_PROMOTE", "true").lower() in ("true", "1", "yes")
+
     return AppSettings(
         azure=azure,
         qdrant=qdrant,
@@ -342,4 +348,5 @@ def load_settings(env_file: Optional[str | os.PathLike[str]] = None) -> AppSetti
         postgres=postgres,
         embed_dims=embed_dims,
         api_key=os.getenv("API_KEY"),
+        sync_neo4j_on_promote=sync_neo4j_on_promote,
     )

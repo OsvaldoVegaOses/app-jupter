@@ -61,7 +61,9 @@ export function EpistemicModeSelector({
     opacity: disabled ? 0.6 : 1,
     padding: compact ? "0" : "0.5rem",
     borderRadius: "0.375rem",
-    border: "1px solid transparent"
+    borderWidth: "1px",
+    borderStyle: "solid",
+    borderColor: "transparent"
   };
 
   const selectedStyle: React.CSSProperties = {
