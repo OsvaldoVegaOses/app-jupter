@@ -34,7 +34,7 @@ jobs:
           creds: ${{ env.AZURE_CREDENTIALS }}
 
       - name: Login to Azure via OIDC
-        if: ${{ env.AZURE_CREDENTIALS == '' }}
+        if: ${{ env.AZURE_CREDENTIALS == '' && env.AZURE_CLIENT_ID != '' && env.AZURE_TENANT_ID != '' }}
         uses: azure/login@v2
         with:
           enable-oidc: true
@@ -65,13 +65,18 @@ jobs:
       - name: Inject secrets and env (storage + flags)
         run: |
           set -euo pipefail
-          if [ -n "${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" ]; then
-            az containerapp secret set -g "$RG" -n axial-api --secrets AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" || true
+          if [ -n "${AZURE_STORAGE_CONNECTION_STRING:-}" ]; then
+            az containerapp secret set -g "$RG" -n axial-api --secrets AZURE_STORAGE_CONNECTION_STRING="$AZURE_STORAGE_CONNECTION_STRING" || true
           fi
           az containerapp update -g "$RG" -n axial-api --set-env-vars \
             ARTIFACTS_ALLOW_LOCAL_FALLBACK=false \
             ALLOW_BLOB_LEGACY_READ=false \
             ALLOW_ORGLESS_TASKS=false || true
+
+      - name: Skip deploy when no Azure credentials available
+        if: ${{ env.AZURE_CREDENTIALS == '' && (env.AZURE_CLIENT_ID == '' || env.AZURE_TENANT_ID == '') }}
+        run: |
+          echo "No Azure service principal or OIDC client configured; skipping deploy"
 
       - name: Show updated config and recent logs
         run: |
