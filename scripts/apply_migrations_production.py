@@ -19,6 +19,13 @@ MIGRATIONS = [
     "migrations/013_codes_catalog_ontology.sql",
     "migrations/014_code_id_columns.sql",
     "migrations/015_ontology_freeze.sql",
+    "migrations/017_epistemic_mode.sql",
+    "migrations/018_code_id_propagation.sql",
+    "migrations/019_axial_ledger_states_code_id.sql",
+    "migrations/020_axial_ai_analyses.sql",
+    "migrations/021_axial_ai_evidence.sql",
+    "migrations/022_link_predictions_neo4j_sync_status.sql",
+    "migrations/023_link_predictions_reopen.sql",
 ]
 
 
@@ -37,10 +44,10 @@ def run_migrations() -> None:
                 with conn.cursor() as cur:
                     cur.execute(sql)
                 conn.commit()
-                print("✅ OK")
+                print("OK")
             except Exception as exc:
                 conn.rollback()
-                print(f"❌ Failed: {rel_path} -> {exc}")
+                print(f"FAILED: {rel_path} -> {exc}")
                 raise
     finally:
         return_pg_connection(conn)

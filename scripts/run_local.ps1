@@ -29,6 +29,7 @@ python scripts/Cerrar_procesos.py --kill-app
   - `smoke`: verifica `/healthz` y hace un POST mínimo a `/neo4j/query`.
   - `tests`: ejecuta pytest + vitest.
   - `all`: ejecuta `tests` + `dev` + `smoke`.
+  - Auto-retry Neo4j (link_predictions): si está activo, reintenta sync en loop.
 
   GUIA PASO A PASO (Quickstart)
   1) Prerrequisitos
@@ -70,6 +71,11 @@ python scripts/Cerrar_procesos.py --kill-app
   6) Tests
      - Backend + frontend:
          powershell -ExecutionPolicy Bypass -File scripts\run_local.ps1 -Action tests
+  
+  7) Auto-retry Neo4j (link predictions)
+     - Por defecto está habilitado en local para facilitar operación.
+     - Para desactivarlo:
+         powershell -ExecutionPolicy Bypass -File scripts\run_local.ps1 -Action dev -DisableNeo4jRetry
 
   Troubleshooting comun
   - Si ves errores de "Tiempo de espera agotado" en el frontend: casi siempre es porque el backend no esta escuchando en el puerto configurado (por defecto http://127.0.0.1:8000).
@@ -145,7 +151,14 @@ param (
 
   [switch]$NoReload,
   [switch]$NoNewWindow,
-  [switch]$PrintOnly
+  [switch]$PrintOnly,
+
+  # Auto-retry Neo4j para link_predictions (production-friendly)
+  [switch]$DisableNeo4jRetry,
+  [int]$RetryInterval = 60,
+  [int]$RetryBatchSize = 200,
+  [int]$RetryCooldownMinutes = 2,
+  [string]$RetryProject = ""
 )
 
 function Import-DotEnvFile {
@@ -194,6 +207,36 @@ function Wait-HttpOk {
   return $false
 }
 
+function Start-Neo4jRetryLoop {
+  param(
+    [string]$RepoRoot,
+    [string]$PythonPath,
+    [int]$IntervalSec,
+    [int]$BatchSize,
+    [int]$CooldownMinutes,
+    [string]$Project,
+    [switch]$NoNewWindow,
+    [switch]$PrintOnly
+  )
+  $scriptPath = Join-Path $RepoRoot "scripts\retry_link_predictions_neo4j.py"
+  if (-not (Test-Path $scriptPath)) { return $null }
+
+  $retryArgs = @($scriptPath, "--loop", "--interval", $IntervalSec, "--batch-size", $BatchSize, "--cooldown-minutes", $CooldownMinutes)
+  if ($Project) { $retryArgs += @("--project", $Project) }
+
+  if ($PrintOnly) {
+    Write-Host "Neo4j retry: $PythonPath $($retryArgs -join ' ')" -ForegroundColor DarkGray
+    return $null
+  }
+
+  if ($NoNewWindow) {
+    return Start-Process -FilePath $PythonPath -ArgumentList $retryArgs -WorkingDirectory $RepoRoot -NoNewWindow -PassThru
+  }
+
+  Start-Process -FilePath $PythonPath -ArgumentList $retryArgs -WorkingDirectory $RepoRoot | Out-Null
+  return $null
+}
+
 $repoRoot = Resolve-RepoRoot
 Set-Location $repoRoot
 
@@ -232,15 +275,27 @@ if ($Action -in @('dev','all')) {
   if ($PrintOnly) {
     Write-Host "Backend: $python $($backendArgs -join ' ')" -ForegroundColor DarkGray
     Write-Host "Frontend (cwd=frontend): npm $($frontendArgs -join ' ')" -ForegroundColor DarkGray
+    if (-not $DisableNeo4jRetry) {
+      Start-Neo4jRetryLoop -RepoRoot $repoRoot -PythonPath $python -IntervalSec $RetryInterval -BatchSize $RetryBatchSize -CooldownMinutes $RetryCooldownMinutes -Project $RetryProject -NoNewWindow:$NoNewWindow -PrintOnly
+    }
     Write-Host "Tip: abre 2 terminals y ejecuta esos comandos en paralelo." -ForegroundColor Yellow
   } elseif ($NoNewWindow) {
     # Run both processes without opening new windows (shares this console).
     $backendProc = Start-Process -FilePath $python -ArgumentList $backendArgs -WorkingDirectory $repoRoot -NoNewWindow -PassThru
     $frontendProc = Start-Process -FilePath "npm" -ArgumentList $frontendArgs -WorkingDirectory (Join-Path $repoRoot "frontend") -NoNewWindow -PassThru
     Write-Host "Started backend PID=$($backendProc.Id) and frontend PID=$($frontendProc.Id) (no new windows)." -ForegroundColor Green
+    if (-not $DisableNeo4jRetry) {
+      $retryProc = Start-Neo4jRetryLoop -RepoRoot $repoRoot -PythonPath $python -IntervalSec $RetryInterval -BatchSize $RetryBatchSize -CooldownMinutes $RetryCooldownMinutes -Project $RetryProject -NoNewWindow:$NoNewWindow
+      if ($retryProc) {
+        Write-Host "Started Neo4j retry PID=$($retryProc.Id)." -ForegroundColor Green
+      }
+    }
   } else {
     Start-Process -FilePath $python -ArgumentList $backendArgs -WorkingDirectory $repoRoot | Out-Null
     Start-Process -FilePath "npm" -ArgumentList $frontendArgs -WorkingDirectory (Join-Path $repoRoot "frontend") | Out-Null
+    if (-not $DisableNeo4jRetry) {
+      Start-Neo4jRetryLoop -RepoRoot $repoRoot -PythonPath $python -IntervalSec $RetryInterval -BatchSize $RetryBatchSize -CooldownMinutes $RetryCooldownMinutes -Project $RetryProject -NoNewWindow:$NoNewWindow
+    }
   }
 
   $ok = Wait-HttpOk -Url "http://$BackendHost`:$BackendPort/healthz" -TimeoutSec 25
@@ -254,7 +309,11 @@ if ($Action -in @('dev','all')) {
     Write-Host "Dev running. Press CTRL+C to stop." -ForegroundColor Cyan
     # Keep the script alive so child processes remain running.
     try {
-      Wait-Process -Id @($backendProc.Id, $frontendProc.Id)
+      if ($retryProc) {
+        Wait-Process -Id @($backendProc.Id, $frontendProc.Id, $retryProc.Id)
+      } else {
+        Wait-Process -Id @($backendProc.Id, $frontendProc.Id)
+      }
     } catch {
       # Best-effort: allow CTRL+C to break.
     }

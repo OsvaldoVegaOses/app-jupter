@@ -7,10 +7,11 @@
  * @module components/LinkPredictionPanel
  */
 
-import React, { useState, useCallback, useMemo } from "react";
-import { predictLinks, getCommunityLinks, analyzePredictions, LinkSuggestion, saveLinkPredictions, saveAnalysisReport, submitCandidate, checkBatchCodes, BatchCheckResult, EpistemicStatement } from "../services/api";
+import React, { useState, useCallback, useMemo, useEffect } from "react";
+import { predictLinks, getCommunityLinks, analyzePredictions, LinkSuggestion, saveLinkPredictions, saveAnalysisReport, submitCandidate, checkBatchCodes, BatchCheckResult, EpistemicStatement, listAnalysisReports, AnalysisReport } from "../services/api";
 import { EpistemicBadge } from "./common/Analysis";
 import { LinkPredictionValidationPanel } from "./LinkPredictionValidationPanel";
+import { AxialAiReviewPanel } from "./AxialAiReviewPanel";
 
 interface LinkPredictionPanelProps {
   project: string;
@@ -55,6 +56,8 @@ export function LinkPredictionPanel({
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiAnalysisId, setAiAnalysisId] = useState<number | null>(null);
+  const [aiPersisted, setAiPersisted] = useState(false);
 
   // Sprint 29+: Epistemic-tagged memo rendering (compatible with legacy text)
   const [aiMemoStatements, setAiMemoStatements] = useState<EpistemicStatement[]>([]);
@@ -74,6 +77,11 @@ export function LinkPredictionPanel({
   // State for saving AI report to database
   const [reportSaving, setReportSaving] = useState(false);
   const [reportSaved, setReportSaved] = useState<string | null>(null);
+
+  // State for listing saved AI reports
+  const [reportList, setReportList] = useState<AnalysisReport[]>([]);
+  const [reportListLoading, setReportListLoading] = useState(false);
+  const [reportListError, setReportListError] = useState<string | null>(null);
 
   // State for codes to candidates (Sprint: uniform flow)
   const [sendingCodes, setSendingCodes] = useState(false);
@@ -99,6 +107,8 @@ export function LinkPredictionPanel({
     setError(null);
     setAiAnalysis(null); // Clear previous analysis
     setAiMemoStatements([]);
+    setAiAnalysisId(null);
+    setAiPersisted(false);
 
     try {
       const result = await predictLinks(algorithm, topK, project);
@@ -138,6 +148,8 @@ export function LinkPredictionPanel({
       const result = await analyzePredictions(usedAlgorithm || algorithm, suggestions, project);
       setAiAnalysis(result.analysis);
       setAiMemoStatements(Array.isArray((result as any).memo_statements) ? ((result as any).memo_statements as EpistemicStatement[]) : []);
+      setAiAnalysisId(typeof result.analysis_id === "number" ? result.analysis_id : null);
+      setAiPersisted(Boolean(result.persisted));
     } catch (err) {
       setAiError(err instanceof Error ? err.message : "Error en análisis IA");
     } finally {
@@ -219,6 +231,35 @@ export function LinkPredictionPanel({
       setSendingCodes(false);
     }
   }, [project, usedAlgorithm, algorithm]);
+
+  const formatReportDate = useCallback((value?: string | null) => {
+    if (!value) return "-";
+    try {
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString();
+    } catch {
+      return String(value);
+    }
+  }, []);
+
+  const loadReports = useCallback(async () => {
+    if (!project) return;
+    setReportListLoading(true);
+    setReportListError(null);
+    try {
+      const res = await listAnalysisReports(project, "link_prediction", 50);
+      setReportList(Array.isArray(res.reports) ? res.reports : []);
+    } catch (err) {
+      setReportListError(err instanceof Error ? err.message : "Error cargando informes");
+    } finally {
+      setReportListLoading(false);
+    }
+  }, [project]);
+
+  useEffect(() => {
+    void loadReports();
+  }, [loadReports]);
 
   return (
     <div className="link-prediction-panel">
@@ -382,6 +423,11 @@ export function LinkPredictionPanel({
             <div className="link-prediction-panel__ai-result">
               <div className="link-prediction-panel__ai-header">
                 <h4>🧠 Análisis Cualitativo (IA)</h4>
+                {aiPersisted && aiAnalysisId !== null && (
+                  <span style={{ fontSize: "0.8rem", color: "#6b21a8" }}>
+                    Artefacto guardado: #{aiAnalysisId}
+                  </span>
+                )}
                 <button
                   className="link-prediction-panel__btn link-prediction-panel__btn--save"
                   disabled={reportSaving}
@@ -408,6 +454,7 @@ export function LinkPredictionPanel({
                         { algorithm: usedAlgorithm, suggestions_count: suggestions.length }
                       );
                       setReportSaved('✅ Informe guardado en BD');
+                      await loadReports();
                       setTimeout(() => setReportSaved(null), 5000);
                     } catch (err) {
                       console.error('Error guardando informe:', err);
@@ -445,7 +492,7 @@ export function LinkPredictionPanel({
                       Mostrar etiquetado
                     </label>
                     <span style={{ fontSize: "0.8rem", color: "#6b21a8" }}>
-                      (OBSERVATION requiere evidencia: IDs de sugerencia)
+                      (OBSERVATION requiere evidencia: fragmento_id)
                     </span>
                   </div>
 
@@ -489,6 +536,9 @@ export function LinkPredictionPanel({
                           const evid = Array.isArray(s.evidence_ids)
                             ? s.evidence_ids.filter((n) => typeof n === "number" && Number.isFinite(n))
                             : [];
+                          const fragIds = Array.isArray((s as any).evidence_fragment_ids)
+                            ? ((s as any).evidence_fragment_ids as any[]).map((v) => String(v || "").trim()).filter(Boolean)
+                            : [];
                           return (
                             <div
                               key={`${type}-${idx}`}
@@ -507,9 +557,16 @@ export function LinkPredictionPanel({
                               </div>
                               <div style={{ flex: 1 }}>
                                 <div style={{ fontSize: "0.92rem", lineHeight: 1.35 }}>{s.text}</div>
-                                {evid.length > 0 && (
+                                {(fragIds.length > 0 || evid.length > 0) && (
                                   <div style={{ marginTop: "0.2rem", fontSize: "0.78rem", color: "#6b7280" }}>
-                                    Evidencia (IDs sugerencia): {evid.join(", ")}
+                                    {fragIds.length > 0 ? (
+                                      <>
+                                        Evidencia (fragmentos): {fragIds.slice(0, 12).join(", ")}
+                                        {fragIds.length > 12 ? "…" : ""}
+                                      </>
+                                    ) : null}
+                                    {fragIds.length > 0 && evid.length > 0 ? " · " : null}
+                                    {evid.length > 0 ? <>Links: {evid.join(", ")}</> : null}
                                   </div>
                                 )}
                               </div>
@@ -553,6 +610,84 @@ export function LinkPredictionPanel({
           )}
         </div>
       )}
+
+      {/* Reportes IA guardados */}
+      <div className="link-prediction-panel__reports">
+        <div className="link-prediction-panel__reports-header">
+          <h4>Informes IA guardados (Link Prediction)</h4>
+          <button
+            onClick={() => void loadReports()}
+            disabled={reportListLoading}
+            className="link-prediction-panel__btn link-prediction-panel__btn--secondary"
+          >
+            {reportListLoading ? "Cargando..." : "Refrescar"}
+          </button>
+        </div>
+
+        {reportListError && (
+          <div className="link-prediction-panel__error">{reportListError}</div>
+        )}
+
+        {!reportListLoading && reportList.length === 0 && (
+          <div className="link-prediction-panel__reports-empty">
+            No hay informes guardados. Usa "Analizar con IA" y luego "Guardar Informe".
+          </div>
+        )}
+
+        {reportList.map((report) => {
+          const meta = report?.metadata && typeof report.metadata === "object" ? report.metadata : null;
+          const algorithmLabel = meta && "algorithm" in meta ? String((meta as any).algorithm || "") : "";
+          const suggestionsCount = meta && "suggestions_count" in meta ? Number((meta as any).suggestions_count) : null;
+          return (
+            <details key={report.id} className="link-prediction-panel__report">
+              <summary className="link-prediction-panel__report-summary">
+                <span className="link-prediction-panel__report-title">
+                  #{report.id} {report.title}
+                </span>
+                <span className="link-prediction-panel__report-meta">
+                  {formatReportDate(report.created_at)}
+                  {algorithmLabel ? ` · ${algorithmLabel}` : ""}
+                  {typeof suggestionsCount === "number" && Number.isFinite(suggestionsCount)
+                    ? ` · ${suggestionsCount} sugerencias`
+                    : ""}
+                </span>
+              </summary>
+
+              <div className="link-prediction-panel__report-body">
+                <div className="link-prediction-panel__report-actions">
+                  <button
+                    className="link-prediction-panel__btn link-prediction-panel__btn--save"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      const content = report.content || "";
+                      const blob = new Blob([content], { type: "text/markdown" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = `link-prediction-report-${report.id}.md`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                  >
+                    Descargar .md
+                  </button>
+                </div>
+
+                <div className="link-prediction-panel__report-content">
+                  {report.content}
+                </div>
+
+                {meta && (
+                  <div className="link-prediction-panel__report-meta-box">
+                    <strong>Metadata</strong>
+                    <pre>{JSON.stringify(meta, null, 2)}</pre>
+                  </div>
+                )}
+              </div>
+            </details>
+          );
+        })}
+      </div>
 
       {/* Deduplication Modal */}
       {showDedupModal && (
@@ -907,6 +1042,83 @@ export function LinkPredictionPanel({
         .link-prediction-panel__evidence-tip strong {
           color: #7c3aed;
         }
+        .link-prediction-panel__reports {
+          margin-top: 1.25rem;
+          padding: 0.75rem;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 0.75rem;
+        }
+        .link-prediction-panel__reports-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 0.5rem;
+          margin-bottom: 0.75rem;
+        }
+        .link-prediction-panel__reports-header h4 {
+          margin: 0;
+          font-size: 0.95rem;
+          color: #334155;
+        }
+        .link-prediction-panel__reports-empty {
+          font-size: 0.85rem;
+          color: #64748b;
+        }
+        .link-prediction-panel__report {
+          background: white;
+          border: 1px solid #e2e8f0;
+          border-radius: 0.75rem;
+          padding: 0.5rem 0.75rem;
+          margin-bottom: 0.75rem;
+        }
+        .link-prediction-panel__report-summary {
+          cursor: pointer;
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+        }
+        .link-prediction-panel__report-title {
+          font-weight: 700;
+          color: #0f172a;
+        }
+        .link-prediction-panel__report-meta {
+          font-size: 0.8rem;
+          color: #64748b;
+        }
+        .link-prediction-panel__report-body {
+          margin-top: 0.75rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+        .link-prediction-panel__report-actions {
+          display: flex;
+          gap: 0.5rem;
+          justify-content: flex-end;
+        }
+        .link-prediction-panel__report-content {
+          white-space: pre-wrap;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 0.5rem;
+          padding: 0.75rem;
+          font-size: 0.85rem;
+          color: #1f2937;
+        }
+        .link-prediction-panel__report-meta-box {
+          background: #fff;
+          border: 1px dashed #cbd5f5;
+          border-radius: 0.5rem;
+          padding: 0.5rem 0.75rem;
+          font-size: 0.8rem;
+          color: #475569;
+        }
+        .link-prediction-panel__report-meta-box pre {
+          white-space: pre-wrap;
+          margin: 0.35rem 0 0;
+          font-size: 0.75rem;
+        }
       `}</style>
       
       {/* Bandeja de validación de predicciones guardadas */}
@@ -916,6 +1128,8 @@ export function LinkPredictionPanel({
           // Las relaciones validadas se sincronizan a Neo4j automáticamente
         }} 
       />
+
+      <AxialAiReviewPanel project={project} />
     </div>
   );
 }

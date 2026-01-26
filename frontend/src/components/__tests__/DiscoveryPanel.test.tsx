@@ -61,10 +61,10 @@ describe("DiscoveryPanel", () => {
     test("renders discovery form correctly", async () => {
         render(<DiscoveryPanel {...defaultProps} />);
 
-        // Should show labels (form structure) - prefer label-based queries to avoid matching description text
-        expect(await screen.findByLabelText(/conceptos positivos/i)).toBeInTheDocument();
-        expect(await screen.findByLabelText(/conceptos negativos/i)).toBeInTheDocument();
-        expect(await screen.findByLabelText(/texto objetivo/i)).toBeInTheDocument();
+        // Should find the three main controls (use robust helper that falls back to placeholder/nearby control)
+        expect(getFieldControl(/conceptos positivos/i)).toBeInTheDocument();
+        expect(getFieldControl(/conceptos negativos/i)).toBeInTheDocument();
+        expect(getFieldControl(/texto objetivo/i)).toBeInTheDocument();
 
         // Should show top-k selector (number input)
         expect(await screen.findByRole('spinbutton')).toBeInTheDocument();

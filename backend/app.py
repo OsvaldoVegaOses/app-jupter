@@ -256,16 +256,6 @@ class CypherRequest(BaseModel):
     )
 
 
-class GDSRequest(BaseModel):
-    algorithm: str = Field(..., pattern="^(louvain|pagerank|betweenness)$")
-    persist: bool = False
-
-    formats: Optional[List[str]] = Field(
-        default=None,
-        description="Lista de formatos a devolver (raw, table, graph, all).",
-    )
-
-
 class MaintenanceDeleteFileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -290,6 +280,10 @@ class AnalyzeHiddenRelationshipsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project: str = Field(default="default", description="ID del proyecto")
     suggestions: List[Dict[str, Any]] = Field(..., description="Relaciones ocultas sugeridas")
+    persist: bool = Field(
+        default=True,
+        description="Si True, persiste el análisis como artefacto auditable (axial_ai_analyses).",
+    )
 
 
 class HiddenRelationshipsMetricsRequest(BaseModel):
@@ -618,34 +612,165 @@ async def api_analyze_hidden_relationships(
 
     clients = build_service_clients(settings)
     try:
-        suggestions_text = []
-        for i, sug in enumerate(payload.suggestions[:10], 1):
+        # Multi-tenant: resolver project_id canónico + validar acceso.
+        try:
+            project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Epistemic mode → prompts versionados (audit trail)
+        from app.postgres_block import get_project_epistemic_mode
+        from app.prompts.loader import get_system_prompt
+
+        epistemic_mode = get_project_epistemic_mode(clients.postgres, project_id)
+        system_prompt, prompt_version = get_system_prompt(epistemic_mode, "axial_coding")
+
+        api_logger.info(
+            "api.analyze_hidden_relationships.start",
+            project=project_id,
+            epistemic_mode=epistemic_mode.value,
+            prompt_version=prompt_version,
+            suggestions_count=len(payload.suggestions or []),
+        )
+
+        MAX_SUGGESTIONS = 10
+        POS_TOTAL = 24
+        NEG_TOTAL = 12
+        EXCERPT_CHARS = 240
+        POS_IN_PROMPT = 3
+        NEG_IN_PROMPT = 2
+
+        suggestions_for_prompt = payload.suggestions[:MAX_SUGGESTIONS]
+
+        # Evidence pack (positivo/negativo) para grounding + auditoria reproducible.
+        from datetime import datetime, timezone
+
+        evidence_pack: Dict[str, Any]
+        try:
+            from app.axial_evidence import build_link_prediction_evidence_pack
+
+            evidence_pack = build_link_prediction_evidence_pack(
+                clients,
+                settings,
+                project_id=project_id,
+                suggestions=suggestions_for_prompt,
+                positive_total=POS_TOTAL,
+                negative_total=NEG_TOTAL,
+                excerpt_chars=EXCERPT_CHARS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            api_logger.warning(
+                "api.analyze_hidden_relationships.evidence_failed",
+                project=project_id,
+                error=str(exc)[:200],
+            )
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            evidence_pack = {
+                "schema_version": 1,
+                "generated_at": now,
+                "limits": {
+                    "positive_total": POS_TOTAL,
+                    "negative_total": NEG_TOTAL,
+                    "excerpt_chars": EXCERPT_CHARS,
+                },
+                "suggestions": [],
+                "totals": {"positive": 0, "negative": 0, "by_method": {}},
+                "notes": {"reason": "build_failed"},
+            }
+
+        evidence_by_id: Dict[int, Dict[str, Any]] = {}
+        try:
+            if isinstance(evidence_pack, dict) and isinstance(evidence_pack.get("suggestions"), list):
+                for item in evidence_pack["suggestions"]:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        sid = int(item.get("id") or 0)
+                    except Exception:
+                        continue
+                    if sid > 0:
+                        evidence_by_id[sid] = item
+        except Exception:
+            evidence_by_id = {}
+
+        def _one_line(value: Any) -> str:
+            return str(value or "").replace("\r", " ").replace("\n", " ").strip()
+
+        # Preparar contexto de sugerencias (+ evidencia resumida) para el prompt.
+        suggestions_text: List[str] = []
+        for i, sug in enumerate(suggestions_for_prompt, 1):
             source = sug.get("source", "?")
             target = sug.get("target", "?")
             score = sug.get("score", 0)
-            reason = sug.get("reason", "")
-            evidence = sug.get("evidence_ids") or []
-            evid_txt = f" evidencias={len(evidence)}" if isinstance(evidence, list) else ""
-            suggestions_text.append(
-                f"{i}. {source} ↔ {target} (score: {score:.3f}) {reason}{evid_txt}".strip()
-            )
+            reason = _one_line(sug.get("reason", ""))
+            try:
+                score_f = float(score or 0.0)
+            except Exception:
+                score_f = 0.0
 
-        prompt = f"""Analiza las siguientes relaciones ocultas detectadas en un grafo de análisis cualitativo (Teoría Fundamentada).
+            block_lines = [f"{i}. {source} ↔ {target} (score: {score_f:.3f})"]
+            if reason:
+                block_lines.append(f"   RAZON: {reason}")
 
-Sugerencias de relaciones ocultas (IDs 1..{min(len(payload.suggestions), 10)}):
-{chr(10).join(suggestions_text)}
+            ev = evidence_by_id.get(i) or {}
+            pos_items = ev.get("positive") if isinstance(ev.get("positive"), list) else []
+            neg_items = ev.get("negative") if isinstance(ev.get("negative"), list) else []
 
-Contexto: estas relaciones son hipótesis y requieren validación humana con evidencia.
+            if pos_items:
+                block_lines.append("   EVIDENCIA_POSITIVA:")
+                for e in pos_items[:POS_IN_PROMPT]:
+                    if not isinstance(e, dict):
+                        continue
+                    fid = _one_line(e.get("fragmento_id"))
+                    archivo = _one_line(e.get("archivo"))
+                    par_idx = e.get("par_idx")
+                    frag = _one_line(e.get("fragmento"))
+                    method = _one_line(e.get("method"))
+                    block_lines.append(
+                        f"   - [{fid}] {archivo}:{par_idx} \"{frag}\" ({method})".strip()
+                    )
+            if neg_items:
+                block_lines.append("   EVIDENCIA_NEGATIVA (tension):")
+                for e in neg_items[:NEG_IN_PROMPT]:
+                    if not isinstance(e, dict):
+                        continue
+                    fid = _one_line(e.get("fragmento_id"))
+                    archivo = _one_line(e.get("archivo"))
+                    par_idx = e.get("par_idx")
+                    frag = _one_line(e.get("fragmento"))
+                    method = _one_line(e.get("method"))
+                    ps = e.get("present_source")
+                    pt = e.get("present_target")
+                    present = ""
+                    if ps is not None or pt is not None:
+                        present = f" present(source={int(bool(ps))},target={int(bool(pt))})"
+                    block_lines.append(
+                        f"   - [{fid}] {archivo}:{par_idx}{present} \"{frag}\" ({method})".strip()
+                    )
 
-IMPORTANTE: Responde ÚNICAMENTE con un JSON válido (sin markdown, sin ```).
-La síntesis debe distinguir explícitamente el estatus epistemológico de cada afirmación.
+            suggestions_text.append("\n".join(block_lines))
+
+        suggestions_block = "\n\n".join(suggestions_text)
+
+        prompt = f"""Analiza las siguientes relaciones ocultas detectadas en un grafo de analisis cualitativo (Teoria Fundamentada).
+
+Para cada sugerencia se incluye evidencia en fragmentos (EVIDENCIA_POSITIVA / EVIDENCIA_NEGATIVA).
+Cita la evidencia usando los `fragmento_id` proporcionados. No inventes IDs.
+
+Sugerencias de relaciones ocultas (IDs 1..{len(suggestions_for_prompt)}):
+{suggestions_block}
+
+Contexto: estas relaciones son hipotesis y requieren validacion humana con evidencia.
+
+IMPORTANTE: Responde UNICAMENTE con un JSON valido (sin markdown, sin ```).
+La sintesis debe distinguir explicitamente el estatus epistemologico de cada afirmacion.
 El JSON debe tener esta estructura exacta:
 
 {{
     "memo_sintesis": [
-        {{"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3]}},
-        {{"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3]}},
-        {{"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2]}},
+        {{"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3], "evidence_fragment_ids": ["123", "456"]}},
+        {{"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3], "evidence_fragment_ids": ["123"]}},
+        {{"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2], "evidence_fragment_ids": ["789"]}},
         {{"type": "NORMATIVE_INFERENCE", "text": "...", "evidence_ids": [4]}}
     ]
 }}
@@ -653,15 +778,16 @@ El JSON debe tener esta estructura exacta:
 REGLAS:
 1. memo_sintesis: lista de 3-6 statements.
 2. type: uno de OBSERVATION | INTERPRETATION | HYPOTHESIS | NORMATIVE_INFERENCE.
-3. text: una oración clara (español).
-4. evidence_ids: lista de enteros referidos a la numeración de las sugerencias (1..10).
-5. PROHIBIDO: OBSERVATION sin evidence_ids no vacíos.
-6. Sé conciso: evita listas largas o párrafos extensos."""
+3. text: una oracion clara (espanol).
+4. evidence_ids: lista de enteros referidos a la numeracion de las sugerencias (1..{len(suggestions_for_prompt)}).
+5. evidence_fragment_ids: lista de strings `fragmento_id` (de la evidencia provista). No inventes IDs.
+6. PROHIBIDO: OBSERVATION sin evidence_fragment_ids no vacios.
+7. Se conciso: evita listas largas o parrafos extensos."""
 
         response = clients.aoai.chat.completions.create(
             model=settings.azure.deployment_chat,
             messages=[
-                {"role": "system", "content": "Eres un experto en análisis cualitativo y Teoría Fundamentada."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             max_completion_tokens=600,
@@ -708,12 +834,28 @@ REGLAS:
                             evidence_ids.append(int(v))
                         except Exception:
                             continue
-                if stype == "OBSERVATION" and not evidence_ids:
+                evidence_fragment_ids: List[str] = []
+                raw_frag_ids = item.get("evidence_fragment_ids")
+                if isinstance(raw_frag_ids, list):
+                    for v in raw_frag_ids:
+                        fid = str(v or "").strip()
+                        if fid:
+                            evidence_fragment_ids.append(fid)
+                # Guardrail: OBSERVATION requiere evidencia en fragmentos.
+                if stype == "OBSERVATION" and not evidence_fragment_ids:
                     stype = "INTERPRETATION"
                 entry: Dict[str, Any] = {"type": stype, "text": text}
                 if evidence_ids:
                     entry["evidence_ids"] = evidence_ids
-                    lines.append(f"[{stype}] {text} (evid: {', '.join(str(i) for i in evidence_ids)})")
+                if evidence_fragment_ids:
+                    entry["evidence_fragment_ids"] = evidence_fragment_ids
+
+                if evidence_fragment_ids:
+                    preview = ", ".join(evidence_fragment_ids[:6])
+                    suffix = "…" if len(evidence_fragment_ids) > 6 else ""
+                    lines.append(f"[{stype}] {text} (frags: {preview}{suffix})")
+                elif evidence_ids:
+                    lines.append(f"[{stype}] {text} (links: {', '.join(str(i) for i in evidence_ids)})")
                 else:
                     lines.append(f"[{stype}] {text}")
                 out.append(entry)
@@ -728,11 +870,49 @@ REGLAS:
             structured = False
             memo_statements = []
 
+        analysis_id = 0
+        persisted = False
+        evidence_schema_version = (
+            int(evidence_pack.get("schema_version", 1) or 1) if isinstance(evidence_pack, dict) else 1
+        )
+        if payload.persist:
+            from app.postgres_block import insert_axial_ai_analysis
+
+            analysis_id = insert_axial_ai_analysis(
+                clients.postgres,
+                project_id=project_id,
+                source_type="analyze_hidden_relationships",
+                algorithm="hidden_relationships",
+                algorithm_description="Relaciones ocultas (descubrimiento): evidencia positiva/negativa",
+                suggestions_json=payload.suggestions[:10],
+                analysis_text=analysis,
+                memo_statements=memo_statements,
+                structured=structured,
+                estado="pendiente",
+                created_by=user.user_id,
+                epistemic_mode=epistemic_mode.value,
+                prompt_version=prompt_version,
+                llm_deployment=settings.azure.deployment_chat,
+                llm_api_version=settings.azure.api_version,
+                evidence_schema_version=evidence_schema_version,
+                evidence_json=evidence_pack if isinstance(evidence_pack, dict) else None,
+            )
+            persisted = bool(analysis_id)
+
         return {
+            "project": project_id,
             "analysis": analysis,
             "structured": structured,
             "memo_statements": memo_statements,
             "suggestions_analyzed": len(payload.suggestions[:10]),
+            "epistemic_mode": epistemic_mode.value,
+            "prompt_version": prompt_version,
+            "llm_deployment": settings.azure.deployment_chat,
+            "llm_api_version": settings.azure.api_version,
+            "analysis_id": analysis_id,
+            "persisted": persisted,
+            "evidence_schema_version": evidence_schema_version,
+            "evidence_totals": evidence_pack.get("totals") if isinstance(evidence_pack, dict) else None,
         }
     except Exception as exc:
         api_logger.error("api.analyze_hidden_relationships.error", error=str(exc))
@@ -1643,6 +1823,15 @@ async def api_delete_project(
                     results["deleted"][dir_name] = "not_found"
             except Exception as e:
                 results["deleted"][f"{dir_name}_error"] = str(e)
+
+        # 7b. Delete tenant-scoped Blob artifacts (reports container).
+        try:
+            from app.blob_storage import CONTAINER_REPORTS, delete_prefix, tenant_prefix
+
+            blob_prefix = tenant_prefix(org_id=str(getattr(user, "organization_id", None) or ""), project_id=project_id).rstrip("/") + "/"
+            results["deleted"]["blob_reports"] = delete_prefix(container=CONTAINER_REPORTS, prefix=blob_prefix)
+        except Exception as e:
+            results["deleted"]["blob_reports_error"] = str(e)
         
         # 8. Backups locales: deshabilitado en modo cloud-only
         
@@ -2432,41 +2621,60 @@ async def api_transcribe(
             "saved_path": None,
         }
         
-        # PASO 1: SIEMPRE guardar en carpeta del proyecto con nombre descriptivo
-        # Esto asegura que nunca tengamos archivos temporales referenciados
+        # PASO 1: Guardar DOCX a temp, subir a Blob Storage tenant-scoped, y establecer saved_path al URL del blob
         from datetime import datetime
-        
-        # Estructura unificada: data/projects/{project_id}/audio/transcriptions/
-        project_audio_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        project_audio_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Nombre basado en archivo de audio original + timestamp
-        base_name = Path(payload.filename).stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved_filename = f"{base_name}_{timestamp}.docx"
-        saved_path = project_audio_dir / saved_filename
-        
-        save_transcription_docx(result, saved_path)
-        response_data["saved_path"] = str(saved_path)
-        
+        import tempfile
+        from hashlib import sha256
+        from app.blob_storage import upload_local_path, logical_path_to_blob_name, CONTAINER_INTERVIEWS, CONTAINER_AUDIO
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpdoc:
+            tmp_doc_path = Path(tmpdoc.name)
+        save_transcription_docx(result, tmp_doc_path)
+
+        # Logical path under tenant/project
+        logical = f"interviews/{project_id}/audio/transcriptions/{tmp_doc_path.name}"
+        try:
+            docx_blob_name = logical_path_to_blob_name(org_id=(getattr(user, "organization_id", None) or None), project_id=project_id, logical_path=logical)
+        except ValueError as exc:
+            # Tenant guard: do not allow legacy local-style blobs in strict mode.
+            msg = str(exc or "")
+            if "org_id is required" in msg or "org_id is required" in msg.lower():
+                log.warning("api.transcribe.missing_org", project=project_id, filename=tmp_doc_path.name)
+                raise HTTPException(status_code=409, detail="Organization-scoped storage required") from exc
+            # propagate other validation errors
+            raise
+        except Exception:
+            # Fallback for unexpected errors: keep legacy behavior
+            docx_blob_name = f"{project_id}/{tmp_doc_path.name}"
+
+        docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_doc_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        # compute hash for docx
+        hdoc = sha256()
+        with open(tmp_doc_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hdoc.update(chunk)
+        docx_hash = hdoc.hexdigest()
+
+        response_data["saved_path"] = docx_url
+        response_data["docx_blob"] = {"container": CONTAINER_INTERVIEWS, "name": docx_blob_name, "url": docx_url, "sha256": docx_hash}
+
         log.info(
             "api.transcribe.saved",
-            path=str(saved_path),
+            path=docx_url,
             project=project_id,
-            filename=saved_filename,
+            filename=tmp_doc_path.name,
         )
 
-        # PASO 2: Ingestar al pipeline si se solicita (usando el archivo guardado)
+        # PASO 2: Ingestar al pipeline si se solicita (usando el archivo temp local)
         if payload.ingest:
             from app.ingestion import ingest_documents
-            
+
             clients = build_clients_or_error(settings)
             try:
-                # Usar el archivo guardado con nombre descriptivo
                 ingest_result = ingest_documents(
                     clients,
                     settings,
-                    files=[saved_path],
+                    files=[str(tmp_doc_path)],
                     batch_size=20,
                     min_chars=payload.min_chars,
                     max_chars=payload.max_chars,
@@ -2478,11 +2686,16 @@ async def api_transcribe(
                 log.info(
                     "api.transcribe.ingested",
                     fragments=response_data["fragments_ingested"],
-                    docx_path=str(saved_path),
+                    docx_path=docx_url,
                     project=project_id,
                 )
             finally:
                 clients.close()
+        # Clean up local temp
+        try:
+            tmp_doc_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         
         return response_data
         
@@ -2569,6 +2782,7 @@ async def api_transcribe_stream(
     
     # Encolar tarea con incremental=True
     task = cast(Any, task_transcribe_audio).delay(
+        org_id=getattr(user, "organization_id", None),
         audio_base64=payload.audio_base64,
         filename=payload.filename,
         project_id=project_id,
@@ -2632,6 +2846,7 @@ async def api_transcribe_batch(
     jobs = []
     for file_item in payload.files:
         task = cast(Any, task_transcribe_audio).delay(
+            org_id=getattr(user, "organization_id", None),
             audio_base64=file_item.audio_base64,
             filename=file_item.filename,
             project_id=project_id,
@@ -2877,14 +3092,36 @@ async def api_transcribe_merge(
         
         doc.save(str(tmp_path))
         
-        # También guardar en carpeta del proyecto (estructura unificada)
-        project_audio_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        project_audio_dir.mkdir(parents=True, exist_ok=True)
+        # Upload combined DOCX to Blob Storage tenant-scoped instead of saving locally
+        import tempfile
+        from hashlib import sha256
+        from app.blob_storage import upload_local_path, logical_path_to_blob_name, CONTAINER_INTERVIEWS
+
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        doc.save(str(tmp_path))
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        permanent_path = project_audio_dir / f"combined_{timestamp}.docx"
-        doc.save(str(permanent_path))
-        
-        log.info("api.transcribe_merge.saved", path=str(permanent_path))
+        logical = f"interviews/{project_id}/audio/transcriptions/combined_{timestamp}.docx"
+        try:
+            blob_name = logical_path_to_blob_name(org_id=str(getattr(user, "organization_id", None) or ""), project_id=project_id, logical_path=logical)
+        except Exception:
+            blob_name = f"{project_id}/combined_{timestamp}.docx"
+
+        blob_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=blob_name, file_path=str(tmp_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        # compute sha256
+        h = sha256()
+        with open(tmp_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        doc_hash = h.hexdigest()
+
+        log.info("api.transcribe_merge.saved_blob", blob=blob_name, url=blob_url)
+        # Clean temp
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         
         # Leer como base64
         with open(tmp_path, "rb") as f:
@@ -3363,8 +3600,8 @@ async def api_download_note(
     rel: str = Query(..., description="Ruta relativa bajo notes/<project>/"),
     clients: ServiceClients = Depends(get_service_clients),
     user: User = Depends(require_auth),
-) -> FileResponse:
-    """Descarga segura de un memo dentro de notes/<project>/ (previene path traversal)."""
+) -> Response:
+    """Descarga segura de un memo dentro de notes/<project>/ (Blob Storage, multi-tenant)."""
     try:
         project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
     except ValueError as exc:
@@ -3373,16 +3610,35 @@ async def api_download_note(
     if not rel or not rel.strip():
         raise HTTPException(status_code=400, detail="Missing required query param: rel")
 
-    base_dir = (Path("notes") / project_id).resolve()
     rel_norm = rel.replace("\\", "/").lstrip("/")
-    target = (base_dir / rel_norm).resolve()
-    if base_dir not in target.parents and target != base_dir:
+    target_rel = Path(rel_norm)
+    if target_rel.is_absolute() or ".." in target_rel.parts:
         raise HTTPException(status_code=400, detail="Invalid rel path")
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="Memo not found")
 
-    media_type = "text/markdown" if target.suffix.lower() in {".md", ".markdown"} else "text/plain"
-    return FileResponse(path=str(target), media_type=media_type, filename=target.name)
+    logical_path = f"notes/{project_id}/{rel_norm}"
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, download_file, logical_path_to_blob_name
+
+        blob_name = logical_path_to_blob_name(
+            org_id=str(getattr(user, "organization_id", None) or ""),
+            project_id=project_id,
+            logical_path=logical_path,
+        )
+        data = download_file(CONTAINER_REPORTS, blob_name)
+    except Exception:
+        # Backward-compat: fallback to local filesystem if present.
+        base_dir = (Path("notes") / project_id).resolve()
+        target = (base_dir / rel_norm).resolve()
+        if base_dir not in target.parents and target != base_dir:
+            raise HTTPException(status_code=400, detail="Invalid rel path")
+        if not target.exists() or not target.is_file():
+            raise HTTPException(status_code=404, detail="Memo not found")
+        data = target.read_bytes()
+
+    suffix = target_rel.suffix.lower()
+    media_type = "text/markdown" if suffix in {".md", ".markdown"} else "text/plain"
+    headers = {"Content-Disposition": f'attachment; filename="{target_rel.name}"'}
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 @app.post("/api/codes/candidates")
@@ -4855,12 +5111,18 @@ async def api_save_link_predictions(
     for i, suggestion in enumerate(payload.suggestions):
         source = suggestion.get("source", "")
         target = suggestion.get("target", "")
-        score = suggestion.get("score", 0.0)
+        raw_score = suggestion.get("score", 0.0)
         algorithm = suggestion.get("algorithm", "common_neighbors")
         reason = suggestion.get("reason", "")
         
         if not source or not target:
             continue
+
+        try:
+            score = float(raw_score)
+        except Exception:
+            score = 0.0
+        score = max(score, 0.0)
             
         predictions.append({
             "project_id": project_id,
@@ -4868,7 +5130,7 @@ async def api_save_link_predictions(
             "target_code": target,
             "relation_type": "asociado_con",
             "algorithm": algorithm,
-            "score": min(max(score, 0.0), 1.0),
+            "score": score,
             "rank": i + 1,
             "memo": reason if reason else f"Sugerido por {algorithm}",
         })
@@ -5077,6 +5339,121 @@ async def api_batch_update_link_predictions(
         "estado": payload.estado,
         "neo4j_synced": neo4j_synced,
     }
+
+
+# =============================================================================
+# SYNC - Sincronización PostgreSQL → Neo4j (códigos abiertos)
+# =============================================================================
+
+class SyncNeo4jRequest(BaseModel):
+    """Request para sincronizar códigos PostgreSQL → Neo4j."""
+    model_config = ConfigDict(extra="forbid")
+    project: str = Field(..., description="Proyecto a sincronizar")
+
+
+@app.post("/api/sync/neo4j")
+async def api_sync_postgres_to_neo4j(
+    payload: SyncNeo4jRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """
+    Sincroniza códigos abiertos desde PostgreSQL a Neo4j.
+    
+    Crea nodos :Codigo y relaciones :TIENE_CODIGO para todos los códigos
+    que existen en PostgreSQL pero no en Neo4j.
+    """
+    try:
+        project_id = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    clients = build_clients_or_error(settings)
+    try:
+        # 1. Obtener códigos únicos de PostgreSQL con fragmento_id válido
+        with clients.postgres.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT codigo, fragmento_id, archivo 
+                FROM analisis_codigos_abiertos 
+                WHERE project_id = %s AND fragmento_id IS NOT NULL
+            """, (project_id,))
+            pg_codes = cur.fetchall()
+
+        if not clients.neo4j:
+            return {"success": False, "error": "Neo4j no está configurado"}
+
+        db = settings.neo4j.database
+
+        # 2. Obtener códigos existentes en Neo4j
+        with clients.neo4j.session(database=db) as session:
+            result = session.run(
+                "MATCH (c:Codigo {project_id: $pid}) RETURN c.nombre AS name",
+                pid=project_id
+            )
+            neo4j_codes = {r["name"] for r in result}
+
+        neo4j_codes_before = len(neo4j_codes)
+        synced_codes = 0
+        synced_rels = 0
+        missing_fragments = 0
+
+        # 3. Sincronizar códigos y relaciones
+        with clients.neo4j.session(database=db) as session:
+            for row in pg_codes:
+                codigo, frag_id, archivo = row
+                
+                # Crear código si no existe
+                if codigo not in neo4j_codes:
+                    session.run(
+                        """
+                        MERGE (c:Codigo {nombre: $codigo, project_id: $project_id})
+                        SET c.status = 'active', c.synced_at = datetime()
+                        """,
+                        codigo=codigo, project_id=project_id
+                    )
+                    neo4j_codes.add(codigo)
+                    synced_codes += 1
+
+                # Crear relación TIENE_CODIGO
+                result = session.run(
+                    """
+                    MATCH (f:Fragmento {id: $frag_id, project_id: $project_id})
+                    MATCH (c:Codigo {nombre: $codigo, project_id: $project_id})
+                    MERGE (f)-[rel:TIENE_CODIGO]->(c)
+                    SET rel.archivo = $archivo, 
+                        rel.project_id = $project_id, 
+                        rel.synced_at = datetime()
+                    RETURN count(rel) as cnt
+                    """,
+                    frag_id=frag_id, codigo=codigo, archivo=archivo, project_id=project_id
+                )
+                cnt = result.single()
+                if cnt and cnt["cnt"] > 0:
+                    synced_rels += 1
+                else:
+                    missing_fragments += 1
+
+        log.info(
+            "sync.neo4j.success",
+            project_id=project_id,
+            synced_codes=synced_codes,
+            synced_rels=synced_rels,
+            missing_fragments=missing_fragments,
+        )
+
+        return {
+            "success": True,
+            "pg_codes_total": len(pg_codes),
+            "neo4j_codes_before": neo4j_codes_before,
+            "synced_codes": synced_codes,
+            "synced_relations": synced_rels,
+            "missing_fragments": missing_fragments,
+        }
+    except Exception as exc:
+        log.error("sync.neo4j.error", error=str(exc), project=payload.project)
+        raise HTTPException(status_code=500, detail=f"Error en sincronización: {exc}") from exc
+    finally:
+        clients.close()
 
 
 # =============================================================================
@@ -6599,40 +6976,6 @@ async def api_analyze_persist(
         clients.close()
 
 
-@app.post("/api/axial/gds")
-async def api_run_gds_analysis(
-    payload: GDSRequest,
-    settings: AppSettings = Depends(get_settings),
-    user: User = Depends(require_auth),
-) -> List[Dict[str, Any]]:
-    clients = build_neo4j_only(settings)
-    try:
-        results = run_gds_analysis(
-            cast(ServiceClients, clients),
-            settings,
-            payload.algorithm,
-            persist=payload.persist,
-        )
-        return results
-    except AxialNotReadyError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "axial_not_ready",
-                "project_id": exc.project_id,
-                "blocking_reasons": exc.blocking_reasons,
-                "message": str(exc),
-            },
-        ) from exc
-    except AxialError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        api_logger.error("api.gds.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        clients.close()
-
-
 @app.post("/api/coding/suggestions")
 async def api_coding_suggestions(
     payload: CodeSuggestionRequest,
@@ -6780,13 +7123,13 @@ class GraphRAGSaveRequest(BaseModel):
 @app.post("/api/graphrag/save_report")
 async def api_save_report(
     payload: GraphRAGSaveRequest,
+    clients: ServiceClients = Depends(get_service_clients),
     user: User = Depends(require_auth),
 ) -> Dict[str, str]:
-    """Guarda el reporte de GraphRAG como archivo Markdown."""
+    """Guarda el reporte de GraphRAG como artefacto (Blob Storage, multi-tenant)."""
     try:
-        # Create directory
-        base_dir = Path("reports") / payload.project
-        base_dir.mkdir(parents=True, exist_ok=True)
+        # Multi-tenant: resolver project_id canónico + validar acceso.
+        project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
         
         # Generate filename
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -6794,13 +7137,13 @@ async def api_save_report(
         # Safe slug from query (first 30 chars, alphanumeric only)
         safe_query = "".join(c if c.isalnum() else "_" for c in payload.query[:30]).strip("_")
         filename = f"{timestamp}_{safe_query}.md"
-        file_path = base_dir / filename
+        logical_path = f"reports/{project_id}/{filename}"
         
         # Format Content
         lines = [
             f"# Reporte de Investigación: {payload.query}",
             f"**Fecha:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"**Proyecto:** {payload.project}",
+            f"**Proyecto:** {project_id}",
             "\n## Respuesta",
             payload.answer,
             "\n## Contexto del Grafo",
@@ -6814,12 +7157,32 @@ async def api_save_report(
             lines.append(f"\n### Fragmento {idx+1} ({source})")
             lines.append(f"> {text}")
             
-        # Write file
-        file_path.write_text("\n".join(lines), encoding="utf-8")
+        content = "\n".join(lines)
+
+        # Persist to Blob Storage (reports container, tenant-scoped prefix).
+        try:
+            from app.blob_storage import CONTAINER_REPORTS, logical_path_to_blob_name, upload_text
+
+            blob_name = logical_path_to_blob_name(
+                org_id=str(getattr(user, "organization_id", None) or ""),
+                project_id=project_id,
+                logical_path=logical_path,
+            )
+            blob_url = upload_text(
+                container=CONTAINER_REPORTS,
+                blob_name=blob_name,
+                text=content,
+                content_type="text/markdown; charset=utf-8",
+            )
+        except Exception as exc:
+            api_logger.error("report.save.blob_failed", error=str(exc)[:200], project=project_id)
+            raise HTTPException(status_code=503, detail="Blob Storage no disponible") from exc
+
+        api_logger.info("report.saved", path=logical_path, blob=blob_name)
+        return {"status": "ok", "path": logical_path, "filename": filename, "blob_url": blob_url}
         
-        api_logger.info("report.saved", path=str(file_path))
-        return {"status": "ok", "path": str(file_path), "filename": filename}
-        
+    except HTTPException:
+        raise
     except Exception as exc:
         api_logger.error("report.save.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -6855,11 +7218,11 @@ def _assert_doctoral_task_access(*, task_id: str, task: Dict[str, Any], user: Us
         raise HTTPException(status_code=403, detail="Forbidden: task belongs to another user")
 
 
-def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, settings: AppSettings) -> None:
+def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, settings: AppSettings, org_id: str) -> None:
     """Background worker for stage report generation."""
     from app.stage_reports import generate_stage3_report, generate_stage4_report
     from app.postgres_block import save_doctoral_report, update_report_job
-    from app.blob_storage import CONTAINER_REPORTS, upload_local_path
+    from app.blob_storage import CONTAINER_REPORTS, logical_path_to_blob_name, upload_text
 
     clients = build_clients_or_error(settings)
     try:
@@ -6876,9 +7239,9 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             pass
 
         if payload.stage == "stage3":
-            result = generate_stage3_report(clients, settings, payload.project)
+            result = generate_stage3_report(clients, settings, payload.project, org_id=org_id)
         elif payload.stage == "stage4":
-            result = generate_stage4_report(clients, settings, payload.project)
+            result = generate_stage4_report(clients, settings, payload.project, org_id=org_id)
         else:
             update_report_job(
                 clients.postgres,
@@ -6890,22 +7253,15 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             )
             return
 
-        base_dir = Path("reports") / payload.project / "doctoral"
-        base_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         filename = f"{timestamp}_doctoral_{payload.stage}.md"
-        file_path = base_dir / filename
-        file_path.write_text(result.get("content") or "", encoding="utf-8")
+        logical_path = f"reports/{payload.project}/doctoral/{filename}"
+        content = result.get("content") or ""
 
         blob_url: Optional[str] = None
         try:
-            blob_name = f"{payload.project}/doctoral/{filename}"
-            blob_url = upload_local_path(
-                container=CONTAINER_REPORTS,
-                blob_name=blob_name,
-                file_path=str(file_path),
-                content_type="text/markdown",
-            )
+            blob_name = logical_path_to_blob_name(org_id=org_id, project_id=payload.project, logical_path=logical_path)
+            blob_url = upload_text(container=CONTAINER_REPORTS, blob_name=blob_name, text=content, content_type="text/markdown; charset=utf-8")
         except Exception as exc:
             api_logger.warning("stage_reports.report.blob_upload_failed", error=str(exc)[:200], task_id=task_id)
 
@@ -6914,19 +7270,20 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             clients.postgres,
             project=payload.project,
             stage=payload.stage,
-            content=result.get("content") or "",
+            content=content,
             stats=result.get("stats"),
-            file_path=str(file_path),
+            file_path=logical_path,
         )
 
         final_result = {
             **(result or {}),
             "stage": payload.stage,
             "project": payload.project,
-            "path": str(file_path),
+            "path": logical_path,
             "filename": filename,
             "report_id": report_id,
             "blob_url": blob_url,
+            "blob_name": blob_name if blob_url else None,
         }
 
         update_report_job(
@@ -6935,7 +7292,7 @@ def _run_doctoral_report_task(*, task_id: str, payload: DoctoralReportRequest, s
             status="completed",
             message="Informe de avance generado",
             result=final_result,
-            result_path=str(file_path),
+            result_path=logical_path,
             finished_at=datetime.now().isoformat(),
         )
     except Exception as exc:
@@ -6980,7 +7337,12 @@ async def api_execute_doctoral_report_job(
     user: User = Depends(require_role(["admin", "analyst"])),
 ) -> Dict[str, Any]:
     """Start an async doctoral report generation job."""
-    task_id = f"doctoral_{payload.project}_{payload.stage}_{uuid.uuid4().hex[:12]}"
+    try:
+        resolved_project = resolve_project(payload.project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    task_id = f"doctoral_{resolved_project}_{payload.stage}_{uuid.uuid4().hex[:12]}"
     auth = {
         "user_id": str(user.user_id),
         "org": str(user.organization_id),
@@ -6992,12 +7354,14 @@ async def api_execute_doctoral_report_job(
 
         clients = build_clients_or_error(settings)
         try:
+            # Multi-tenant: validate project access using the live pg connection.
+            resolved_project = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
             create_report_job(
                 clients.postgres,
                 task_id=task_id,
                 job_type="doctoral",
-                project_id=payload.project,
-                payload=payload.model_dump(),
+                project_id=resolved_project,
+                payload={**payload.model_dump(), "project": resolved_project},
                 auth=auth,
                 message="Inicializando...",
             )
@@ -7006,10 +7370,17 @@ async def api_execute_doctoral_report_job(
     except Exception as exc:
         api_logger.warning("doctoral.report.job_persist_failed", error=str(exc), task_id=task_id)
 
-    api_logger.info("doctoral.report.job_started", task_id=task_id, project=payload.project, stage=payload.stage)
+    api_logger.info("doctoral.report.job_started", task_id=task_id, project=resolved_project, stage=payload.stage)
 
     # FastAPI injects BackgroundTasks, but we keep it typed loosely to avoid extra imports.
-    background_tasks.add_task(_run_doctoral_report_task, task_id=task_id, payload=payload, settings=settings)
+    payload.project = resolved_project
+    background_tasks.add_task(
+        _run_doctoral_report_task,
+        task_id=task_id,
+        payload=payload,
+        settings=settings,
+        org_id=str(user.organization_id),
+    )
     return {"task_id": task_id, "status": "started"}
 
 
@@ -7083,45 +7454,60 @@ async def api_generate_doctoral_report(
     from app.postgres_block import save_doctoral_report
     
     try:
+        project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
         if payload.stage == "stage3":
-            result = generate_stage3_report(clients, settings, payload.project)
+            result = generate_stage3_report(clients, settings, project_id, org_id=str(getattr(user, "organization_id", None) or ""))
         elif payload.stage == "stage4":
-            result = generate_stage4_report(clients, settings, payload.project)
+            result = generate_stage4_report(clients, settings, project_id, org_id=str(getattr(user, "organization_id", None) or ""))
         else:
             raise HTTPException(
                 status_code=400,
                 detail=f"Etapa no válida: {payload.stage}. Use 'stage3' o 'stage4'."
             )
         
-        # Guardar como archivo
-        base_dir = Path("reports") / payload.project / "doctoral"
-        base_dir.mkdir(parents=True, exist_ok=True)
-        
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         filename = f"{timestamp}_doctoral_{payload.stage}.md"
-        file_path = base_dir / filename
-        
-        file_path.write_text(result["content"], encoding="utf-8")
-        
-        result["path"] = str(file_path)
+
+        logical_path = f"reports/{project_id}/doctoral/{filename}"
+        content = result.get("content") or ""
+        blob_url: Optional[str] = None
+        try:
+            from app.blob_storage import CONTAINER_REPORTS, logical_path_to_blob_name, upload_text
+
+            blob_name = logical_path_to_blob_name(
+                org_id=str(getattr(user, "organization_id", None) or ""),
+                project_id=project_id,
+                logical_path=logical_path,
+            )
+            blob_url = upload_text(
+                container=CONTAINER_REPORTS,
+                blob_name=blob_name,
+                text=content,
+                content_type="text/markdown; charset=utf-8",
+            )
+        except Exception as exc:
+            api_logger.warning("stage_reports.report.blob_upload_failed", error=str(exc)[:200])
+
+        result["path"] = logical_path
         result["filename"] = filename
+        result["blob_url"] = blob_url
         
         # Sprint 26: Guardar en base de datos para persistencia
         report_id = save_doctoral_report(
             clients.postgres,
-            project=payload.project,
+            project=project_id,
             stage=payload.stage,
-            content=result["content"],
+            content=content,
             stats=result.get("stats"),
-            file_path=str(file_path),
+            file_path=logical_path,
         )
         result["report_id"] = report_id
         
         api_logger.info(
             "stage_reports.report.generated",
             stage=payload.stage,
-            project=payload.project,
-            path=str(file_path),
+            project=project_id,
+            path=logical_path,
             report_id=report_id
         )
         
@@ -7148,26 +7534,25 @@ class DiscoverySaveMemoRequest(BaseModel):
 @app.post("/api/discovery/save_memo")
 async def api_save_discovery_memo(
     payload: DiscoverySaveMemoRequest,
+    clients: ServiceClients = Depends(get_service_clients),
     user: User = Depends(require_auth),
 ) -> Dict[str, str]:
-    """Guarda los resultados de Discovery como memo Markdown."""
+    """Guarda los resultados de Discovery como memo (Blob Storage, multi-tenant)."""
     try:
-        # Create directory
-        base_dir = Path("notes") / payload.project
-        base_dir.mkdir(parents=True, exist_ok=True)
+        project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
         
         # Generate filename
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         title = payload.memo_title or "_".join(payload.positive_texts[:2])
         safe_title = "".join(c if c.isalnum() else "_" for c in title[:30]).strip("_")
         filename = f"{timestamp}_discovery_{safe_title}.md"
-        file_path = base_dir / filename
+        logical_path = f"notes/{project_id}/{filename}"
         
         # Format Content
         lines = [
             f"# Memo de Exploración: {payload.memo_title or ', '.join(payload.positive_texts)}",
             f"**Fecha:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"**Proyecto:** {payload.project}",
+            f"**Proyecto:** {project_id}",
             "",
             "## Criterios de Búsqueda",
             f"**Conceptos Positivos:** {', '.join(payload.positive_texts)}",
@@ -7195,12 +7580,31 @@ async def api_save_discovery_memo(
         lines.append("\n---")
         lines.append("*Generado automáticamente por Discovery Search*")
             
-        # Write file
-        file_path.write_text("\n".join(lines), encoding="utf-8")
+        content = "\n".join(lines)
+
+        try:
+            from app.blob_storage import CONTAINER_REPORTS, logical_path_to_blob_name, upload_text
+
+            blob_name = logical_path_to_blob_name(
+                org_id=str(getattr(user, "organization_id", None) or ""),
+                project_id=project_id,
+                logical_path=logical_path,
+            )
+            blob_url = upload_text(
+                container=CONTAINER_REPORTS,
+                blob_name=blob_name,
+                text=content,
+                content_type="text/markdown; charset=utf-8",
+            )
+        except Exception as exc:
+            api_logger.error("discovery.memo.save.blob_failed", error=str(exc)[:200], project=project_id)
+            raise HTTPException(status_code=503, detail="Blob Storage no disponible") from exc
+
+        api_logger.info("discovery.memo.saved", path=logical_path, blob=blob_name, has_synthesis=bool(payload.ai_synthesis))
+        return {"status": "ok", "path": logical_path, "filename": filename, "blob_url": blob_url}
         
-        api_logger.info("discovery.memo.saved", path=str(file_path), has_synthesis=bool(payload.ai_synthesis))
-        return {"status": "ok", "path": str(file_path), "filename": filename}
-        
+    except HTTPException:
+        raise
     except Exception as exc:
         api_logger.error("discovery.memo.save.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -7248,95 +7652,16 @@ async def api_discover_search(
         clients.close()
 
 
-@app.get("/api/axial/predict")
-async def api_axial_predict(
-    source_type: str = Query(default="Categoria"),
-    target_type: str = Query(default="Codigo"),
-    algorithm: str = Query(default="common_neighbors"),
-    top_k: int = Query(default=10, ge=1, le=50),
-    project: str = Query(default="default"),
-    categoria: Optional[str] = Query(default=None),
-    settings: AppSettings = Depends(get_settings),
-    user: User = Depends(require_auth),
-) -> Dict[str, Any]:
-    """
-    Predice enlaces faltantes en el grafo axial.
-    
-    Usa algoritmos de link prediction para sugerir relaciones
-    que podrian estar faltando entre categorias y codigos.
-    """
-    from app.link_prediction import suggest_links, suggest_axial_relations
-    
-    clients = build_clients_or_error(settings)
-    try:
-        api_logger.info(
-            "api.predict.start",
-            algorithm=algorithm,
-            source_type=source_type,
-            target_type=target_type,
-        )
-        
-        if categoria:
-            # Sugerencias especificas para una categoria
-            suggestions = suggest_axial_relations(
-                clients, settings,
-                categoria=categoria,
-                project=project,
-                top_k=top_k,
-            )
-        else:
-            # Sugerencias generales
-            suggestions = suggest_links(
-                clients, settings,
-                source_type=source_type,
-                target_type=target_type,
-                algorithm=algorithm,
-                top_k=top_k,
-                project=project,
-            )
-        
-        api_logger.info("api.predict.complete", suggestions=len(suggestions))
-        
-        return {"suggestions": suggestions, "algorithm": algorithm}
-        
-    except Exception as exc:
-        api_logger.error("api.predict.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        clients.close()
-
-
-@app.get("/api/axial/community-links")
-async def api_axial_community_links(
-    project: str = Query(default="default"),
-    settings: AppSettings = Depends(get_settings),
-    user: User = Depends(require_auth),
-) -> Dict[str, Any]:
-    """
-    Detecta enlaces faltantes basandose en comunidades.
-    
-    Nodos en la misma comunidad (Louvain) que no estan conectados
-    son candidatos para nuevas relaciones.
-    """
-    from app.link_prediction import detect_missing_links_by_community
-    
-    clients = build_clients_or_error(settings)
-    try:
-        suggestions = detect_missing_links_by_community(clients, settings, project)
-        return {"suggestions": suggestions, "method": "community_based"}
-    except Exception as exc:
-        api_logger.error("api.community_links.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        clients.close()
-
-
 class AnalyzePredictionsRequest(BaseModel):
     """Request para análisis IA de predicciones de enlaces."""
     model_config = ConfigDict(extra="forbid")
     project: str = Field(default="default", description="ID del proyecto")
     algorithm: str = Field(..., description="Algoritmo usado para la predicción")
     suggestions: List[Dict[str, Any]] = Field(..., description="Sugerencias de enlaces")
+    persist: bool = Field(
+        default=True,
+        description="Si True, persiste el análisis como artefacto auditable (axial_ai_analyses).",
+    )
 
 
 @app.post("/api/axial/analyze-predictions")
@@ -7363,26 +7688,156 @@ async def api_analyze_predictions(
     
     clients = build_service_clients(settings)
     try:
+        # Multi-tenant: resolver project_id canónico + validar acceso.
+        try:
+            project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Epistemic mode → prompts versionados (audit trail)
+        from app.postgres_block import get_project_epistemic_mode
+        from app.prompts.loader import get_system_prompt
+
+        epistemic_mode = get_project_epistemic_mode(clients.postgres, project_id)
+        system_prompt, prompt_version = get_system_prompt(epistemic_mode, "axial_coding")
+
         algorithm_desc = ALGORITHM_DESCRIPTIONS.get(
             payload.algorithm, 
             f"Algoritmo: {payload.algorithm}"
         )
+
+        api_logger.info(
+            "api.analyze_predictions.start",
+            project=project_id,
+            algorithm=payload.algorithm,
+            epistemic_mode=epistemic_mode.value,
+            prompt_version=prompt_version,
+            suggestions_count=len(payload.suggestions or []),
+        )
         
-        # Preparar contexto de sugerencias
-        suggestions_text = []
-        for i, sug in enumerate(payload.suggestions[:10], 1):  # Max 10 para el prompt
+        MAX_SUGGESTIONS = 10
+        POS_TOTAL = 24
+        NEG_TOTAL = 12
+        EXCERPT_CHARS = 240
+        POS_IN_PROMPT = 3
+        NEG_IN_PROMPT = 2
+
+        suggestions_for_prompt = payload.suggestions[:MAX_SUGGESTIONS]
+
+        # AX-AI-03: Evidence pack (positivo/negativo) para grounding + auditoría reproducible.
+        from datetime import datetime, timezone
+        evidence_pack: Dict[str, Any]
+        try:
+            from app.axial_evidence import build_link_prediction_evidence_pack
+
+            evidence_pack = build_link_prediction_evidence_pack(
+                clients,
+                settings,
+                project_id=project_id,
+                suggestions=suggestions_for_prompt,
+                positive_total=POS_TOTAL,
+                negative_total=NEG_TOTAL,
+                excerpt_chars=EXCERPT_CHARS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            api_logger.warning(
+                "api.analyze_predictions.evidence_failed",
+                project=project_id,
+                error=str(exc)[:200],
+            )
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            evidence_pack = {
+                "schema_version": 1,
+                "generated_at": now,
+                "limits": {
+                    "positive_total": POS_TOTAL,
+                    "negative_total": NEG_TOTAL,
+                    "excerpt_chars": EXCERPT_CHARS,
+                },
+                "suggestions": [],
+                "totals": {"positive": 0, "negative": 0, "by_method": {}},
+                "notes": {"reason": "build_failed"},
+            }
+
+        evidence_by_id: Dict[int, Dict[str, Any]] = {}
+        try:
+            if isinstance(evidence_pack, dict) and isinstance(evidence_pack.get("suggestions"), list):
+                for item in evidence_pack["suggestions"]:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        sid = int(item.get("id") or 0)
+                    except Exception:
+                        continue
+                    if sid > 0:
+                        evidence_by_id[sid] = item
+        except Exception:
+            evidence_by_id = {}
+
+        def _one_line(value: Any) -> str:
+            return str(value or "").replace("\r", " ").replace("\n", " ").strip()
+
+        # Preparar contexto de sugerencias (+ evidencia resumida) para el prompt.
+        suggestions_text: List[str] = []
+        for i, sug in enumerate(suggestions_for_prompt, 1):  # Max 10 para el prompt
             source = sug.get("source", "?")
             target = sug.get("target", "?")
             score = sug.get("score", 0)
-            suggestions_text.append(f"{i}. {source} → {target} (score: {score:.3f})")
+            try:
+                score_f = float(score or 0.0)
+            except Exception:
+                score_f = 0.0
+
+            block_lines = [f"{i}. {source} ↔ {target} (score: {score_f:.3f})"]
+            ev = evidence_by_id.get(i) or {}
+            pos_items = ev.get("positive") if isinstance(ev.get("positive"), list) else []
+            neg_items = ev.get("negative") if isinstance(ev.get("negative"), list) else []
+
+            if pos_items:
+                block_lines.append("   EVIDENCIA_POSITIVA:")
+                for e in pos_items[:POS_IN_PROMPT]:
+                    if not isinstance(e, dict):
+                        continue
+                    fid = _one_line(e.get("fragmento_id"))
+                    archivo = _one_line(e.get("archivo"))
+                    par_idx = e.get("par_idx")
+                    frag = _one_line(e.get("fragmento"))
+                    method = _one_line(e.get("method"))
+                    block_lines.append(
+                        f"   - [{fid}] {archivo}:{par_idx} \"{frag}\" ({method})".strip()
+                    )
+            if neg_items:
+                block_lines.append("   EVIDENCIA_NEGATIVA (tensión):")
+                for e in neg_items[:NEG_IN_PROMPT]:
+                    if not isinstance(e, dict):
+                        continue
+                    fid = _one_line(e.get("fragmento_id"))
+                    archivo = _one_line(e.get("archivo"))
+                    par_idx = e.get("par_idx")
+                    frag = _one_line(e.get("fragmento"))
+                    method = _one_line(e.get("method"))
+                    ps = e.get("present_source")
+                    pt = e.get("present_target")
+                    present = ""
+                    if ps is not None or pt is not None:
+                        present = f" present(source={int(bool(ps))},target={int(bool(pt))})"
+                    block_lines.append(
+                        f"   - [{fid}] {archivo}:{par_idx}{present} \"{frag}\" ({method})".strip()
+                    )
+
+            suggestions_text.append("\n".join(block_lines))
+        suggestions_block = "\n\n".join(suggestions_text)
         
         # Sprint 29+: Contrato JSON estructurado con etiquetas epistemológicas (compatible con legacy texto).
         prompt = f"""Analiza las siguientes predicciones de enlaces en un grafo de análisis cualitativo (Teoría Fundamentada).
 
 Algoritmo utilizado: {algorithm_desc}
 
-Sugerencias de relaciones axiales faltantes (IDs 1..{min(len(payload.suggestions), 10)}):
-{chr(10).join(suggestions_text)}
+Para cada sugerencia se incluye evidencia en fragmentos (EVIDENCIA_POSITIVA / EVIDENCIA_NEGATIVA).
+Cita la evidencia usando los `fragmento_id` proporcionados. No inventes IDs.
+
+Sugerencias de relaciones axiales faltantes (IDs 1..{len(suggestions_for_prompt)}):
+{suggestions_block}
 
 Contexto: Estas son relaciones potenciales entre códigos/categorías detectadas algorítmicamente.
 
@@ -7392,9 +7847,9 @@ El JSON debe tener esta estructura exacta:
 
 {{
     "memo_sintesis": [
-        {{"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3]}},
-        {{"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3]}},
-        {{"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2]}},
+        {{"type": "OBSERVATION", "text": "...", "evidence_ids": [1, 3], "evidence_fragment_ids": ["123", "456"]}},
+        {{"type": "INTERPRETATION", "text": "...", "evidence_ids": [1, 3], "evidence_fragment_ids": ["123"]}},
+        {{"type": "HYPOTHESIS", "text": "...", "evidence_ids": [2], "evidence_fragment_ids": ["789"]}},
         {{"type": "NORMATIVE_INFERENCE", "text": "...", "evidence_ids": [4]}}
     ]
 }}
@@ -7403,16 +7858,17 @@ REGLAS:
 1. memo_sintesis: lista de 3-6 statements.
 2. type: uno de OBSERVATION | INTERPRETATION | HYPOTHESIS | NORMATIVE_INFERENCE.
 3. text: una oración clara (español).
-4. evidence_ids: lista de enteros referidos a la numeración de las sugerencias (1..10).
-5. PROHIBIDO: OBSERVATION sin evidence_ids no vacíos.
-6. Sé conciso: evita listas largas o párrafos extensos."""
+4. evidence_ids: lista de enteros referidos a la numeración de las sugerencias (1..{len(suggestions_for_prompt)}).
+5. evidence_fragment_ids: lista de strings `fragmento_id` (de la evidencia provista). No inventes IDs.
+6. PROHIBIDO: OBSERVATION sin evidence_fragment_ids no vacíos.
+7. Sé conciso: evita listas largas o párrafos extensos."""
 
         # gpt-5.x models no soportan temperature != 1, omitir el parámetro
         response = clients.aoai.chat.completions.create(
             model=settings.azure.deployment_chat,
             messages=[
-                {"role": "system", "content": "Eres un experto en análisis cualitativo y Teoría Fundamentada."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
             ],
             max_completion_tokens=600,
             # temperature omitido: gpt-5.x usa default=1
@@ -7460,13 +7916,28 @@ REGLAS:
                             evidence_ids.append(int(v))
                         except Exception:
                             continue
-                # Regla de seguridad: OBSERVATION requiere evidencia.
-                if stype == "OBSERVATION" and not evidence_ids:
+                evidence_fragment_ids: List[str] = []
+                raw_frag_ids = item.get("evidence_fragment_ids")
+                if isinstance(raw_frag_ids, list):
+                    for v in raw_frag_ids:
+                        fid = str(v or "").strip()
+                        if fid:
+                            evidence_fragment_ids.append(fid)
+                # Regla de seguridad: OBSERVATION requiere evidencia en fragmentos.
+                if stype == "OBSERVATION" and not evidence_fragment_ids:
                     stype = "INTERPRETATION"
                 entry: Dict[str, Any] = {"type": stype, "text": text}
                 if evidence_ids:
                     entry["evidence_ids"] = evidence_ids
-                    lines.append(f"[{stype}] {text} (evid: {', '.join(str(i) for i in evidence_ids)})")
+                if evidence_fragment_ids:
+                    entry["evidence_fragment_ids"] = evidence_fragment_ids
+
+                if evidence_fragment_ids:
+                    preview = ", ".join(evidence_fragment_ids[:6])
+                    suffix = "…" if len(evidence_fragment_ids) > 6 else ""
+                    lines.append(f"[{stype}] {text} (frags: {preview}{suffix})")
+                elif evidence_ids:
+                    lines.append(f"[{stype}] {text} (links: {', '.join(str(i) for i in evidence_ids)})")
                 else:
                     lines.append(f"[{stype}] {text}")
                 out.append(entry)
@@ -7474,8 +7945,9 @@ REGLAS:
         
         api_logger.info(
             "api.analyze_predictions.complete",
+            project=project_id,
             algorithm=payload.algorithm,
-            suggestions_count=len(payload.suggestions),
+            suggestions_count=len(suggestions_for_prompt),
         )
         
         if isinstance(parsed, dict) and parsed.get("memo_sintesis") is not None:
@@ -7487,6 +7959,39 @@ REGLAS:
             structured = False
             memo_statements = []
 
+        analysis_id = 0
+        persisted = False
+        evidence_schema_version = int(evidence_pack.get("schema_version", 1) or 1) if isinstance(evidence_pack, dict) else 1
+        if payload.persist:
+            from app.postgres_block import insert_axial_ai_analysis
+
+            analysis_id = insert_axial_ai_analysis(
+                clients.postgres,
+                project_id=project_id,
+                source_type="analyze_predictions",
+                algorithm=payload.algorithm,
+                algorithm_description=algorithm_desc,
+                suggestions_json=payload.suggestions[:10],
+                analysis_text=analysis,
+                memo_statements=memo_statements,
+                structured=structured,
+                estado="pendiente",
+                created_by=user.user_id,
+                epistemic_mode=epistemic_mode.value,
+                prompt_version=prompt_version,
+                llm_deployment=settings.azure.deployment_chat,
+                llm_api_version=settings.azure.api_version,
+                evidence_schema_version=evidence_schema_version,
+                evidence_json=evidence_pack if isinstance(evidence_pack, dict) else None,
+            )
+            persisted = bool(analysis_id)
+            api_logger.info(
+                "api.analyze_predictions.persisted",
+                project=project_id,
+                analysis_id=analysis_id,
+                estado="pendiente",
+            )
+
         return {
             # Compatibilidad: se mantiene el texto plano.
             "analysis": analysis,
@@ -7496,11 +8001,609 @@ REGLAS:
             "algorithm": payload.algorithm,
             "algorithm_description": algorithm_desc,
             "suggestions_analyzed": len(payload.suggestions[:10]),
+            "project": project_id,
+            "epistemic_mode": epistemic_mode.value,
+            "prompt_version": prompt_version,
+            "llm_deployment": settings.azure.deployment_chat,
+            "llm_api_version": settings.azure.api_version,
+            "analysis_id": analysis_id,
+            "persisted": persisted,
+            "evidence_schema_version": evidence_schema_version,
+            "evidence_totals": evidence_pack.get("totals") if isinstance(evidence_pack, dict) else None,
         }
         
     except Exception as exc:
         api_logger.error("api.analyze_predictions.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        clients.close()
+
+
+class AxialAiAnalysisUpdateRequest(BaseModel):
+    """Request para actualizar estado de un artefacto IA axial."""
+    model_config = ConfigDict(extra="forbid")
+
+    project: str = Field(..., description="Proyecto")
+    estado: str = Field(..., description="Nuevo estado: pendiente, validado, rechazado")
+    review_memo: Optional[str] = Field(None, description="Memo/nota humana opcional")
+
+
+@app.get("/api/axial/ai-analyses")
+async def api_list_axial_ai_analyses(
+    project: str = Query(..., description="Proyecto requerido"),
+    estado: Optional[str] = Query(None, description="Filtrar por estado"),
+    source_type: Optional[str] = Query(None, description="Filtrar por origen (source_type)"),
+    algorithm: Optional[str] = Query(None, description="Filtrar por algoritmo"),
+    epistemic_mode: Optional[str] = Query(None, description="Filtrar por epistemic_mode"),
+    created_from: Optional[str] = Query(None, description="Filtrar desde (ISO 8601)"),
+    created_to: Optional[str] = Query(None, description="Filtrar hasta (ISO 8601)"),
+    min_score: Optional[float] = Query(None, description="Filtrar por score mínimo (max score dentro del artefacto)"),
+    has_evidence: Optional[bool] = Query(None, description="Filtrar por artefactos con/sin evidencia"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Lista artefactos IA axiales persistidos (audit trail)."""
+    clients = build_pg_only(settings)
+    try:
+        try:
+            project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        from app.postgres_block import list_axial_ai_analyses, count_axial_ai_analyses
+
+        items = list_axial_ai_analyses(
+            clients.postgres,
+            project_id=project_id,
+            estado=estado,
+            source_type=source_type,
+            algorithm=algorithm,
+            epistemic_mode=epistemic_mode,
+            created_from=created_from,
+            created_to=created_to,
+            min_score=min_score,
+            has_evidence=has_evidence,
+            limit=limit,
+            offset=offset,
+        )
+        total = count_axial_ai_analyses(
+            clients.postgres,
+            project_id=project_id,
+            estado=estado,
+            source_type=source_type,
+            algorithm=algorithm,
+            epistemic_mode=epistemic_mode,
+            created_from=created_from,
+            created_to=created_to,
+            min_score=min_score,
+            has_evidence=has_evidence,
+        )
+
+        return {
+            "project": project_id,
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    finally:
+        clients.close()
+
+
+@app.get("/api/axial/ai-analyses/{analysis_id}")
+async def api_get_axial_ai_analysis(
+    analysis_id: int,
+    project: str = Query(..., description="Proyecto requerido"),
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Obtiene un artefacto IA axial por ID (scoped por proyecto)."""
+    clients = build_pg_only(settings)
+    try:
+        try:
+            project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        from app.postgres_block import get_axial_ai_analysis_by_id
+
+        item = get_axial_ai_analysis_by_id(
+            clients.postgres,
+            project_id=project_id,
+            analysis_id=int(analysis_id),
+        )
+        if not item:
+            raise HTTPException(status_code=404, detail="Análisis IA axial no encontrado")
+        return item
+    finally:
+        clients.close()
+
+
+@app.patch("/api/axial/ai-analyses/{analysis_id}")
+async def api_update_axial_ai_analysis(
+    analysis_id: int,
+    payload: AxialAiAnalysisUpdateRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Actualiza estado/memo de revisión de un artefacto IA axial (no crea relaciones)."""
+    if payload.estado not in ("pendiente", "validado", "rechazado"):
+        raise HTTPException(status_code=400, detail="estado debe ser: pendiente, validado, rechazado")
+
+    clients = build_pg_only(settings)
+    try:
+        try:
+            project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        from app.postgres_block import (
+            get_axial_ai_analysis_by_id,
+            log_project_action,
+            update_axial_ai_analysis_estado,
+        )
+
+        current = get_axial_ai_analysis_by_id(
+            clients.postgres,
+            project_id=project_id,
+            analysis_id=int(analysis_id),
+        )
+        if not current:
+            raise HTTPException(status_code=404, detail="Análisis IA axial no encontrado")
+
+        current_estado = str(current.get("estado") or "pendiente")
+        new_estado = payload.estado
+        effective_review_memo = (
+            payload.review_memo if payload.review_memo is not None else current.get("review_memo")
+        )
+        is_admin = "admin" in (user.roles or [])
+
+        if current_estado != new_estado:
+            # Regla: cambios desde estados finales requieren rol admin + motivo.
+            if current_estado in ("validado", "rechazado"):
+                if not is_admin:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="No autorizado: solo admin puede cambiar un estado final (validado/rechazado).",
+                    )
+                if not (payload.review_memo or "").strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Para cambiar un estado final se requiere review_memo (motivo).",
+                    )
+            # Regla: desde pendiente solo se permite cerrar (validado/rechazado).
+            if current_estado == "pendiente" and new_estado not in ("validado", "rechazado"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transición inválida: pendiente solo puede cambiar a validado o rechazado.",
+                )
+
+        success = update_axial_ai_analysis_estado(
+            clients.postgres,
+            project_id=project_id,
+            analysis_id=int(analysis_id),
+            estado=payload.estado,
+            reviewed_by=user.user_id,
+            review_memo=payload.review_memo,
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Análisis IA axial no encontrado")
+
+        # AX-AI-05: audit trail (antes/después).
+        log_project_action(
+            clients.postgres,
+            project=project_id,
+            user_id=user.user_id,
+            action="axial_ai_analysis.update",
+            entity_type="axial_ai_analysis",
+            entity_id=str(int(analysis_id)),
+            details={
+                "from_estado": current_estado,
+                "to_estado": new_estado,
+                "from_review_memo": current.get("review_memo"),
+                "to_review_memo": effective_review_memo,
+                "changed_estado": bool(current_estado != new_estado),
+                "is_admin": bool(is_admin),
+            },
+        )
+
+        api_logger.info(
+            "axial_ai_analysis.estado_updated",
+            project=project_id,
+            analysis_id=int(analysis_id),
+            estado=payload.estado,
+            user=user.user_id,
+        )
+
+        return {"success": True, "analysis_id": int(analysis_id), "estado": payload.estado}
+    finally:
+        clients.close()
+
+
+class AxialAiSuggestionDecisionRequest(BaseModel):
+    """Aplica una decisión humana sobre una sugerencia dentro de un artefacto IA.
+
+    Nivel 1 (ya): validar/rechazar el artefacto (`axial_ai_analyses`).
+    Nivel 2 (nuevo): aplicar/cerrar una sugerencia (crea/actualiza `link_predictions` y opcionalmente Neo4j).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    project: str = Field(..., description="Proyecto")
+    suggestion_id: int = Field(..., ge=1, description="ID 1-based de la sugerencia dentro del artefacto")
+    decision: str = Field(..., description="validate_apply | reject_close")
+    relation_type: Optional[str] = Field(
+        None,
+        description="Tipo de relación a aplicar en Neo4j (solo para validate_apply).",
+    )
+    memo: Optional[str] = Field(None, description="Memo opcional para guardar en link_predictions")
+
+
+@app.post("/api/axial/ai-analyses/{analysis_id}/suggestions/decision")
+async def api_decide_axial_ai_suggestion(
+    analysis_id: int,
+    payload: AxialAiSuggestionDecisionRequest,
+    settings: AppSettings = Depends(get_settings),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Cierra/aplica una sugerencia del análisis IA axial.
+
+    - `validate_apply`: marca la sugerencia como validada y crea la relación axial en Neo4j (best-effort).
+    - `reject_close`: marca la sugerencia como rechazada (para que no reaparezca en sugerencias futuras).
+    """
+    if payload.decision not in ("validate_apply", "reject_close"):
+        raise HTTPException(status_code=400, detail="decision debe ser: validate_apply | reject_close")
+
+    from app.neo4j_block import merge_axial_relationship
+    from app.postgres_block import (
+        check_project_permission,
+        ensure_link_predictions_table,
+        ensure_project_members_table,
+        get_axial_ai_analysis_by_id,
+    )
+    from psycopg2.extras import Json
+
+    clients = build_clients_or_error(settings)
+    try:
+        try:
+            project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # Permisos: aplicar/cerrar sugerencias modifica el ledger (write).
+        if not check_project_permission(clients.postgres, project_id, user.user_id, "codificador"):
+            raise HTTPException(
+                status_code=403,
+                detail="Acceso denegado: se requiere rol 'codificador' (o 'admin') en el proyecto.",
+            )
+
+        analysis = get_axial_ai_analysis_by_id(
+            clients.postgres,
+            project_id=project_id,
+            analysis_id=int(analysis_id),
+        )
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Análisis IA axial no encontrado")
+
+        # Prefer evidence-pack suggestions (incluye id + metadata), fallback a suggestions_json.
+        suggestions: List[Any] = []
+        evidence_json = analysis.get("evidence_json")
+        if isinstance(evidence_json, dict) and isinstance(evidence_json.get("suggestions"), list):
+            suggestions = list(evidence_json.get("suggestions") or [])
+        if not suggestions and isinstance(analysis.get("suggestions_json"), list):
+            suggestions = list(analysis.get("suggestions_json") or [])
+
+        total = len(suggestions)
+        if total <= 0:
+            raise HTTPException(status_code=400, detail="El artefacto no contiene sugerencias")
+
+        sid = int(payload.suggestion_id)
+        if sid < 1 or sid > total:
+            raise HTTPException(status_code=400, detail=f"suggestion_id fuera de rango (1..{total})")
+
+        item = suggestions[sid - 1]
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Sugerencia inválida en el artefacto")
+
+        source = str(item.get("source") or item.get("source_code") or "").strip()
+        target = str(item.get("target") or item.get("target_code") or "").strip()
+        if not source or not target:
+            raise HTTPException(status_code=400, detail="Sugerencia sin source/target")
+        if source == target:
+            raise HTTPException(status_code=400, detail="Sugerencia inválida: source == target")
+
+        # En este producto, el ledger link_predictions es Código↔Código.
+        source_type = str(item.get("source_type") or "Codigo").strip() or "Codigo"
+        target_type = str(item.get("target_type") or "Codigo").strip() or "Codigo"
+        if source_type != "Codigo" or target_type != "Codigo":
+            raise HTTPException(
+                status_code=400,
+                detail="Solo se soporta aplicar/cerrar sugerencias Codigo↔Codigo en link_predictions",
+            )
+
+        algorithm = str(item.get("algorithm") or analysis.get("algorithm") or "common_neighbors").strip()
+        if not algorithm:
+            algorithm = "common_neighbors"
+
+        # Guardrails epistemológicos (server-side): aplicar requiere evidencia positiva
+        # (o override admin + memo).
+        is_admin = "admin" in (user.roles or [])
+        positive_items = item.get("positive")
+        negative_items = item.get("negative")
+        pos_count = len(positive_items) if isinstance(positive_items, list) else 0
+        neg_count = len(negative_items) if isinstance(negative_items, list) else 0
+        notes = item.get("notes") if isinstance(item.get("notes"), dict) else {}
+        positive_missing = bool(notes.get("positive_missing")) if isinstance(notes, dict) else False
+        negative_missing = bool(notes.get("negative_missing")) if isinstance(notes, dict) else False
+
+        raw_score = item.get("score", 0.0)
+        try:
+            score = float(raw_score)
+        except Exception:
+            score = 0.0
+        score = max(score, 0.0)
+
+        # Canonicalize (A,B) as undirected pair for storage.
+        a, b = (source, target) if source <= target else (target, source)
+
+        new_estado = "validado" if payload.decision == "validate_apply" else "rechazado"
+
+        if payload.decision == "validate_apply" and pos_count <= 0:
+            memo_clean = str(payload.memo or "").strip()
+            if not (is_admin and len(memo_clean) >= 20):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "No se puede 'validar y aplicar' sin evidencia positiva. "
+                        "Use evidencia (evidence pack) o solicite override admin con memo >= 20 chars."
+                    ),
+                )
+
+        # Resolver predicción existente (si existe) para no pisar relation_type accidentalmente.
+        existing_prediction = None
+        with clients.postgres.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, estado, memo, relation_type
+                FROM link_predictions
+                WHERE project_id = %s AND source_code = %s AND target_code = %s AND algorithm = %s
+                """,
+                (project_id, a, b, algorithm),
+            )
+            row = cur.fetchone()
+            if row:
+                existing_prediction = {
+                    "id": row[0],
+                    "estado": row[1],
+                    "memo": row[2],
+                    "relation_type": row[3],
+                }
+        relation_type_to_store = str(
+            payload.relation_type
+            or (existing_prediction.get("relation_type") if isinstance(existing_prediction, dict) else None)
+            or "asociado_con"
+        ).strip() or "asociado_con"
+
+        # Asegurar tablas antes de transacción.
+        ensure_link_predictions_table(clients.postgres)
+        ensure_project_members_table(clients.postgres)
+
+        # Transacción PG: upsert + update estado + audit log.
+        try:
+            with clients.postgres.cursor() as cur:
+                # Snapshot previo (si existe).
+                cur.execute(
+                    """
+                    SELECT id, estado, memo, relation_type
+                    FROM link_predictions
+                    WHERE project_id = %s AND source_code = %s AND target_code = %s AND algorithm = %s
+                    FOR UPDATE
+                    """,
+                    (project_id, a, b, algorithm),
+                )
+                before_row = cur.fetchone()
+                before_id = before_row[0] if before_row else None
+                before_estado = str(before_row[1]) if before_row and before_row[1] else None
+                before_memo = before_row[2] if before_row else None
+                before_relation_type = before_row[3] if before_row else None
+
+                # Upsert base.
+                cur.execute(
+                    """
+                    INSERT INTO link_predictions (
+                        project_id, source_code, target_code, relation_type,
+                        algorithm, score, rank, memo
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (project_id, source_code, target_code, algorithm) DO UPDATE SET
+                        score = EXCLUDED.score,
+                        rank = EXCLUDED.rank,
+                        memo = COALESCE(EXCLUDED.memo, link_predictions.memo),
+                        relation_type = EXCLUDED.relation_type,
+                        updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (
+                        project_id,
+                        a,
+                        b,
+                        relation_type_to_store,
+                        algorithm,
+                        score,
+                        sid,
+                        None,
+                    ),
+                )
+                prediction_id = cur.fetchone()[0]
+
+                # Aplicar estado/memo/relation_type (si cambian).
+                changed_estado = (before_estado or "pendiente") != new_estado
+                memo_clean = str(payload.memo or "").strip()
+                before_memo_clean = str(before_memo or "").strip()
+                changed_memo = payload.memo is not None and memo_clean != before_memo_clean
+                rel_type_clean = str(payload.relation_type or "").strip()
+                before_rel_clean = str(before_relation_type or "").strip()
+                changed_relation_type = payload.relation_type is not None and rel_type_clean != before_rel_clean
+
+                if changed_estado or changed_memo or changed_relation_type:
+                    cur.execute(
+                        """
+                        UPDATE link_predictions
+                        SET estado = %s,
+                            relation_type = COALESCE(%s, relation_type),
+                            validado_por = COALESCE(%s, validado_por),
+                            validado_en = CASE WHEN %s IN ('validado', 'rechazado') THEN NOW() ELSE validado_en END,
+                            memo = COALESCE(%s, memo),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING relation_type, estado, memo
+                        """,
+                        (
+                            new_estado,
+                            payload.relation_type,
+                            user.user_id,
+                            new_estado,
+                            payload.memo,
+                            prediction_id,
+                        ),
+                    )
+                    updated_row = cur.fetchone()
+                else:
+                    updated_row = (relation_type_to_store, before_estado or "pendiente", before_memo)
+
+                rel_type = str(updated_row[0] or "asociado_con").strip() or "asociado_con"
+
+                # Audit log (mismo TX).
+                cur.execute(
+                    """
+                    INSERT INTO project_audit_log (project_id, user_id, action, entity_type, entity_id, details)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        project_id,
+                        user.user_id,
+                        "axial_ai_suggestion.decision",
+                        "link_prediction",
+                        str(prediction_id),
+                        Json(
+                            {
+                                "analysis_id": int(analysis_id),
+                                "suggestion_id": sid,
+                                "decision": payload.decision,
+                                "estado": new_estado,
+                                "before_estado": before_estado,
+                                "changed_estado": bool(changed_estado),
+                                "changed_memo": bool(changed_memo),
+                                "changed_relation_type": bool(changed_relation_type),
+                                "idempotent": bool(not (changed_estado or changed_memo or changed_relation_type)),
+                                "analysis_epistemic_mode": analysis.get("epistemic_mode"),
+                                "analysis_prompt_version": analysis.get("prompt_version"),
+                                "has_evidence_pack": bool(isinstance(analysis.get("evidence_json"), dict)),
+                                "evidence_positive_count": int(pos_count),
+                                "evidence_negative_count": int(neg_count),
+                                "evidence_positive_missing": bool(positive_missing),
+                                "evidence_negative_missing": bool(negative_missing),
+                                "source_code": a,
+                                "target_code": b,
+                                "algorithm": algorithm,
+                                "score": score,
+                                "relation_type": rel_type,
+                            }
+                        ),
+                    ),
+                )
+
+            clients.postgres.commit()
+        except Exception:
+            clients.postgres.rollback()
+            raise
+
+        neo4j_synced = False
+        neo4j_error: Optional[str] = None
+        if payload.decision == "validate_apply" and clients.neo4j:
+            try:
+                merge_axial_relationship(
+                    driver=clients.neo4j,
+                    database=settings.neo4j.database,
+                    project_id=project_id,
+                    source_code=prediction.get("source_code") or a,
+                    target_code=prediction.get("target_code") or b,
+                    relation_type=rel_type,
+                )
+                neo4j_synced = True
+            except Exception as exc:  # noqa: BLE001
+                neo4j_error = str(exc)[:200]
+                api_logger.warning(
+                    "axial_ai_suggestion.neo4j_sync_failed",
+                    project=project_id,
+                    analysis_id=int(analysis_id),
+                    suggestion_id=sid,
+                    prediction_id=prediction_id,
+                    error=neo4j_error,
+                )
+
+        # Persistir estado de sync (best-effort).
+        sync_status = "skipped"
+        if payload.decision == "validate_apply":
+            sync_status = "success" if neo4j_synced else "failed"
+        try:
+            with clients.postgres.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE link_predictions
+                    SET neo4j_sync_status = %s,
+                        neo4j_sync_error = %s,
+                        neo4j_synced_at = CASE WHEN %s = 'success' THEN NOW() ELSE neo4j_synced_at END,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (sync_status, neo4j_error, sync_status, prediction_id),
+                )
+            clients.postgres.commit()
+        except Exception as exc:  # noqa: BLE001
+            clients.postgres.rollback()
+            api_logger.warning(
+                "axial_ai_suggestion.sync_status_update_failed",
+                project=project_id,
+                analysis_id=int(analysis_id),
+                prediction_id=prediction_id,
+                error=str(exc)[:200],
+            )
+
+        # Registrar sync Neo4j (best-effort) en audit log separado si falla.
+        if neo4j_error:
+            with clients.postgres.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO project_audit_log (project_id, user_id, action, entity_type, entity_id, details)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        project_id,
+                        user.user_id,
+                        "axial_ai_suggestion.neo4j_sync_failed",
+                        "link_prediction",
+                        str(prediction_id),
+                        Json(
+                            {
+                                "analysis_id": int(analysis_id),
+                                "suggestion_id": sid,
+                                "neo4j_error": neo4j_error,
+                            }
+                        ),
+                    ),
+                )
+            clients.postgres.commit()
+
+        return {
+            "success": True,
+            "analysis_id": int(analysis_id),
+            "suggestion_id": sid,
+            "prediction_id": prediction_id,
+            "estado": new_estado,
+            "neo4j_synced": neo4j_synced,
+        }
     finally:
         clients.close()
 
@@ -7912,11 +9015,13 @@ async def api_hidden_relationships(
     Retorna sugerencias con score y razón.
     """
     from app.link_prediction import discover_hidden_relationships
+    from app.project_state import resolve_project
     
     clients = build_clients_or_error(settings)
     try:
-        api_logger.info("api.hidden_relationships.start", project=project)
-        suggestions = discover_hidden_relationships(clients, settings, project, top_k)
+        project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
+        api_logger.info("api.hidden_relationships.start", project=project_id)
+        suggestions = discover_hidden_relationships(clients, settings, project_id, top_k)
         
         # Agrupar por método
         by_method = {}
@@ -7930,6 +9035,7 @@ async def api_hidden_relationships(
             "suggestions": suggestions,
             "by_method": by_method,
             "total": len(suggestions),
+            "project": project_id,
         }
     except Exception as exc:
         api_logger.error("api.hidden_relationships.error", error=str(exc))
@@ -7945,27 +9051,38 @@ async def api_confirm_relationship(
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
-    Confirma una relación oculta descubierta.
-    
-    Crea la relación en Neo4j con origen='descubierta' para
-    distinguirla de las relaciones creadas manualmente.
+    Encola una relación oculta descubierta como hipótesis en PostgreSQL (ledger).
+
+    Importante:
+    - NO crea la relación en Neo4j.
+    - Neo4j solo se actualiza cuando un humano valida/aplica la relación (workflow link_predictions).
     """
     from app.link_prediction import confirm_hidden_relationship
+    from app.project_state import resolve_project
+    from app.postgres_block import check_project_permission
     
     clients = build_clients_or_error(settings)
     try:
+        project_id = resolve_project(payload.project, allow_create=False, pg=clients.postgres)
+
+        # Permisos: encolar hipótesis es una operación de escritura (codificador/admin).
+        is_admin = "admin" in {str(r).strip().lower() for r in (user.roles or [])}
+        if not is_admin and not check_project_permission(clients.postgres, project_id, user.user_id, "codificador"):
+            raise HTTPException(status_code=403, detail="Permiso insuficiente para confirmar relaciones")
+
         api_logger.info(
             "api.confirm_relationship.start",
             source=payload.source,
             target=payload.target,
             tipo=payload.relation_type,
+            project=project_id,
         )
         result = confirm_hidden_relationship(
             clients, settings,
             source=payload.source,
             target=payload.target,
             relation_type=payload.relation_type,
-            project=payload.project,
+            project=project_id,
         )
         
         if result.get("status") == "error":
@@ -8296,6 +9413,7 @@ async def api_generate_stage4_final_report(
             aoai_client=clients.aoai,
             deployment_chat=settings.azure.deployment_chat,
             project_id=project,
+            org_id=str(getattr(user, "organization_id", None) or ""),
         )
         return report
     except Exception as exc:
@@ -8309,10 +9427,10 @@ async def api_generate_stage4_final_report(
 # Stage4 final report jobs (async)
 # -----------------------------------------------------------------------------
 
-def _run_stage4_final_report_task(*, task_id: str, project: str, settings: AppSettings) -> None:
+def _run_stage4_final_report_task(*, task_id: str, project: str, settings: AppSettings, org_id: str) -> None:
     from app.reports import generate_stage4_final_report
     from app.postgres_block import update_report_job
-    from app.blob_storage import CONTAINER_REPORTS, upload_local_path
+    from app.blob_storage import CONTAINER_REPORTS, logical_path_to_blob_name, upload_file
 
     clients = build_clients_or_error(settings)
     try:
@@ -8334,22 +9452,21 @@ def _run_stage4_final_report_task(*, task_id: str, project: str, settings: AppSe
             aoai_client=clients.aoai,
             deployment_chat=settings.azure.deployment_chat,
             project_id=project,
+            org_id=org_id,
         )
 
-        base_dir = Path("reports") / project
-        base_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
         filename = f"{timestamp}_stage4_final.json"
-        file_path = base_dir / filename
-        file_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        logical_path = f"reports/{project}/{filename}"
+        payload_bytes = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
 
         blob_url: Optional[str] = None
         try:
-            blob_name = f"{project}/{filename}"
-            blob_url = upload_local_path(
+            blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project, logical_path=logical_path)
+            blob_url = upload_file(
                 container=CONTAINER_REPORTS,
                 blob_name=blob_name,
-                file_path=str(file_path),
+                data=payload_bytes,
                 content_type="application/json",
             )
         except Exception as exc:
@@ -8357,10 +9474,11 @@ def _run_stage4_final_report_task(*, task_id: str, project: str, settings: AppSe
 
         result = {
             "project": project,
-            "path": str(file_path),
+            "path": logical_path,
             "filename": filename,
             "report": report,
             "blob_url": blob_url,
+            "blob_name": blob_name if blob_url else None,
         }
 
         update_report_job(
@@ -8369,7 +9487,7 @@ def _run_stage4_final_report_task(*, task_id: str, project: str, settings: AppSe
             status="completed",
             message="Informe final Etapa 4 generado",
             result=result,
-            result_path=str(file_path),
+            result_path=logical_path,
             finished_at=datetime.now().isoformat(),
         )
     except Exception as exc:
@@ -8396,7 +9514,12 @@ async def api_execute_stage4_final_report_job(
     settings: AppSettings = Depends(get_settings),
     user: User = Depends(require_role(["admin", "analyst"])),
 ) -> Dict[str, Any]:
-    task_id = f"stage4final_{project}_{uuid.uuid4().hex[:12]}"
+    try:
+        resolved_project = resolve_project(project, allow_create=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    task_id = f"stage4final_{resolved_project}_{uuid.uuid4().hex[:12]}"
     auth = {
         "user_id": str(user.user_id),
         "org": str(user.organization_id),
@@ -8408,12 +9531,13 @@ async def api_execute_stage4_final_report_job(
 
         clients = build_clients_or_error(settings)
         try:
+            resolved_project = resolve_project(project, allow_create=False, pg=clients.postgres)
             create_report_job(
                 clients.postgres,
                 task_id=task_id,
                 job_type="stage4_final",
-                project_id=project,
-                payload={"project": project},
+                project_id=resolved_project,
+                payload={"project": resolved_project},
                 auth=auth,
                 message="Inicializando...",
             )
@@ -8422,8 +9546,14 @@ async def api_execute_stage4_final_report_job(
     except Exception as exc:
         api_logger.warning("stage4_final.job_persist_failed", error=str(exc), task_id=task_id)
 
-    api_logger.info("stage4_final.job_started", task_id=task_id, project=project)
-    background_tasks.add_task(_run_stage4_final_report_task, task_id=task_id, project=project, settings=settings)
+    api_logger.info("stage4_final.job_started", task_id=task_id, project=resolved_project)
+    background_tasks.add_task(
+        _run_stage4_final_report_task,
+        task_id=task_id,
+        project=resolved_project,
+        settings=settings,
+        org_id=str(user.organization_id),
+    )
     return {"task_id": task_id, "status": "started"}
 
 
@@ -8528,7 +9658,12 @@ async def api_list_report_artifacts(
     try:
         from app.report_artifacts import list_recent_report_artifacts
 
-        artifacts = list_recent_report_artifacts(clients.postgres, project_id, limit=limit)
+        artifacts = list_recent_report_artifacts(
+            clients.postgres,
+            project_id,
+            org_id=str(getattr(user, "organization_id", None) or ""),
+            limit=limit,
+        )
         return {
             "project": project_id,
             "artifacts": artifacts,
@@ -8564,28 +9699,46 @@ async def api_download_report_artifact(
     rel_norm = path.replace("\\", "/").lstrip("/")
     target_rel = Path(rel_norm)
 
-    if target_rel.is_absolute():
+    # Block absolute paths / Windows drive traversal / dot-dot traversal.
+    if target_rel.is_absolute() or ".." in target_rel.parts or ":" in (target_rel.parts[0] if target_rel.parts else ""):
         raise HTTPException(status_code=400, detail="Absolute paths are not allowed")
 
-    target = target_rel.resolve()
-    allowed_roots = [
-        (Path("reports") / project_id).resolve(),
-        (Path("reports") / "runner" / project_id).resolve(),
-        (Path("logs") / "runner_reports" / project_id).resolve(),
-        (Path("logs") / "runner_checkpoints" / project_id).resolve(),
+    # Validate logical roots (independent of filesystem existence).
+    allowed_prefixes = [
+        f"reports/{project_id}/",
+        f"reports/runner/{project_id}/",
+        f"logs/runner_reports/{project_id}/",
+        f"logs/runner_checkpoints/{project_id}/",
+        f"notes/{project_id}/",  # allow notes via this endpoint too (optional)
     ]
-
-    def _is_under_allowed_root(candidate: Path) -> bool:
-        for root in allowed_roots:
-            if root == candidate or root in candidate.parents:
-                return True
-        return False
-
-    if not _is_under_allowed_root(target):
+    if not any(rel_norm.startswith(p) for p in allowed_prefixes):
         raise HTTPException(status_code=400, detail="Invalid artifact path")
 
-    # Prefer Azure Blob when a matching report job provides blob_url.
-    # This allows secure downloads even when the container is private.
+    # Prefer tenant-scoped Blob artifacts (cloud mode).
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, download_file, logical_path_to_blob_name
+
+        blob_name = logical_path_to_blob_name(
+            org_id=str(getattr(user, "organization_id", None) or ""),
+            project_id=project_id,
+            logical_path=rel_norm,
+        )
+        data = download_file(CONTAINER_REPORTS, blob_name)
+        suffix = target_rel.suffix.lower()
+        if suffix in {".md", ".markdown"}:
+            media_type = "text/markdown"
+        elif suffix == ".json":
+            media_type = "application/json"
+        elif suffix == ".csv":
+            media_type = "text/csv"
+        else:
+            media_type = "application/octet-stream"
+        headers = {"Content-Disposition": f'attachment; filename="{target_rel.name}"'}
+        return Response(content=data, media_type=media_type, headers=headers)
+    except Exception as exc:
+        api_logger.debug("reports.artifact.blob_fallback", error=str(exc)[:200], project=project_id)
+
+    # Backward-compat: try legacy job blob_url by result_path (if any).
     try:
         from app.blob_storage import download_by_url
 
@@ -8605,7 +9758,7 @@ async def api_download_report_artifact(
         blob_url = (row[0] if row else None)
         if isinstance(blob_url, str) and blob_url.strip():
             data = download_by_url(blob_url)
-            suffix = target.suffix.lower()
+            suffix = target_rel.suffix.lower()
             if suffix in {".md", ".markdown"}:
                 media_type = "text/markdown"
             elif suffix == ".json":
@@ -8614,10 +9767,29 @@ async def api_download_report_artifact(
                 media_type = "text/csv"
             else:
                 media_type = "application/octet-stream"
-            headers = {"Content-Disposition": f'attachment; filename="{target.name}"'}
+            headers = {"Content-Disposition": f'attachment; filename="{target_rel.name}"'}
             return Response(content=data, media_type=media_type, headers=headers)
-    except Exception as exc:
-        api_logger.debug("reports.artifact.blob_fallback", error=str(exc)[:200], project=project_id)
+    except Exception:
+        pass
+
+    # Final fallback: legacy local filesystem.
+    allowed_roots = [
+        (Path("reports") / project_id).resolve(),
+        (Path("reports") / "runner" / project_id).resolve(),
+        (Path("logs") / "runner_reports" / project_id).resolve(),
+        (Path("logs") / "runner_checkpoints" / project_id).resolve(),
+        (Path("notes") / project_id).resolve(),
+    ]
+    target = target_rel.resolve()
+
+    def _is_under_allowed_root(candidate: Path) -> bool:
+        for root in allowed_roots:
+            if root == candidate or root in candidate.parents:
+                return True
+        return False
+
+    if not _is_under_allowed_root(target):
+        raise HTTPException(status_code=400, detail="Invalid artifact path")
 
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Artifact not found")
@@ -8664,9 +9836,15 @@ async def api_generate_product_artifacts(
                 clients,
                 settings,
                 project_id,
+                org_id=str(getattr(user, "organization_id", None) or ""),
                 changed_by=getattr(user, "user_id", None),
             )
         except Exception as exc:
+            # Storage failures should not be reported as "invalid payload".
+            msg = str(exc)
+            if "AZURE_STORAGE_CONNECTION_STRING" in msg or "Blob Storage" in msg or "azure-storage-blob" in msg:
+                raise HTTPException(status_code=503, detail="Blob Storage no disponible") from exc
+
             # If the new product contracts fail hard validation, surface a user-friendly message.
             try:
                 from pydantic import ValidationError
@@ -8696,39 +9874,52 @@ async def api_get_latest_product_artifacts(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    base = Path("reports") / project_id
-    exec_path = base / "executive_summary.md"
-    top_path = base / "top_10_insights.json"
-    open_path = base / "open_questions.md"
-    manifest_path = base / "product_manifest.json"
+    org_id = str(getattr(user, "organization_id", None) or "")
+    exec_logical = f"reports/{project_id}/executive_summary.md"
+    top_logical = f"reports/{project_id}/top_10_insights.json"
+    open_logical = f"reports/{project_id}/open_questions.md"
+    manifest_logical = f"reports/{project_id}/product_manifest.json"
 
-    def _read_text(p: Path) -> Optional[str]:
+    def _read_text(logical_path: str) -> Optional[str]:
+        # Blob first (cloud mode)
         try:
-            if not p.exists():
+            from app.blob_storage import CONTAINER_REPORTS, download_file, logical_path_to_blob_name
+
+            blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical_path)
+            data = download_file(CONTAINER_REPORTS, blob_name)
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        # Legacy local fallback
+        try:
+            local_path = Path(logical_path)
+            if not local_path.exists():
                 return None
-            return p.read_text(encoding="utf-8", errors="ignore")
+            return local_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return None
 
-    def _read_json(p: Path) -> Optional[Any]:
+    def _read_json(logical_path: str) -> Optional[Any]:
+        raw = _read_text(logical_path)
+        if raw is None:
+            return None
         try:
-            if not p.exists():
-                return None
-            return json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            return json.loads(raw)
         except Exception:
             return None
 
     return {
         "project": project_id,
-        "executive_summary": _read_text(exec_path),
-        "top_10_insights": _read_json(top_path),
-        "open_questions": _read_text(open_path),
-        "manifest": _read_json(manifest_path),
+        "executive_summary": _read_text(exec_logical),
+        "top_10_insights": _read_json(top_logical),
+        "open_questions": _read_text(open_logical),
+        "manifest": _read_json(manifest_logical),
         "paths": {
-            "executive_summary": str(exec_path.as_posix()),
-            "top_10_insights": str(top_path.as_posix()),
-            "open_questions": str(open_path.as_posix()),
-            "manifest": str(manifest_path.as_posix()),
+            "executive_summary": exec_logical,
+            "top_10_insights": top_logical,
+            "open_questions": open_logical,
+            "manifest": manifest_logical,
         },
     }
 
@@ -8800,17 +9991,53 @@ async def api_list_report_jobs(
 async def api_download_report_blob_by_url(
     url: str = Query(..., description="Full Azure Blob URL (used to locate container/blob)."),
     filename: Optional[str] = Query(default=None, description="Optional filename override for Content-Disposition"),
+    clients: ServiceClients = Depends(get_service_clients),
     user: User = Depends(require_role(["admin", "analyst"])),
 ) -> Response:
     """Proxy-download a blob by its URL.
 
     Uses the server-side storage connection string, so it works for private containers.
     This is intended for Reportes v2 job history downloads when only blob_url is known.
+
+    Strict multi-tenant: only allows blob URLs that are registered in `report_jobs`
+    for a project the caller can access.
     """
     try:
         from urllib.parse import urlparse
 
         from app.blob_storage import download_by_url
+
+        # Multi-tenant guard: URL must belong to an existing job the user can access.
+        try:
+            with clients.postgres.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT project_id
+                      FROM report_jobs
+                     WHERE result->>'blob_url' = %s
+                     ORDER BY updated_at DESC
+                     LIMIT 1
+                    """,
+                    (url,),
+                )
+                row = cur.fetchone()
+        except Exception:
+            row = None
+
+        if not row or not row[0]:
+            raise HTTPException(status_code=404, detail="Unknown blob_url (not registered)")
+
+        job_project_id = str(row[0])
+        try:
+            resolve_project(job_project_id, allow_create=False, pg=clients.postgres)
+        except Exception:
+            raise HTTPException(status_code=403, detail="Forbidden") from None
+
+        # Optional extra hardening: only allow downloads from the reports container.
+        parsed = urlparse(url)
+        container = (parsed.path or "").lstrip("/").split("/", 1)[0]
+        if container and container != "reports":
+            raise HTTPException(status_code=400, detail="Only 'reports' container is allowed for this endpoint")
 
         data = download_by_url(url)
 
@@ -9249,6 +10476,91 @@ async def api_update_project_details(
     )
 
     return updated
+
+
+class ProjectEpistemicModeUpdate(BaseModel):
+    """Request para actualizar el modo epistémico de un proyecto (endpoint dedicado)."""
+    model_config = ConfigDict(extra="forbid")
+
+    epistemic_mode: str = Field(..., description="constructivist | post_positivist")
+
+
+@app.put("/api/projects/{project_id}/epistemic-mode")
+async def api_update_project_epistemic_mode(
+    project_id: str,
+    payload: ProjectEpistemicModeUpdate,
+    clients: ServiceClients = Depends(get_service_clients),
+    user: User = Depends(require_auth),
+) -> Dict[str, Any]:
+    """Actualiza `epistemic_mode` con guardrails de estado (no es PATCH genérico)."""
+    from app.postgres_block import (
+        check_project_permission,
+        get_project_epistemic_mode,
+        log_project_action,
+        set_project_epistemic_mode,
+    )
+    from app.project_state import resolve_project
+    from app.settings import EpistemicMode
+
+    try:
+        resolved = resolve_project(project_id, allow_create=False, pg=clients.postgres)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    requested_raw = str(payload.epistemic_mode or "").strip().lower()
+    if requested_raw not in ("constructivist", "post_positivist"):
+        raise HTTPException(
+            status_code=400,
+            detail="epistemic_mode inválido: use constructivist | post_positivist",
+        )
+
+    # Permisos: alinea con edición de proyecto (codificador/admin).
+    is_admin = "admin" in {str(r).strip().lower() for r in (user.roles or [])}
+    if not is_admin and not check_project_permission(clients.postgres, resolved, user.user_id, "codificador"):
+        raise HTTPException(status_code=403, detail="Permiso insuficiente para cambiar epistemic_mode")
+
+    current = get_project_epistemic_mode(clients.postgres, resolved)
+    desired = EpistemicMode.from_string(requested_raw)
+    if desired.value == current.value:
+        return {
+            "project_id": resolved,
+            "epistemic_mode": current.value,
+            "changed": False,
+            "message": "epistemic_mode ya estaba configurado",
+        }
+
+    ok, message = set_project_epistemic_mode(clients.postgres, resolved, desired)
+    if not ok:
+        # Guardrails / lock de modo: conflicto de estado.
+        raise HTTPException(status_code=409, detail=message)
+
+    try:
+        log_project_action(
+            clients.postgres,
+            project=resolved,
+            user_id=user.user_id,
+            action="project.epistemic_mode.updated",
+            entity_type="project",
+            entity_id=resolved,
+            details={"from": current.value, "to": desired.value},
+        )
+    except Exception:
+        # Best-effort audit trail: no bloquear el cambio ya aplicado.
+        pass
+
+    api_logger.info(
+        "project.epistemic_mode.updated",
+        project_id=resolved,
+        user=user.user_id,
+        from_mode=current.value,
+        to_mode=desired.value,
+    )
+    return {
+        "project_id": resolved,
+        "epistemic_mode": desired.value,
+        "changed": True,
+        "message": message,
+    }
 
 
 # =============================================================================

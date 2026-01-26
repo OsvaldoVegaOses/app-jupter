@@ -22,6 +22,7 @@ logger = structlog.get_logger(__name__)
 @celery_app.task(bind=True, name="app.tasks.transcribe_audio_task")
 def transcribe_audio_task(
     self,
+    org_id: Optional[str],
     audio_base64: str,
     filename: str,
     project_id: str,
@@ -56,6 +57,15 @@ def transcribe_audio_task(
     log.info("task.transcribe.start")
     
     settings = load_settings()
+    # Enforce tenant scoping: org_id must be provided in production.
+    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "true").lower() in ("1", "true", "yes")
+    if not org_id:
+        if allow_orgless:
+            logger.warning("task.transcribe.org_missing.allow_fallback", task_id=getattr(self.request, "id", None))
+            org_id = ""
+        else:
+            logger.error("task.transcribe.missing_org", task_id=getattr(self.request, "id", None))
+            return {"status": "failed", "error": "Missing org_id for tenant-scoped storage"}
     suffix = Path(filename).suffix.lower()
     
     # Decode audio
@@ -89,34 +99,74 @@ def transcribe_audio_task(
             duration=result.duration_seconds,
         )
         
-        # Save to project folder
+        # Save to a temp docx, upload to Blob Storage (tenant-scoped), and optionally ingest
         from datetime import datetime
-        project_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        project_dir.mkdir(parents=True, exist_ok=True)
-        
-        base_name = Path(filename).stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved_filename = f"{base_name}_{timestamp}.docx"
-        saved_path = project_dir / saved_filename
-        
-        save_transcription_docx(result, saved_path)
-        
-        log.info("task.transcribe.saved", path=str(saved_path))
-        
-        # Ingest if requested
+        import tempfile
+        from hashlib import sha256
+        from app.blob_storage import upload_local_path, logical_path_to_blob_name, CONTAINER_INTERVIEWS, CONTAINER_AUDIO, tenant_upload
+
+        # Create temp docx and save
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpdoc:
+            tmp_doc_path = Path(tmpdoc.name)
+        save_transcription_docx(result, tmp_doc_path)
+
+        # Build logical path and upload (tenant-aware)
+        logical = f"interviews/{project_id}/audio/transcriptions/{tmp_doc_path.name}"
+        try:
+            docx_blob = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical,
+                file_path=str(tmp_doc_path),
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            docx_url = docx_blob["url"]
+            docx_blob_name = docx_blob["name"]
+            docx_hash = docx_blob["sha256"]
+        except Exception:
+            # Fallback to tenant_upload_file in non-strict mode to centralize behavior
+            try:
+                docx_blob = tenant_upload_file(
+                    org_id=org_id or None,
+                    project_id=project_id,
+                    container=CONTAINER_INTERVIEWS,
+                    logical_path=logical,
+                    file_path=str(tmp_doc_path),
+                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    strict_tenant=False,
+                )
+                docx_url = docx_blob.get("url")
+                docx_blob_name = docx_blob.get("name")
+                docx_hash = docx_blob.get("sha256")
+            except Exception:
+                # Legacy fallback: compute name and upload locally
+                try:
+                    docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical)
+                except Exception:
+                    docx_blob_name = f"{project_id}/{tmp_doc_path.name}"
+                docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_doc_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                hdoc = sha256()
+                with open(tmp_doc_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        hdoc.update(chunk)
+                docx_hash = hdoc.hexdigest()
+
+        log.info("task.transcribe.saved_blob", blob=docx_blob_name)
+
+        # Ingest if requested (ingest from temp file path)
         fragments_ingested = None
         if ingest:
             self.update_state(state="PROCESSING", meta={"stage": "ingesting"})
-            
             from app.clients import build_service_clients
             from app.ingestion import ingest_documents
-            
+
             clients = build_service_clients(settings)
             try:
                 ingest_result = ingest_documents(
                     clients,
                     settings,
-                    files=[saved_path],
+                    files=[str(tmp_doc_path)],
                     batch_size=20,
                     min_chars=min_chars,
                     max_chars=max_chars,
@@ -132,7 +182,8 @@ def transcribe_audio_task(
         return {
             "status": "completed",
             "filename": filename,
-            "saved_path": str(saved_path),
+            "saved_path": docx_url,
+            "docx_blob": {"container": CONTAINER_INTERVIEWS, "name": docx_blob_name, "url": docx_url, "sha256": docx_hash},
             "text": result.text,
             "segments": [
                 {
@@ -152,7 +203,14 @@ def transcribe_audio_task(
         log.exception("task.transcribe.error")
         return {"status": "error", "error": str(e), "filename": filename}
     finally:
-        tmp_path.unlink(missing_ok=True)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            tmp_doc_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @celery_app.task(name="app.tasks.batch_status")

@@ -26,7 +26,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.clients import ServiceClients, build_service_clients
 from app.ingestion import ingest_documents
 from app.project_state import resolve_project
-from app.blob_storage import upload_file, CONTAINER_INTERVIEWS, CONTAINER_AUDIO
+from app.blob_storage import (
+    upload_file,
+    CONTAINER_INTERVIEWS,
+    CONTAINER_AUDIO,
+    logical_path_to_blob_name,
+    upload_local_path,
+    tenant_upload,
+    TenantRequiredError,
+    build_artifact_contract,
+)
 from app.settings import AppSettings, load_settings
 from app.postgres_block import stage0_require_ready_or_override
 from backend.auth import User, get_current_user
@@ -291,17 +300,32 @@ async def api_upload_and_ingest(
     saved_filename = f"{Path(safe_filename).stem}_{timestamp}.docx"
     blob_name = f"{project_id}/{saved_filename}"
     
+    # Ensure tenant present for blob writes
+    org_id = getattr(user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+
     tmp_path = None
     try:
         contents = await file.read()
 
-        # Guardar en Azure Blob Storage
-        blob_url = upload_file(
-            CONTAINER_INTERVIEWS,
-            blob_name,
-            contents,
-            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+        # Guardar en Azure Blob Storage using tenant-aware logical path (relative to project)
+        logical = f"interviews/{saved_filename}"
+        # Tenant-aware upload: central helper computes sha256 and returns canonical blob info
+        try:
+            blob_info = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical,
+                data=contents,
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except TenantRequiredError:
+            raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+
+        blob_name_mapped = blob_info["name"]
+        blob_url = blob_info["url"]
 
         log.info(
             "api.upload_and_ingest.saved",
@@ -352,7 +376,9 @@ async def api_upload_and_ingest(
         return {
             "project": project_id,
             "filename": saved_filename,
-            "blob_url": blob_url,
+            "artifact_version": 1,
+            "docx_logical_path": logical,
+            "docx_blob": {"container": CONTAINER_INTERVIEWS, "name": blob_name_mapped, "url": blob_url},
             "result": result,
             "status": "success",
             "message": "Archivo subido a Azure e ingestión completada",
@@ -399,11 +425,15 @@ async def api_upload_and_transcribe(
 
     log = api_logger.bind(endpoint="upload_and_transcribe", project=project)
 
-    # Validar proyecto
+    # Validate tenant and project
     try:
         project_id = resolve_project(project, allow_create=False)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    org_id = getattr(user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
 
     # Validar extensión
     if not file.filename:
@@ -416,34 +446,55 @@ async def api_upload_and_transcribe(
             detail=f"Formato no soportado: {suffix}. Formatos válidos: {', '.join(SUPPORTED_AUDIO_FORMATS)}"
         )
 
-    # Guardar audio original
+    # Guardar audio original (to blob, using logical naming)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_filename = file.filename.replace(" ", "_")
     saved_filename = f"{Path(safe_filename).stem}_{timestamp}{suffix}"
-    blob_name = f"{project_id}/{saved_filename}"
-
+    logical_audio = f"audio/raw/{saved_filename}"
     try:
         contents = await file.read()
-        
-        # Guardar en Azure Blob Storage
-        blob_url = upload_file(
-            CONTAINER_AUDIO,
-            blob_name,
-            contents,
-            content_type=f"audio/{suffix.lstrip('.')}"
-        )
+
+        # Map common extensions to reliable mime types
+        ext = suffix.lower()
+        ext_to_mime = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".mp4": "audio/mp4",
+            ".flac": "audio/flac",
+            ".ogg": "audio/ogg",
+        }
+        content_type = ext_to_mime.get(ext, f"audio/{ext.lstrip('.')}")
+
+        # Tenant-aware upload for audio: helper returns sha256
+        try:
+            audio_blob = tenant_upload(
+                container=CONTAINER_AUDIO,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical_audio,
+                data=contents,
+                content_type=content_type,
+            )
+            audio_sha256 = audio_blob["sha256"]
+            blob_name = audio_blob["name"]
+            blob_url = audio_blob["url"]
+        except TenantRequiredError:
+            raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+        except Exception:
+            # Non-tenant errors (upload failure) -> fallback to local hash
+            blob_url = None
+            import hashlib as _hashlib
+            audio_sha256 = _hashlib.sha256(contents).hexdigest()
         log.info("api.upload_and_transcribe.saved_blob", blob=blob_name, url=blob_url, size=len(contents))
-        
-        # También guardar copia local temporal para transcripción
-        raw_audio_dir = Path(f"data/projects/{project_id}/audio/raw")
-        raw_audio_dir.mkdir(parents=True, exist_ok=True)
-        saved_path = raw_audio_dir / saved_filename
-        with open(saved_path, "wb") as f:
-            f.write(contents)
-        
-        trans_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        trans_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # También guardar copia local temporal para transcripción (se eliminará)
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmpf:
+            tmpf.write(contents)
+            saved_path = Path(tmpf.name)
+
+        trans_dir = Path(tempfile.gettempdir())
+
     except Exception as exc:
         log.error("api.upload_and_transcribe.save_error", error=str(exc))
         raise HTTPException(status_code=500, detail=f"Error guardando audio: {exc}") from exc
@@ -468,25 +519,43 @@ async def api_upload_and_transcribe(
         response_data = {
             "text": result.text,
             "segments": [
-                {
-                    "speaker": seg.speaker,
-                    "text": seg.text,
-                    "start": seg.start,
-                    "end": seg.end,
-                }
+                {"speaker": seg.speaker, "text": seg.text, "start": seg.start, "end": seg.end}
                 for seg in result.segments
             ],
             "speaker_count": result.speaker_count,
             "duration_seconds": result.duration_seconds,
             "fragments_ingested": None,
-            "saved_path": None,
         }
 
         # Guardar DOCX
         docx_filename = f"{Path(safe_filename).stem}_{timestamp}.docx"
         docx_path = trans_dir / docx_filename
         save_transcription_docx(result, docx_path)
-        response_data["saved_path"] = str(docx_path)
+
+        # Upload final DOCX to interviews container using logical mapping (relative to project)
+        logical_docx = f"interviews/audio/transcriptions/{docx_filename}"
+        # Tenant-aware upload for DOCX: use helper to upload and compute sha256
+        docx_blob = tenant_upload(
+            container=CONTAINER_INTERVIEWS,
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=logical_docx,
+            file_path=str(docx_path),
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        docx_blob_name = docx_blob["name"]
+        docx_url = docx_blob["url"]
+        docx_hash = docx_blob["sha256"]
+
+        # Clean local docx and audio temp files
+        try:
+            docx_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            saved_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         # Ingestar (opcional)
         if ingest:
@@ -506,8 +575,18 @@ async def api_upload_and_transcribe(
                 response_data["fragments_ingested"] = totals.get("fragments_total", 0)
             finally:
                 clients.close()
-        
-        return response_data
+        # Return standardized artifact contract
+        return {
+            "artifact_version": 1,
+            "docx_logical_path": logical_docx,
+            "docx_blob": {"container": CONTAINER_INTERVIEWS, "name": docx_blob_name, "url": docx_url, "sha256": docx_hash},
+            "audio_blob": {"container": CONTAINER_AUDIO, "name": blob_name, "url": blob_url, "sha256": audio_sha256},
+            "text": result.text,
+            "segments": response_data["segments"],
+            "speaker_count": result.speaker_count,
+            "duration_seconds": result.duration_seconds,
+            "fragments_ingested": response_data["fragments_ingested"],
+        }
 
     except Exception as exc:
         log.exception("api.upload_and_transcribe.error")
@@ -614,6 +693,11 @@ async def api_transcribe(
         project_id = resolve_project(payload.project, allow_create=False)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Ensure tenant present for blob writes
+    org_id = getattr(user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
     
     # Validar extensión
     suffix = Path(payload.filename).suffix.lower()
@@ -630,8 +714,41 @@ async def api_transcribe(
         audio_bytes = base64.b64decode(payload.audio_base64)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="No se pudo decodificar audio_base64") from exc
-    
-    # Guardar archivo temporal
+
+    # Guardar audio a Blob (logical) y en temporal para transcripción
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = Path(payload.filename).stem
+    saved_filename = f"{base_name}_{timestamp}{suffix}"
+    logical_audio = f"audio/raw/{saved_filename}"
+    # Tenant-aware upload for audio (central helper computes sha256)
+    ext = suffix.lower()
+    ext_to_mime = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+    }
+    content_type = ext_to_mime.get(ext, f"audio/{ext.lstrip('.')}")
+    try:
+        audio_blob = tenant_upload(
+            container=CONTAINER_AUDIO,
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=logical_audio,
+            data=audio_bytes,
+            content_type=content_type,
+        )
+        blob_name = audio_blob["name"]
+        blob_url = audio_blob["url"]
+        audio_sha256 = audio_blob["sha256"]
+    except Exception:
+        blob_url = None
+        import hashlib as _hashlib
+        audio_sha256 = _hashlib.sha256(audio_bytes).hexdigest()
+
+    # Guardar archivo temporal para transcripción
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = Path(tmp.name)
@@ -668,19 +785,50 @@ async def api_transcribe(
             "saved_path": None,
         }
         
-        # Guardar en carpeta del proyecto
-        project_audio_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        project_audio_dir.mkdir(parents=True, exist_ok=True)
-        
-        base_name = Path(payload.filename).stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        saved_filename = f"{base_name}_{timestamp}.docx"
-        saved_path = project_audio_dir / saved_filename
-        
-        save_transcription_docx(result, saved_path)
-        response_data["saved_path"] = str(saved_path)
-        
-        log.info("api.transcribe.saved", path=str(saved_path))
+        # Guardar DOCX temporal y subir a Blob con mapping lógico
+        trans_dir = Path(tempfile.gettempdir())
+        docx_filename = f"{base_name}_{timestamp}.docx"
+        docx_path = trans_dir / docx_filename
+        save_transcription_docx(result, docx_path)
+
+        logical_docx = f"interviews/audio/transcriptions/{docx_filename}"
+        try:
+            docx_blob = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical_docx,
+                file_path=str(docx_path),
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            docx_blob_name = docx_blob["name"]
+            docx_url = docx_blob["url"]
+            docx_hash = docx_blob["sha256"]
+        except TenantRequiredError:
+            raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+        except Exception:
+            # Fallback to legacy upload and manual hash compute for non-tenant upload errors
+            try:
+                docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical_docx)
+            except Exception:
+                docx_blob_name = f"{docx_filename}"
+            docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(docx_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            import hashlib
+            h = hashlib.sha256()
+            with open(docx_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            docx_hash = h.hexdigest()
+
+        # Clean local docx and audio temp files (will also be ensured in finally)
+        try:
+            docx_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         # Ingestar si se solicita
         if payload.ingest:
@@ -689,7 +837,7 @@ async def api_transcribe(
                 ingest_result = ingest_documents(
                     clients,
                     settings,
-                    files=[saved_path],
+                    files=[str(docx_path)],
                     batch_size=20,
                     min_chars=payload.min_chars,
                     max_chars=payload.max_chars,
@@ -700,8 +848,33 @@ async def api_transcribe(
                 response_data["fragments_ingested"] = totals.get("fragments_total", 0)
             finally:
                 clients.close()
-        
-        return response_data
+        # Return standardized artifact contract
+        artifact = build_artifact_contract(audio={
+            "container": CONTAINER_AUDIO,
+            "name": blob_name,
+            "url": blob_url,
+            "sha256": audio_sha256,
+            "size_bytes": None,
+            "content_type": content_type,
+            "logical_path": logical_audio,
+        }, docx={
+            "container": CONTAINER_INTERVIEWS,
+            "name": docx_blob_name,
+            "url": docx_url,
+            "sha256": docx_hash,
+            "size_bytes": None,
+            "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "logical_path": logical_docx,
+        })
+
+        return {
+            **artifact,
+            "text": result.text,
+            "segments": response_data["segments"],
+            "speaker_count": result.speaker_count,
+            "duration_seconds": result.duration_seconds,
+            "fragments_ingested": response_data["fragments_ingested"],
+        }
         
     except ValueError as exc:
         log.error("api.transcribe.error", error=str(exc))
@@ -710,7 +883,15 @@ async def api_transcribe(
         log.exception("api.transcribe.error")
         raise HTTPException(status_code=500, detail=f"Error en transcripción: {exc}") from exc
     finally:
-        tmp_path.unlink(missing_ok=True)
+        try:
+            if 'docx_path' in locals():
+                Path(docx_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -746,9 +927,10 @@ async def api_transcribe_stream(
         )
     
     task = cast(Any, task_transcribe_audio).delay(
+        org_id=getattr(user, "organization_id", None),
+        project_id=project_id,
         audio_base64=payload.audio_base64,
         filename=payload.filename,
-        project_id=project_id,
         diarize=payload.diarize,
         language=payload.language,
         ingest=payload.ingest,
@@ -803,9 +985,10 @@ async def api_transcribe_batch(
     jobs = []
     for file_item in payload.files:
         task = cast(Any, task_transcribe_audio).delay(
+            org_id=getattr(user, "organization_id", None),
+            project_id=project_id,
             audio_base64=file_item.audio_base64,
             filename=file_item.filename,
-            project_id=project_id,
             diarize=payload.diarize,
             language=payload.language,
             ingest=payload.ingest,
@@ -963,6 +1146,11 @@ async def api_transcribe_merge(
         project_id = resolve_project(payload.project, allow_create=False)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Ensure tenant present for blob writes
+    org_id = getattr(user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
     
     log = api_logger.bind(endpoint="transcribe_merge", project=project_id)
     
@@ -1022,26 +1210,46 @@ async def api_transcribe_merge(
         
         doc.save(str(tmp_path))
         
-        # También guardar en carpeta del proyecto
-        project_audio_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-        project_audio_dir.mkdir(parents=True, exist_ok=True)
-        permanent_path = project_audio_dir / f"combined_{timestamp}.docx"
-        doc.save(str(permanent_path))
-        
-        log.info("api.transcribe_merge.saved", path=str(permanent_path))
-        
-        # Leer como base64
-        with open(tmp_path, "rb") as f:
-            docx_bytes = f.read()
-        docx_base64 = base64.b64encode(docx_bytes).decode("utf-8")
-        
-        tmp_path.unlink(missing_ok=True)
-        
+        # Subir DOCX combinado a Blob (logical path) y devolver contrato de artefacto
+        logical_docx = f"interviews/audio/transcriptions/combined_{timestamp}.docx"
+        try:
+            docx_blob = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical_docx,
+                file_path=str(tmp_path),
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            docx_blob_name = docx_blob["name"]
+            docx_url = docx_blob["url"]
+            docx_hash = docx_blob["sha256"]
+        except Exception:
+            try:
+                docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical_docx)
+            except Exception:
+                docx_blob_name = f"combined_{timestamp}.docx"
+            docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            import hashlib as _hashlib
+            h = _hashlib.sha256()
+            with open(tmp_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            docx_hash = h.hexdigest()
+
+        log.info("api.transcribe_merge.saved", blob=docx_blob_name, url=docx_url)
+
         return {
-            "docx_base64": docx_base64,
+            "artifact_version": 1,
+            "docx_logical_path": logical_docx,
+            "docx_blob": {"container": CONTAINER_INTERVIEWS, "name": docx_blob_name, "url": docx_url, "sha256": docx_hash},
             "filename": f"transcripciones_{project_id}_{timestamp}.docx",
         }
-        
     except Exception as exc:
         log.exception("api.transcribe_merge.error")
         raise HTTPException(status_code=500, detail=f"Error generando DOCX: {exc}") from exc
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass

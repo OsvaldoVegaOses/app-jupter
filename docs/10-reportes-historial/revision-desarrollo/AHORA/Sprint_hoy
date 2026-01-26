@@ -1,0 +1,323 @@
+1) Revisión rápida de los nuevos adjuntos (qué tenemos “en la mesa”)
+Backend / API
+
+En backend/app.py existen endpoints completos para:
+
+Codificación abierta: /api/coding/assign, /api/coding/unassign, /api/coding/suggest, /api/coding/fragments, /api/coding/citations, /api/coding/stats, etc.
+
+Axial: /api/axial/gds, /api/axial/hidden-relationships, /api/axial/predict, /api/axial/confirm-relationship, etc.
+
+Ojo: backend/routers/coding.py es explícitamente una migración parcial (“minimal implementation”), y reconoce que el “core real” está aún en app.py.
+
+App (núcleo de dominio)
+
+app/prompts/ ya trae templates diferenciados por epistemic_mode (constructivist / post_positivist), incluyendo axial_coding.txt.
+
+app/prompts/loader.py carga prompts por modo y etapa con cache + fallback auditado.
+
+app/graph_algorithms.py ya es un wrapper multi-motor (Neo4j GDS / Memgraph / NetworkX fallback).
+
+app/graphrag.py ya implementa GraphRAG (Qdrant + Neo4j → contexto para LLM) con gates anti-alucinación.
+
+app/link_prediction.py implementa predicción de enlaces y tiene confirmación de relaciones (hoy centrada en Neo4j).
+
+Frontend
+
+src/components/CodingPanel.tsx dice explícitamente que es el panel “abierta + axial” (aunque hoy el flujo real de axial avanzado está más en endpoints y exploración).
+
+Hay Neo4jExplorer en el build (y en tu base anterior ya estaba mencionado como UI existente).
+
+Migraciones
+
+017_epistemic_mode.sql (modo epistemológico).
+
+018_code_id_propagation.sql agrega code_id a abierta y a candidatos, con backfill desde catalogo_codigos.
+
+✅ Ya existe migración equivalente para “axial con code_id”:
+- 019_axial_ledger_states_code_id.sql agrega `code_id` + `estado` (+ índices) a `analisis_axial` (ledger auditable).
+
+2) Verificación: ¿Codificación abierta está lista?
+
+Sí, está lista como workflow operativo, con un matiz importante: la asignación manual no “cierra” directo en abierta; entra a bandeja de candidatos.
+
+Evidencias desde el código:
+
+backend/app.py expone /api/coding/assign.
+
+Esa ruta llama app/coding.py::assign_open_code(...).
+
+assign_open_code() inserta en codigos_candidatos (origen “manual”, confidence 1.0) y devuelve estado “pendiente”.
+
+Las tablas base están cubiertas:
+
+analisis_codigos_abiertos tiene code_id (en postgres_block.ensure_open_coding_table y en migración 018).
+
+codigos_candidatos tiene code_id y normalización pre-hoc.
+
+✅ Conclusión: Abierta está “lista” y además ya tiene el patrón correcto para replicar en axial:
+
+acciones del usuario → registro auditable → IA como asistente → validación/promoción humana.
+
+3) Axial “modo avanzado”: mejores herramientas disponibles (según debate teórico)
+
+Del debate (Charmaz constructivista vs tradición más positivista/estructurada), el punto clave para “avanzado” es:
+
+Constructivista: axial como construcción situada, reflexiva, categorías tentativas, fuerte memoing.
+
+Post-positivista (Strauss/Corbin): axial más “paradigmática” (condiciones, acciones/interacciones, consecuencias), más estructura pero igual requiere deliberación.
+
+Con lo que ya tienen, el “stack óptimo” para axial avanzado es:
+
+(A) PostgreSQL = Ledger (verdad, auditoría, estados)
+
+Aquí deben vivir:
+
+Hipótesis axiales (draft/proposed/accepted/rejected)
+
+memos obligatorios
+
+evidencia (fragment_ids)
+
+trazabilidad (quién, cuándo, modelo/prompt_version si vino de IA)
+
+(B) Qdrant = Evidencia semántica
+
+Para axial avanzado, Qdrant sirve para:
+
+recuperar fragmentos que apoyen o contradigan una relación
+
+comparación constante en modo axial (buscar “variación” y “casos negativos”)
+
+(C) Neo4j = Capa cognitiva (proyección + exploración + señales)
+
+Neo4j en axial avanzado se usa para:
+
+navegación (vecindarios, caminos, patrones)
+
+métricas/GDS como señales, no como “verdad”
+
+visualización operativa del modelo emergente
+
+Importante: hoy hay endpoints que confirman relaciones directamente en Neo4j. En “axial avanzado” eso debe reconducirse a:
+confirmar = escribir al ledger (Postgres) y sincronizar a Neo4j.
+
+(D) GraphRAG = IA con contexto estructurado
+
+app/graphrag.py ya permite: Qdrant → subgrafo Neo4j → prompt → respuesta con gates.
+
+Esto es perfecto para axial avanzado, porque el LLM no “inventa”: trabaja con evidencia + estructura.
+
+(E) GraphAlgorithms + Link prediction = “radar” de hipótesis
+
+Útiles como generadores de candidatos:
+
+comunidades (Louvain)
+
+centralidad (PageRank)
+
+predicción de enlaces
+
+Pero en axial avanzado deben producir propuestas, no relaciones finales.
+
+4) Integrar IA en axial como en abierta (patrón recomendado)
+
+La mejor manera (y consistente con tu arquitectura actual) es copiar el patrón de abierta:
+
+Propuesta de flujo “Axial Assistant (Advanced)”
+
+Seleccionar foco
+
+conjunto de códigos (canonizados por code_id)
+
+scope (proyecto / caso / entrevista / periodo)
+
+Recuperar evidencia
+
+top-k fragmentos por código desde Qdrant
+
+buscar también contra-evidencia (negativos) para robustez
+
+Inyectar contexto
+
+subgrafo Neo4j relevante (códigos, co-ocurrencias, candidatos)
+
+memos previos (si existen)
+
+LLM genera salida estructurada
+
+usando get_system_prompt(epistemic_mode, "axial_coding")
+
+output JSON (categorías tentativas, relaciones propuestas, memo sugerido, evidencia vinculada)
+
+Persistir como hipótesis
+
+tabla nueva tipo axial_hypotheses (Postgres)
+
+estado inicial = proposed
+
+no “crea teoría” todavía
+
+UI de revisión
+
+el usuario acepta/edita/rechaza
+
+aceptación exige memo (regla de oro)
+
+al “aceptar”, recién se sincroniza a Neo4j como relación “confirmada por humano”
+
+Esto te da “modo avanzado” real: IA acelera, pero el humano gobierna la teoría.
+
+5) “Modo avanzado”: sacar el máximo provecho tecnológico (sin romper epistemología)
+
+Aquí está lo que hace que sea avanzado y no solo “axial v0”:
+
+5.1. Axial con evidencia visible y casos negativos
+
+Cada relación propuesta viene con:
+
+2–4 fragmentos de apoyo
+
+1–2 fragmentos de tensión/contradicción (si existen)
+
+Esto reduce alucinación y mejora rigor.
+
+5.2. Doble interfaz por epistemic_mode (sin duplicar sistema)
+
+Constructivist: relación tipo libre + memo reflexivo + “preguntas para co-construcción”
+
+Post_positivist: relación sugerida dentro del paradigma (condición/acción/consecuencia/contexto), pero editable
+
+5.3. Neo4j como “radar” (no como juez)
+
+GDS/link prediction alimenta:
+
+“posibles puentes”
+
+“códigos periféricos”
+
+“clusters tentativos”
+
+Todo etiquetado como “señal / exploración”.
+
+5.4. Aprendizaje por feedback (como abierta)
+
+Ya tienes /api/coding/feedback.
+En axial: replica eso para que el sistema aprenda:
+
+qué sugerencias se aceptan
+
+qué tipos de relaciones son frecuentes por proyecto
+
+qué evidencias funcionan
+
+Resultado: diagnóstico de validez + siguiente paso inmediato
+Validez del diagnóstico “externo”
+
+Es parcialmente válido si el sistema actual está usando:
+
+Louvain / GDS / link prediction como creación directa de relaciones axiales “oficiales”.
+
+Pero con lo que ya tienen, no hay que “botar Neo4j”: hay que reencuadrarlo como:
+
+Discovery = señales + navegación
+
+Axial = hipótesis memo-driven + confirmación humana + ledger en Postgres
+
+Próximo paso (convertido a backlog + DoD “sin mínimos”)
+
+Objetivo: entregar Axial/Link Prediction “avanzado” sin implementaciones parciales, con multi‑tenant estricto, ledger en PostgreSQL y señales (GDS) no triviales.
+
+Backlog (entregable único, sin pendientes)
+
+BL-01 — Fix multi‑tenant en GDS (/api/axial/gds)
+- Alcance: backend
+- Problema: el endpoint debe recibir `project` y pasar `project_id` a `run_gds_analysis(..., project=...)`.
+- DoD:
+  - [x] Request incluye `project` (default `default`) y se resuelve a project_id canónico.
+  - [x] GDS ejecuta filtrado por project_id (aislamiento).
+  - [x] Respuesta incluye `project` y no cruza datos de otros proyectos.
+  - [x] Logs incluyen project_id.
+
+BL-02 — Comunidades cuando NO hay axial (co‑ocurrencia Código‑Código)
+- Alcance: backend (GDS projection / fallback)
+- Problema: si no existen edges `REL` (axiales), Louvain genera comunidades degeneradas (1 nodo = 1 comunidad) y el panel “Por Comunidades” no devuelve sugerencias.
+- DoD:
+  - [x] Si `REL` axiales = 0, Louvain/Leiden proyectan un grafo alterno de co‑ocurrencia Código‑Código (desde Fragmento→Código) con edges > 0.
+  - [x] Louvain persiste `community_id` y produce comunidades no triviales (al menos una comunidad con size > 1) cuando existan co‑ocurrencias.
+  - [x] `/api/axial/community-links` retorna sugerencias > 0 cuando el grafo tenga comunidades no triviales y pares no conectados.
+  - [x] Si no hay edges (caso extremo), el endpoint devuelve 0 con razón explícita (no “silencio”).
+
+BL-03 — Ledger axial en PostgreSQL (estado + evidencia + code_id)
+- Alcance: migrations + app/postgres_block.py + sync Neo4j
+- Problema: el ledger axial debe soportar estados y code_id para identidad estable; Neo4j debe reflejar solo “validado”.
+- DoD:
+  - [x] `analisis_axial` incorpora `estado` (pendiente|validado|rechazado) y `code_id` (BIGINT) + índices.
+  - [x] Migración idempotente + backfill de `code_id` desde `catalogo_codigos` (por proyecto, case‑insensitive).
+  - [x] `upsert_axial_relationships` persiste `code_id` cuando exista y mantiene evidencia.
+  - [x] `sync-neo4j/axial` sincroniza solo `estado='validado'` si la columna existe.
+
+BL-04 — Cerrar “minimal implementation” + pruebas E2E (Axial/Link Prediction)
+- Alcance: backend routers + frontend tests
+- Problema: no debe quedar código marcado como “minimal implementation” para endpoints usados por UI; el flujo axial/link prediction debe quedar cubierto por E2E.
+- DoD:
+  - [x] Endpoints críticos usados por UI viven en routers (sin duplicados en `backend/app.py`) o el monolito queda solo como “shell”.
+  - [x] Se elimina/actualiza el aviso “minimal implementation” si ya no aplica.
+  - [x] Se agrega spec Playwright que cubre:
+    - abrir panel Link Prediction
+    - ejecutar “Predecir” (algoritmo) y renderizar sugerencias
+    - ejecutar “Por Comunidades”
+    - validar que responde (0 con razón o >0 con lista) sin crash
+    - guardar predicciones (`/api/link-prediction/save`) sin crash
+  - [x] Documentación actualizada: `Sprint_hoy`, `docs/02-configuracion/data_dictionary.md`, `docs/10-reportes-historial/auditorias/auditoria-alineacion-columnas-etiquetas.md`.
+
+---
+
+Tickets nuevos (Axial IA “al nivel de abierta avanzada”)
+
+AX-AI-01 — Axial AI usa `epistemic_mode` + prompts versionados
+- Alcance: backend (`/api/axial/analyze-predictions`, `/api/axial/analyze-hidden-relationships`)
+- Problema: el análisis IA axial está hardcodeado y no respeta el modo epistémico del proyecto; falta audit trail consistente (prompt_version/mode/model).
+- DoD:
+  - [x] Se resuelve `project` → `project_id` canónico (y se valida acceso) antes de llamar LLM.
+  - [x] El system prompt usa `get_system_prompt(epistemic_mode, "axial_coding")` (base + axial), sin strings hardcodeadas de metodología.
+  - [x] La respuesta incluye `epistemic_mode`, `prompt_version`, `llm_deployment`, `llm_api_version`.
+  - [x] Logs incluyen `project_id`, `epistemic_mode` y `prompt_version`.
+  - [x] UI sigue funcionando (compatibilidad hacia atrás: campos nuevos opcionales).
+
+AX-AI-02 — Persistir análisis IA axial como artefacto auditable (ledger)
+- Alcance: PostgreSQL (migración + helpers) + backend (`/api/axial/analyze-predictions`)
+- Problema: hoy el memo IA se devuelve pero no queda como hipótesis revisable; falta persistencia con provenance + estado.
+- DoD:
+  - [x] Tabla `axial_ai_analyses` (multi-tenant) con: `project_id`, `algorithm`, `suggestions_json`, `memo_statements`, `structured`, `epistemic_mode`, `prompt_version`, `llm_deployment`, `llm_api_version`, `created_by`, `estado`, timestamps.
+  - [x] `/api/axial/analyze-predictions` persiste el artefacto (estado `pendiente`) y devuelve `analysis_id`.
+  - [x] Endpoints para listar/leer artefactos por `project_id` (mínimo: list + get by id) con filtros por `estado`.
+  - [x] Data dictionary + auditoría actualizadas para incluir `axial_ai_analyses`.
+
+AX-AI-03 — Evidence-grounded (positivo + casos negativos)
+- Alcance: backend (`/api/axial/analyze-predictions`) + PostgreSQL (`axial_ai_analyses.evidence_json`)
+- Problema: el memo IA no debe basarse solo en pares/score; debe estar grounded en evidencia (fragmentos) + registrar casos en tensión.
+- DoD:
+  - [x] Se construye un “evidence pack” por sugerencia con:
+    - evidencia positiva (co-ocurrencia / IDs provistos / fallback semántico)
+    - evidencia negativa (casos en tensión, si existen)
+    - coverage por método (auditable)
+  - [x] El prompt incluye evidencia resumida (fragmentos) y fuerza citas por `fragmento_id` (`evidence_fragment_ids`).
+  - [x] Se persiste `evidence_schema_version` + `evidence_json` en `axial_ai_analyses` para reproducibilidad.
+  - [x] Si no se encuentra evidencia, se registra explícitamente (notes/flags), no “silencio”.
+  - [x] Data dictionary + auditoría actualizadas para incluir evidencia.
+
+AX-AI-04 — Panel de revisión completo (lista/detalle/acciones)
+- Alcance: frontend + backend
+- Problema: el backend avanzado no es producto usable si no existe workflow humano de revisión/decisión sobre `analysis_id`.
+- DoD:
+  - [x] UI: lista de análisis con filtros (estado, fecha, score/algoritmo, proyecto).
+  - [x] UI: vista detalle muestra memo estructurado + evidencia positiva/negativa.
+  - [x] UI: acciones Validar/Rechazar/Editar (memo humano) con efecto real (estado + audit trail).
+
+AX-AI-05 — Transiciones + historial + retención (hardening)
+- Alcance: backend + PostgreSQL
+- Problema: sin reglas de transición/historial/retención, el ledger pierde auditabilidad y se degrada en producción.
+- DoD:
+  - [x] PATCH con reglas de transición (pendiente → validado/rechazado; impedir reversas sin rol/motivo).
+  - [x] Historial/auditoría de cambios (quién, qué, cuándo, antes/después) vía `project_audit_log`.
+  - [x] Política de retención/cleanup (script + helper) para evitar crecimiento sin control.

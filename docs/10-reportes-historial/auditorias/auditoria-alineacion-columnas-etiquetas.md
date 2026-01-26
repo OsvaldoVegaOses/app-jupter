@@ -2,6 +2,8 @@
 
 **Fecha:** 2026-01-17
 
+**Última actualización:** 2026-01-25
+
 ## Alcance
 - Backend: app, backend
 - Frontend: frontend
@@ -14,6 +16,7 @@ Se identifican discrepancias entre etiquetas de UI, endpoints y columnas reales 
 - ausencia de la columna `is_deleted` en proyectos,
 - ausencia de `neo4j_synced` si no se ejecutó la migración 010,
 - columnas agregadas en migraciones 008 (si no se aplicaron) para `analisis_codigos_abiertos` y `discovery_navigation_log`.
+Adicionalmente, se consideró el flujo axial/link prediction (multi-tenant) y el ledger axial en PostgreSQL.
 
 ## Hallazgos de alineación (columnas vs lógica)
 
@@ -58,6 +61,27 @@ Se identifican discrepancias entre etiquetas de UI, endpoints y columnas reales 
 - **Estado:** **Alineado** si migración 008 aplicada.
 - **Acción recomendada:** verificar y documentar el uso en UI.
 
+### 8) Ledger axial (PostgreSQL): `analisis_axial.estado` + `code_id`
+- **Columnas:** `analisis_axial.code_id`, `analisis_axial.estado`, `validado_por`, `validado_en`, `updated_at`.
+- **Dependencias:** sync a Neo4j debe reflejar solo `estado='validado'` si existe la columna.
+- **Estado:** **Alineado** con migración 019 y el schema idempotente del backend.
+- **Acción recomendada:** asegurar migración 019 en producción para backfill de `code_id` e integridad de `estado`.
+
+### 9) Link Prediction (PostgreSQL): `link_predictions`
+- **Tabla:** `link_predictions` (creación idempotente por backend: `app/postgres_block.py::ensure_link_predictions_table`).
+- **Columnas clave:** `project_id`, `source_code`, `target_code`, `relation_type`, `algorithm`, `score`, `estado`, `validado_por`, `validado_en`, `memo`, `created_at`, `updated_at`.
+- **Unicidad:** `UNIQUE(project_id, source_code, target_code, algorithm)` para evitar duplicados por corrida/algoritmo.
+- **Dependencias:** al validar (`estado='validado'`) se crea relación `(:Codigo)-[:REL]->(:Codigo)` en Neo4j con `project_id` y `tipo=relation_type`.
+- **Estado:** **Alineado** con el schema idempotente del backend y el flujo del panel (guardar → bandeja → validar).
+- **Acción recomendada:** verificar que en producción se crea la tabla al usar el panel y que todo acceso filtra por `project_id` (multi-tenant).
+
+### 10) Axial IA (PostgreSQL): `axial_ai_analyses`
+- **Tabla:** `axial_ai_analyses` (migraciones: `migrations/020_axial_ai_analyses.sql`, `migrations/021_axial_ai_evidence.sql`; creación idempotente por backend: `app/postgres_block.py::ensure_axial_ai_analyses_table`).
+- **Propósito:** persistir el memo/artefacto generado por IA (con etiquetas epistemológicas) como evidencia auditable; no crea relaciones en Neo4j.
+- **Columnas clave:** `project_id`, `source_type`, `algorithm`, `suggestions_json`, `analysis_text`, `memo_statements`, `structured`, `estado`, `created_by`, `epistemic_mode`, `prompt_version`, `llm_deployment`, `llm_api_version`, `evidence_schema_version`, `evidence_json`.
+- **Estado:** **Alineado** con multi-tenant (todo filtra por `project_id`) y con el patrón “IA acelera → humano decide → auditable”.
+- **Acción recomendada:** aplicar migraciones 020/021 en producción para garantizar audit trail + evidencia estable y evitar “artefactos volátiles”.
+
 ## Hallazgos de alineación (etiquetas UI vs comportamiento)
 
 ### Admin Panel: Limpiezas
@@ -74,19 +98,33 @@ Se identifican discrepancias entre etiquetas de UI, endpoints y columnas reales 
   - **Backend:** `app/neo4j_sync.py`.
   - **Estado:** **Alineado** si `neo4j_synced` está presente.
 
+## Etiquetas y relaciones Neo4j (referencia rápida)
+Para evitar errores por etiquetas inconsistentes, usar siempre estas etiquetas y relaciones canónicas:
+- **Etiquetas de nodos:** `Entrevista`, `Fragmento`, `Codigo`, `Categoria`
+- **Relaciones:** `TIENE_FRAGMENTO` (Entrevista → Fragmento), `TIENE_CODIGO` (Fragmento → Codigo), `REL` (Categoria → Codigo o Codigo → Codigo)
+- **Propiedad obligatoria de scope:** `project_id` en nodos y relaciones (multi-tenant)
+- **Propiedades clave:** `nombre` en `Codigo`/`Categoria`, `id` en `Fragmento`, `tipo` en `REL`
+- **Propiedades GDS (si persistidas):** `community_id` (Louvain/Leiden), `score_centralidad` (PageRank/centralidad).
+
+## Nota multi-tenant (proyecto activo)
+- Todo query debe filtrar por `project_id` (ej. `jd-007` para “JD 007”).
+- En servicios HTTP, resolver el identificador usando el resolutor de proyecto antes de consultar BD/Neo4j.
+
 ## Riesgos de producción
 - Errores 500 o UX confuso por columnas no existentes (`is_deleted`, `organization_id` en proyectos).
 - Reportes de sincronización Neo4j incorrectos si no se aplicó migración 010.
 - Detección de huérfanos basada solo en filesystem local (puede ser falso positivo en despliegues con Blob Storage).
 
 ## Recomendaciones prioritarias
-1. **Aplicar migraciones 007/008/010** en producción.
+1. **Aplicar migraciones 007/008/010/019/020/021** en producción.
 2. **Estandarizar `org_id` en `proyectos`** y evitar `organization_id` en ese contexto.
 3. **Definir estrategia oficial para “deleted projects”** (agregar `is_deleted` o eliminar el botón).
 4. **Ajustar limpieza de huérfanos** para contemplar Blob Storage en producción.
 
 ## Implementado (enero 2026)
 - Migración agregada: [migrations/012_add_is_deleted_to_proyectos.sql](migrations/012_add_is_deleted_to_proyectos.sql).
+- Migración agregada: [migrations/019_axial_ledger_states_code_id.sql](migrations/019_axial_ledger_states_code_id.sql).
+- Migración agregada: [migrations/020_axial_ai_analyses.sql](migrations/020_axial_ai_analyses.sql).
 - Script de aplicación: [scripts/apply_migrations_production.py](scripts/apply_migrations_production.py).
 - Alineación de `org_id` en estadísticas admin (join con `proyectos`).
 - Limpieza y detección de huérfanos ahora considera Blob Storage si hay configuración de Azure.
@@ -98,7 +136,7 @@ Validar flujo completo con servicios reales (PostgreSQL, Neo4j, Qdrant, Azure Op
 
 ### Prerrequisitos
 - Servicios reales disponibles y credenciales válidas en `.env`.
-- Migraciones 007/008/010/012 aplicadas en BD productiva.
+- Migraciones 007/008/010/012/013/014/015/017/018/019/020 aplicadas en BD productiva (según features usadas).
 - Backend y frontend corriendo sin `--reload`.
 
 ### Flujo de prueba

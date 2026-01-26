@@ -78,7 +78,10 @@ class TestPostgresBlockFunctions:
         source = pg_block_path.read_text(encoding="utf-8")
         
         assert "def set_project_epistemic_mode(" in source
-        assert "axial_relationships" in source  # Lock check
+        # Lock checks should be based on real tables (no axial_relationships legacy dependency).
+        assert "analisis_codigos_abiertos" in source  # Open coding started
+        assert "analisis_axial" in source  # Axial validated (category↔code)
+        assert "link_predictions" in source  # Axial validated (code↔code)
         assert "Cannot change epistemic_mode" in source
     
     def test_has_axial_relations_exists(self):
@@ -498,6 +501,14 @@ class TestBackendAPIEpistemicMode:
         # Find the ProjectCreateRequest class and check it has epistemic_mode
         assert "class ProjectCreateRequest" in source
         assert "epistemic_mode" in source
+
+    def test_epistemic_mode_update_endpoint_exists(self):
+        """Dedicated endpoint should exist for updating epistemic_mode."""
+        app_path = Path(__file__).parent.parent / "backend" / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        assert "/api/projects/{project_id}/epistemic-mode" in source
+        assert "api_update_project_epistemic_mode" in source
     
     def test_create_project_db_accepts_epistemic_mode(self):
         """create_project_db should accept epistemic_mode parameter."""

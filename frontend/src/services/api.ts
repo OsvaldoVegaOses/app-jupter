@@ -22,10 +22,16 @@
 
 import type { CodingNextResponse } from "../types";
 
-// IMPORTANTE: VITE_BACKEND_URL es para el proxy de Vite, NO para el navegador.
-// API_BASE puede ser vacío (usa proxy) o una URL absoluta (llamada directa al backend).
+// IMPORTANTE:
+// - VITE_API_BASE: URL base explícita (si se quiere llamada directa).
+// - VITE_BACKEND_URL: target del proxy de Vite. Si no hay proxy disponible (p.ej. build estático),
+//   se usa como fallback directo.
+// - En DEV sin variables, usamos http://localhost:8000 (default del proxy en vite.config).
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 const BACKEND_PROXY = import.meta.env.VITE_BACKEND_URL || "";
+const DEFAULT_DEV_BACKEND = "http://localhost:8000";
+const EFFECTIVE_API_BASE =
+  API_BASE || BACKEND_PROXY || (import.meta.env.DEV ? DEFAULT_DEV_BACKEND : "");
 // Support both VITE_NEO4J_API_KEY (explicit) and legacy VITE_API_KEY
 const API_KEY = import.meta.env.VITE_NEO4J_API_KEY || import.meta.env.VITE_API_KEY;
 // Session ID único por sesión de navegador (para logs por sesión)
@@ -97,9 +103,9 @@ function calculateBackoff(attempt: number, baseDelay: number, maxDelay: number):
 
 function buildUrl(path: string): string {
   if (!path.startsWith("/")) {
-    return `${API_BASE}/${path}`;
+    return `${EFFECTIVE_API_BASE}/${path}`;
   }
-  return `${API_BASE}${path}`;
+  return `${EFFECTIVE_API_BASE}${path}`;
 }
 
 if (import.meta.env.DEV && API_BASE && BACKEND_PROXY && API_BASE !== BACKEND_PROXY) {
@@ -792,16 +798,36 @@ export interface GraphRAGRequest {
   include_fragments?: boolean;
   chain_of_thought?: boolean;
   node_ids?: Array<string | number>;
+  // Optional UI-provided context
+  view_nodes?: Array<{ id: string | number; label?: string; community?: string | number; properties?: Record<string, any> }>;
+  graph_metrics?: Record<string, Record<string, number>>;
+  graph_edges?: Array<{ from: string | number; to: string | number; type?: string }>;
+  communities_detected?: Array<{ community_id: number | string; top_nodes: Array<string | number> }>;
+  evidence_candidates?: Array<{ fragmento_id: string; archivo?: string; fragmento?: string; score?: number }>;
+  filters?: Record<string, any>;
+  max_central?: number;
 }
 
 /** GraphRAG response */
 export interface GraphRAGResponse {
   query: string;
-  answer: string;
-  context: string;
-  nodes: Array<{ id: string; type: string; centralidad?: number }>;
-  relationships: Array<{ from: string; to: string; type: string }>;
-  fragments: Array<{ fragmento_id: string; fragmento: string; archivo: string }>;
+  // Backwards-compatible textual answer (may be present on errors)
+  answer?: string;
+  // New structured fields (optional)
+  graph_summary?: string;
+  central_nodes?: Array<{ id: string; score?: number; role?: string }>;
+  bridges?: Array<{ from: string; to: string; explanation?: string }>;
+  communities?: Array<{ community_id: number | string; top_nodes: string[] }>;
+  paths?: Array<string[]>;
+  evidence?: Array<{ rank: number; archivo: string; fragmento_id: string; texto: string; score: number; citation?: string }>;
+  filters_applied?: Record<string, any>;
+  epistemic_labels?: { is_inference?: boolean; unsupported_claims?: string[] };
+  confidence?: string;
+  confidence_reason?: string;
+  context?: string;
+  nodes?: Array<{ id: string; type: string; centralidad?: number }>;
+  relationships?: Array<{ from: string; to: string; type: string }>;
+  fragments?: Array<{ fragmento_id: string; fragmento: string; archivo: string }>;
 }
 
 /** Discovery search request */
@@ -868,6 +894,13 @@ export async function graphragQuery(request: GraphRAGRequest): Promise<GraphRAGR
       include_fragments: request.include_fragments ?? true,
       chain_of_thought: request.chain_of_thought ?? false,
       node_ids: request.node_ids ?? null,
+      view_nodes: request.view_nodes ?? null,
+      graph_metrics: request.graph_metrics ?? null,
+      graph_edges: request.graph_edges ?? null,
+      communities_detected: request.communities_detected ?? null,
+      evidence_candidates: request.evidence_candidates ?? null,
+      filters: request.filters ?? null,
+      max_central: request.max_central ?? null,
     }),
   });
 }
@@ -1122,6 +1155,19 @@ export interface AnalyzePredictionsResponse {
   algorithm: string;
   algorithm_description: string;
   suggestions_analyzed: number;
+  project?: string;
+  epistemic_mode?: string;
+  prompt_version?: string;
+  llm_deployment?: string;
+  llm_api_version?: string;
+  analysis_id?: number;
+  persisted?: boolean;
+  evidence_schema_version?: number;
+  evidence_totals?: {
+    positive?: number;
+    negative?: number;
+    by_method?: Record<string, number>;
+  } | null;
 }
 
 export interface AnalyzeHiddenRelationshipsResponse {
@@ -1129,6 +1175,19 @@ export interface AnalyzeHiddenRelationshipsResponse {
   structured?: boolean;
   memo_statements?: EpistemicStatement[];
   suggestions_analyzed: number;
+  project?: string;
+  epistemic_mode?: string;
+  prompt_version?: string;
+  llm_deployment?: string;
+  llm_api_version?: string;
+  analysis_id?: number;
+  persisted?: boolean;
+  evidence_schema_version?: number;
+  evidence_totals?: {
+    positive?: number;
+    negative?: number;
+    by_method?: Record<string, number>;
+  } | null;
 }
 
 export interface HiddenRelationshipsMetricsResponse {
@@ -1252,6 +1311,20 @@ export interface SaveAnalysisReportResponse {
   report_id: number;
 }
 
+export interface AnalysisReport {
+  id: number;
+  report_type: string;
+  title: string;
+  content: string;
+  metadata?: Record<string, any> | null;
+  created_at?: string | null;
+}
+
+export interface AnalysisReportsResponse {
+  reports: AnalysisReport[];
+  count: number;
+}
+
 /**
  * Save an AI analysis report to the database.
  */
@@ -1274,16 +1347,185 @@ export async function saveAnalysisReport(
   });
 }
 
+/**
+ * List AI analysis reports for a project.
+ */
+export async function listAnalysisReports(
+  project: string,
+  reportType?: string,
+  limit: number = 50
+): Promise<AnalysisReportsResponse> {
+  const qs = new URLSearchParams();
+  qs.set("project", project);
+  if (reportType) qs.set("report_type", reportType);
+  if (typeof limit === "number") qs.set("limit", String(limit));
+  return apiFetchJson<AnalysisReportsResponse>(`/api/analysis/reports?${qs.toString()}`);
+}
+
 /** AI Analysis response for Discovery */
 export interface EpistemicStatement {
   type: "OBSERVATION" | "INTERPRETATION" | "HYPOTHESIS" | "NORMATIVE_INFERENCE" | string;
   text: string;
   evidence_ids?: number[] | null;
+  evidence_fragment_ids?: string[] | null;
   id?: string;
   evidence?: {
     node_ids?: Array<string | number>;
     relationship_ids?: Array<string | number>;
   };
+}
+
+// =============================================================================
+// Axial AI Analyses (audit trail) - AX-AI-02/03/04
+// =============================================================================
+
+export interface AxialAiAnalysisListItem {
+  id: number;
+  project_id: string;
+  source_type: string;
+  algorithm?: string | null;
+  algorithm_description?: string | null;
+  structured: boolean;
+  estado: "pendiente" | "validado" | "rechazado" | string;
+  created_by?: string | null;
+  reviewed_by?: string | null;
+  reviewed_en?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  epistemic_mode?: string | null;
+  prompt_version?: string | null;
+  evidence_schema_version?: number;
+  has_evidence?: boolean;
+  evidence_positive?: number;
+  evidence_negative?: number;
+  max_score?: number;
+}
+
+export interface AxialAiAnalysesListResponse {
+  project: string;
+  items: AxialAiAnalysisListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AxialAiAnalysisDetail {
+  id: number;
+  project_id: string;
+  source_type: string;
+  algorithm?: string | null;
+  algorithm_description?: string | null;
+  suggestions_json: any;
+  analysis_text?: string | null;
+  memo_statements?: EpistemicStatement[] | any;
+  structured: boolean;
+  estado: "pendiente" | "validado" | "rechazado" | string;
+  created_by?: string | null;
+  reviewed_by?: string | null;
+  reviewed_en?: string | null;
+  review_memo?: string | null;
+  epistemic_mode?: string | null;
+  prompt_version?: string | null;
+  llm_deployment?: string | null;
+  llm_api_version?: string | null;
+  evidence_schema_version?: number;
+  evidence_json?: any;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface AxialAiAnalysesListParams {
+  estado?: string;
+  source_type?: string;
+  algorithm?: string;
+  epistemic_mode?: string;
+  created_from?: string;
+  created_to?: string;
+  min_score?: number;
+  has_evidence?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listAxialAiAnalyses(
+  project: string,
+  params: AxialAiAnalysesListParams = {}
+): Promise<AxialAiAnalysesListResponse> {
+  const qs = new URLSearchParams();
+  qs.set("project", project);
+  if (params.estado) qs.set("estado", params.estado);
+  if (params.source_type) qs.set("source_type", params.source_type);
+  if (params.algorithm) qs.set("algorithm", params.algorithm);
+  if (params.epistemic_mode) qs.set("epistemic_mode", params.epistemic_mode);
+  if (params.created_from) qs.set("created_from", params.created_from);
+  if (params.created_to) qs.set("created_to", params.created_to);
+  if (typeof params.min_score === "number") qs.set("min_score", String(params.min_score));
+  if (typeof params.has_evidence === "boolean") qs.set("has_evidence", String(params.has_evidence));
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+
+  return apiFetchJson<AxialAiAnalysesListResponse>(`/api/axial/ai-analyses?${qs.toString()}`);
+}
+
+export async function getAxialAiAnalysis(
+  analysisId: number,
+  project: string
+): Promise<AxialAiAnalysisDetail> {
+  return apiFetchJson<AxialAiAnalysisDetail>(
+    `/api/axial/ai-analyses/${analysisId}?project=${encodeURIComponent(project)}`
+  );
+}
+
+export async function updateAxialAiAnalysis(
+  analysisId: number,
+  project: string,
+  estado: "pendiente" | "validado" | "rechazado",
+  reviewMemo?: string | null
+): Promise<{ success: boolean; analysis_id: number; estado: string }> {
+  return apiFetchJson<{ success: boolean; analysis_id: number; estado: string }>(
+    `/api/axial/ai-analyses/${analysisId}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        project,
+        estado,
+        review_memo: reviewMemo ?? null,
+      }),
+    }
+  );
+}
+
+export type AxialAiSuggestionDecision = "validate_apply" | "reject_close";
+
+export interface AxialAiSuggestionDecisionResponse {
+  success: boolean;
+  analysis_id: number;
+  suggestion_id: number;
+  prediction_id: number;
+  estado: string;
+  neo4j_synced: boolean;
+}
+
+export async function decideAxialAiSuggestion(
+  analysisId: number,
+  project: string,
+  suggestionId: number,
+  decision: AxialAiSuggestionDecision,
+  options: { relation_type?: string; memo?: string | null } = {}
+): Promise<AxialAiSuggestionDecisionResponse> {
+  return apiFetchJson<AxialAiSuggestionDecisionResponse>(
+    `/api/axial/ai-analyses/${analysisId}/suggestions/decision`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        project,
+        suggestion_id: suggestionId,
+        decision,
+        relation_type: options.relation_type ?? null,
+        memo: options.memo ?? null,
+      }),
+    }
+  );
 }
 
 // =============================================================================
@@ -1636,6 +1878,35 @@ export async function revertValidatedCandidates(
       memo: options?.memo,
       dry_run: Boolean(options?.dry_run),
     }),
+  });
+}
+
+// =============================================================================
+// SYNC - Sincronización PostgreSQL → Neo4j
+// =============================================================================
+
+/** Response for Neo4j sync operation */
+export interface SyncNeo4jResponse {
+  success: boolean;
+  pg_codes_total: number;
+  neo4j_codes_before: number;
+  synced_codes: number;
+  synced_relations: number;
+  missing_fragments: number;
+  error?: string;
+}
+
+/**
+ * Sincroniza códigos abiertos desde PostgreSQL a Neo4j.
+ * Crea nodos :Codigo y relaciones :TIENE_CODIGO.
+ */
+export async function syncNeo4j(project: string): Promise<SyncNeo4jResponse> {
+  if (!project || !project.trim()) {
+    throw new Error("Missing required 'project' for syncNeo4j");
+  }
+  return apiFetchJson<SyncNeo4jResponse>("/api/sync/neo4j", {
+    method: "POST",
+    body: JSON.stringify({ project: project.trim() }),
   });
 }
 

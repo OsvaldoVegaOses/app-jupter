@@ -1,4 +1,4 @@
-# Backlog: Fase 1.5 Core — Identidad por ID end-to-end
+; # Backlog: Fase 1.5 Core — Identidad por ID end-to-end
 
 > **Fecha creación:** 23 Enero 2026  
 > **Epic:** Cerrar Fase 1.5 en el core para que `axial_ready` sea un gate real  

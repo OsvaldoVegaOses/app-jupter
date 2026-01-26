@@ -31,6 +31,16 @@ jobs:
       AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
       API_KEY: ${{ secrets.API_KEY }}
       API_KEY_ORG_ID: ${{ secrets.API_KEY_ORG_ID }}
+      QDRANT_URI: ${{ secrets.QDRANT_URI }}
+      QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+      NEO4J_URI: ${{ secrets.NEO4J_URI }}
+      NEO4J_USERNAME: ${{ secrets.NEO4J_USERNAME }}
+      NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+      POSTGRES_HOST: ${{ secrets.POSTGRES_HOST }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
 
       # Backend runtime
       REDIS_URL: redis://127.0.0.1:6379/0
@@ -67,6 +77,12 @@ jobs:
       - name: Start backend
         run: |
           set -euo pipefail
+          # Ensure required secrets are present before starting heavy checks
+          if [ -z "${QDRANT_URI:-}" ] || [ -z "${POSTGRES_HOST:-}" ]; then
+            echo "Required service secrets (QDRANT_URI, POSTGRES_HOST, ...) are missing."
+            echo "Please add them to repository secrets to run full CI smoke checks."
+            exit 1
+          fi
           nohup uvicorn backend.app:app --host 0.0.0.0 --port 8000 > backend-ci.log 2>&1 &
           echo $! > backend.pid
 

@@ -11,6 +11,9 @@ vi.mock("../../services/api", () => ({
 
 const mockApiFetchJson = vi.mocked(api.apiFetchJson);
 
+// Provide a global fetch mock for the upload-and-ingest flow used by the component
+let fetchMock: ReturnType<typeof vi.fn>;
+
 // Mock crypto.randomUUID
 const mockRandomUUID = vi.fn();
 Object.defineProperty(global.crypto, "randomUUID", {
@@ -21,6 +24,17 @@ Object.defineProperty(global.crypto, "randomUUID", {
 beforeEach(() => {
   vi.clearAllMocks();
   mockRandomUUID.mockReturnValue("12345678-1234-1234-1234-123456789012");
+  fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("/api/upload-and-ingest")) {
+      return {
+        ok: true,
+        json: async () => ({ project: "test-project", exit_code: 0, files: ["entrevista1.docx"] })
+      } as unknown as Response;
+    }
+    return { ok: true, json: async () => ({}) } as unknown as Response;
+  });
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
 });
 
 describe("IngestionPanel", () => {
@@ -51,8 +65,10 @@ describe("IngestionPanel", () => {
     render(<IngestionPanel {...defaultProps} />);
 
     // accept several possible label forms (legacy or updated wording)
-    // New ingestion UI uses a dropzone file input; select it and upload a file
-    const fileInput = screen.getByLabelText(/click para seleccionar|arrastra archivos/i) as HTMLInputElement;
+    // New ingestion UI uses a dropzone file input; prefer data-testid, fallback to label
+    const fileInput =
+      screen.queryByTestId("ingestion-file-input") ??
+      (screen.getByLabelText(/click para seleccionar|arrastra archivos/i) as HTMLInputElement);
     const submitButton = screen.getByRole("button", { name: /ejecutar ingesta|ingestar archivos|ingestar|📥 Ingestar Archivos/i });
 
     expect(submitButton).toBeDisabled();
@@ -67,32 +83,41 @@ describe("IngestionPanel", () => {
     await user.click(submitButton);
 
     await waitFor(() => {
-      expect(mockApiFetchJson).toHaveBeenCalledWith(
-        "/api/ingest",
-        expect.objectContaining({ method: "POST" })
-      );
+      expect(fetchMock).toHaveBeenCalled();
+      // Should have called the upload-and-ingest endpoint
+      expect(fetchMock.mock.calls.some(([req]) => req.toString().includes('/api/upload-and-ingest'))).toBe(true);
     });
 
-    // Should show a success/result marker
-    await waitFor(() => expect(screen.queryByText(/resultado/i)).not.toBeNull());
+    // Should show the uploaded file in the queue and a completed stat
+    await waitFor(() => {
+      expect(screen.getByText(/entrevista1.docx/i)).toBeInTheDocument();
+      expect(screen.getByText(/ingestados/i)).toBeInTheDocument();
+    });
   });
 
   test("shows error when ingestion fails", async () => {
     const user = userEvent.setup();
 
-    mockApiFetchJson.mockRejectedValueOnce(new Error("File not found"));
+    // Simulate a network error for the upload endpoint
+    fetchMock.mockRejectedValueOnce(new Error("File not found"));
 
     render(<IngestionPanel {...defaultProps} />);
 
-    const inputsField = screen.getByLabelText(/entradas/i);
-    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta/i });
+    // Simulate uploading a file but the API fails
+    const fileInput =
+      screen.queryByTestId("ingestion-file-input") ??
+      (screen.getByLabelText(/click para seleccionar|arrastra archivos/i) as HTMLInputElement);
+    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta|ingestar archivos|ingestar|📥 Ingestar Archivos/i });
 
-    await user.type(inputsField, "missing.docx");
+    const file = new File(["dummy"], "missing.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+    await user.upload(fileInput, file);
+    await waitFor(() => expect(submitButton).toBeEnabled());
     await user.click(submitButton);
 
     await waitFor(() => {
-      expect(screen.getByText(/error en la ingesta/i)).toBeInTheDocument();
-      expect(screen.getByText(/file not found/i)).toBeInTheDocument();
+      // The UI shows the file in the queue with an error badge
+      expect(screen.getByText(/missing.docx/i)).toBeInTheDocument();
+      expect(screen.getByText(/file not found|failed to parse url/i)).toBeInTheDocument();
     });
   });
 

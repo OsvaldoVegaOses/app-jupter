@@ -38,6 +38,8 @@ import {
     CheckBatchCodesResponse,
     AiPlanMergePair,
     CodeHistoryEntry,
+    syncNeo4j,
+    SyncNeo4jResponse,
 } from "../services/api";
 
 import { CodeHistoryModal } from "./CodeHistoryModal";
@@ -1266,6 +1268,44 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                 </button>
             )}
 
+            {/* Botón Sync Neo4j */}
+            <button
+                onClick={async () => {
+                    if (!project) return;
+                    const confirmSync = confirm('🔄 ¿Sincronizar códigos abiertos con Neo4j?\n\nEsta operación creará nodos :Codigo y relaciones :TIENE_CODIGO en el grafo.');
+                    if (!confirmSync) return;
+                    try {
+                        const result = await syncNeo4j(project);
+                        if (result.success) {
+                            alert(`✅ Sincronización completada:\n\n📊 Códigos en PostgreSQL: ${result.pg_codes_total}\n🔵 Códigos previos en Neo4j: ${result.neo4j_codes_before}\n➕ Códigos sincronizados: ${result.synced_codes}\n🔗 Relaciones creadas: ${result.synced_relations}\n⚠️ Fragmentos faltantes: ${result.missing_fragments}`);
+                        } else {
+                            alert(`❌ Error: ${result.error || 'Error desconocido'}`);
+                        }
+                    } catch (err) {
+                        alert(`❌ Error de sincronización: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }}
+                disabled={loading}
+                style={{
+                    background: loading ? '#9ca3af' : 'linear-gradient(135deg, #0284c7, #38bdf8)',
+                    color: 'white',
+                    border: 'none',
+                    padding: '10px 20px',
+                    borderRadius: '8px',
+                    cursor: loading ? 'not-allowed' : 'pointer',
+                    fontWeight: 600,
+                    fontSize: '0.95rem',
+                    marginBottom: '1rem',
+                    marginLeft: '0.5rem',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                }}
+                title="Sincroniza códigos abiertos desde PostgreSQL a Neo4j (crea nodos y relaciones)"
+            >
+                🔄 Sincronizar con Neo4j
+            </button>
+
             {/* Batch Actions */}
             {filterEstado === "pendiente" && selected.size > 0 && (
                 <div className="validation-panel__batch">
@@ -2043,18 +2083,7 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                 </div>
             )}
 
-            {/* Promote Button */}
-            {stats && ((stats.validated_unpromoted_total ?? stats.totals.validado) > 0) && (
-                <div className="validation-panel__promote">
-                    <button
-                        onClick={handlePromote}
-                        className="btn btn--promote"
-                        disabled={!stats || ((stats.validated_unpromoted_total ?? (stats.totals?.validado ?? 0)) <= 0)}
-                    >
-                        ⬆️ Promover {stats.validated_unpromoted_total ?? stats.totals.validado} códigos validados a Lista Definitiva
-                    </button>
-                </div>
-            )}
+            {/* Botón de promover movido arriba (después de filtros, línea ~1245) */}
 
             {/* Error */}
             {error && <div className="validation-panel__error">{error}</div>}

@@ -11,8 +11,9 @@ Algoritmos implementados:
     - preferential_attachment: Producto de grados
 
 Casos de uso:
-    - Sugerir que Codigo A deberia relacionarse con Categoria B
-    - Identificar codigos que deberian agruparse
+    - Sugerir que Codigo A deberia relacionarse con Codigo B (axial entre códigos)
+    - (Opcional) Sugerir Categoria -> Codigo cuando existe codificación axial
+    - Identificar códigos que deberían agruparse
     - Detectar relaciones causales implicitas
 
 Ejemplo:
@@ -263,7 +264,7 @@ def preferential_attachment(
 def suggest_links(
     clients: ServiceClients,
     settings: AppSettings,
-    source_type: str = "Categoria",
+    source_type: str = "Codigo",
     target_type: str = "Codigo",
     algorithm: str = "common_neighbors",
     top_k: int = 10,
@@ -301,6 +302,17 @@ def suggest_links(
     if not adjacency:
         _logger.warning("link_prediction.empty_graph")
         return []
+
+    # AX-AI-05 / UX: evitar sugerencias repetidas si el par ya fue cerrado (validado/rechazado)
+    # en la bandeja `link_predictions`.
+    closed_pairs: set[tuple[str, str]] = set()
+    if source_type == target_type == "Codigo":
+        try:
+            from app.postgres_block import get_closed_link_prediction_pairs
+
+            closed_pairs = get_closed_link_prediction_pairs(clients.postgres, project_id=project_id)
+        except Exception:
+            closed_pairs = set()
     
     # Seleccionar funcion de scoring
     score_funcs = {
@@ -317,22 +329,49 @@ def suggest_links(
     
     # Calcular scores para pares no conectados
     candidates = []
-    
-    for source in sources:
-        source_neighbors = adjacency.get(source, set())
-        for target in targets:
-            # Solo considerar pares no conectados
-            if target not in source_neighbors and source != target:
+
+    # Si source/target son del mismo tipo (p.ej. Codigo↔Codigo), evitar duplicados A→B y B→A.
+    if source_type == target_type:
+        nodes = sorted(set(sources))
+        for i, source in enumerate(nodes):
+            source_neighbors = adjacency.get(source, set())
+            for target in nodes[i + 1 :]:
+                if target in source_neighbors or source == target:
+                    continue
+                if closed_pairs:
+                    key = (source, target) if source <= target else (target, source)
+                    if key in closed_pairs:
+                        continue
                 score = score_func(adjacency, source, target)
                 if score > min_score:
-                    candidates.append({
-                        "source": source,
-                        "source_type": source_type,
-                        "target": target,
-                        "target_type": target_type,
-                        "score": score,
-                        "algorithm": algorithm,
-                    })
+                    candidates.append(
+                        {
+                            "source": source,
+                            "source_type": source_type,
+                            "target": target,
+                            "target_type": target_type,
+                            "score": score,
+                            "algorithm": algorithm,
+                        }
+                    )
+    else:
+        for source in sources:
+            source_neighbors = adjacency.get(source, set())
+            for target in targets:
+                # Solo considerar pares no conectados
+                if target not in source_neighbors and source != target:
+                    score = score_func(adjacency, source, target)
+                    if score > min_score:
+                        candidates.append(
+                            {
+                                "source": source,
+                                "source_type": source_type,
+                                "target": target,
+                                "target_type": target_type,
+                                "score": score,
+                                "algorithm": algorithm,
+                            }
+                        )
     
     # Ordenar por score y retornar top_k
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -417,8 +456,17 @@ def detect_missing_links_by_community(
     # Obtener nodos con community_id
     cypher = """
     MATCH (n)
-    WHERE n.community_id IS NOT NULL AND (n:Categoria OR n:Codigo)
-      AND n.project_id = $project_id
+    WHERE n.project_id = $project_id
+      AND n.community_id IS NOT NULL
+      AND (
+        n:Codigo
+        OR (
+          n:Categoria
+          AND EXISTS {
+            MATCH (n)-[:REL]-(:Codigo {project_id: $project_id})
+          }
+        )
+      )
     RETURN n.nombre AS name, labels(n)[0] AS type, n.community_id AS community
     """
     
@@ -439,6 +487,14 @@ def detect_missing_links_by_community(
     
     # Obtener grafo para verificar conexiones existentes
     adjacency, _ = get_graph_data(clients, settings, project_id)
+
+    closed_pairs: set[tuple[str, str]] = set()
+    try:
+        from app.postgres_block import get_closed_link_prediction_pairs
+
+        closed_pairs = get_closed_link_prediction_pairs(clients.postgres, project_id=project_id)
+    except Exception:
+        closed_pairs = set()
     
     # Buscar pares no conectados en misma comunidad
     suggestions = []
@@ -451,7 +507,15 @@ def detect_missing_links_by_community(
             for node_b in nodes[i+1:]:
                 name_a = node_a["name"]
                 name_b = node_b["name"]
-                
+                if (
+                    closed_pairs
+                    and node_a.get("type") == "Codigo"
+                    and node_b.get("type") == "Codigo"
+                ):
+                    key = (name_a, name_b) if str(name_a) <= str(name_b) else (name_b, name_a)
+                    if key in closed_pairs:
+                        continue
+                 
                 # Verificar si no estan conectados
                 if name_b not in adjacency.get(name_a, set()):
                     suggestions.append({
@@ -831,63 +895,99 @@ def confirm_hidden_relationship(
     relation_type: str = "partede",
     project: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Confirma una relación oculta, creándola en Neo4j con marca 'descubierta'.
-    
-    Args:
-        source: Nombre del nodo origen
-        target: Nombre del nodo destino
-        relation_type: Tipo de relación (causa, condicion, consecuencia, partede)
-        project: ID del proyecto
-        
-    Returns:
-        Resultado de la operación
+    """Encola una relacion oculta como HIPOTESIS en PostgreSQL (ledger).
+
+    Importante:
+    - NO escribe en Neo4j.
+    - Solo debe sincronizarse a Neo4j cuando un humano la valide/aplique
+      (p.ej. via `link_predictions`).
     """
     from .neo4j_block import ALLOWED_REL_TYPES
-    
+
     project_id = project or "default"
-    
-    if relation_type not in ALLOWED_REL_TYPES:
-        return {"status": "error", "message": f"Tipo '{relation_type}' no válido"}
-    
-    cypher = """
-    MATCH (s {nombre: $source, project_id: $project_id})
-    MATCH (t {nombre: $target, project_id: $project_id})
-    MERGE (s)-[r:REL {tipo: $relation_type}]->(t)
-    SET r.origen = 'descubierta',
-        r.project_id = $project_id,
-        r.confirmado_en = datetime()
-    RETURN s.nombre AS source, t.nombre AS target, r.tipo AS tipo
-    """
-    
+    src = str(source or "").strip()
+    tgt = str(target or "").strip()
+    rel_type = str(relation_type or "").strip().lower()
+
+    if not src or not tgt or src == tgt:
+        return {"status": "error", "message": "source/target invalidos"}
+
+    if rel_type not in ALLOWED_REL_TYPES:
+        return {"status": "error", "message": f"Tipo '{relation_type}' no valido"}
+
     try:
-        with clients.neo4j.session(database=settings.neo4j.database) as session:
-            result = session.run(
-                cypher,
-                source=source,
-                target=target,
-                relation_type=relation_type,
-                project_id=project_id,
+        from app.postgres_block import ensure_link_predictions_table
+
+        ensure_link_predictions_table(clients.postgres)
+
+        # Canonicalize as undirected pair (A,B) to avoid duplicates.
+        a, b = (src, tgt) if src <= tgt else (tgt, src)
+        algorithm = "hidden_relationships"
+        memo = "Descubierta (hidden_relationships): requiere validacion humana"
+
+        existed = False
+        with clients.postgres.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM link_predictions
+                WHERE project_id = %s AND source_code = %s AND target_code = %s AND algorithm = %s
+                LIMIT 1
+                """,
+                (project_id, a, b, algorithm),
             )
-            record = result.single()
-            
-            if record:
-                _logger.info(
-                    "hidden_relationship.confirmed",
-                    source=source,
-                    target=target,
-                    tipo=relation_type,
+            existed = cur.fetchone() is not None
+
+            cur.execute(
+                """
+                INSERT INTO link_predictions (
+                    project_id, source_code, target_code, relation_type,
+                    algorithm, score, rank, memo
                 )
-                return {
-                    "status": "ok",
-                    "source": record["source"],
-                    "target": record["target"],
-                    "tipo": record["tipo"],
-                    "origen": "descubierta",
-                }
-            else:
-                return {"status": "error", "message": "Nodos no encontrados"}
-                
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, source_code, target_code, algorithm) DO UPDATE SET
+                    relation_type = EXCLUDED.relation_type,
+                    memo = COALESCE(EXCLUDED.memo, link_predictions.memo),
+                    score = GREATEST(link_predictions.score, EXCLUDED.score),
+                    updated_at = NOW()
+                RETURNING id, estado
+                """,
+                (project_id, a, b, rel_type, algorithm, 0.0, None, memo),
+            )
+            stored = cur.fetchone()
+        clients.postgres.commit()
+
+        if not stored:
+            return {"status": "error", "message": "No se pudo registrar la hipotesis en link_predictions"}
+
+        prediction_id = int(stored[0])
+        estado = str(stored[1] or "pendiente")
+        action = "updated" if existed else "created"
+
+        _logger.info(
+            "hidden_relationship.queued",
+            project_id=project_id,
+            source=a,
+            target=b,
+            tipo=rel_type,
+            prediction_id=prediction_id,
+            estado=estado,
+            action=action,
+        )
+        return {
+            "status": "ok",
+            "action": action,
+            "project": project_id,
+            "prediction_id": prediction_id,
+            "source": a,
+            "target": b,
+            "relation_type": rel_type,
+            "estado": estado,
+        }
     except Exception as e:
-        _logger.error("hidden_relationship.confirm_error", error=str(e))
+        try:
+            clients.postgres.rollback()
+        except Exception:
+            pass
+        _logger.error("hidden_relationship.queue_error", error=str(e)[:200])
         return {"status": "error", "message": str(e)}

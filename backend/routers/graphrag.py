@@ -60,6 +60,7 @@ async def require_auth(user: User = Depends(get_current_user)) -> User:
 
 # Request Models
 class GDSRequest(BaseModel):
+    project: str = Field(default="default", description="ID del proyecto (multi-tenant)")
     algorithm: str = Field(..., pattern="^(louvain|pagerank|betweenness)$")
     persist: bool = False
     formats: Optional[List[str]] = Field(
@@ -77,6 +78,29 @@ class GraphRAGRequest(BaseModel):
         default=None,
         description="Scope estricto: IDs internos de nodos Neo4j (id(n)); acepta números o strings numéricos.",
     )
+    # Campos opcionales proporcionados por la UI (Neo4jExplorer)
+    view_nodes: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Lista de nodos visibles en la vista (id, label, optional community).",
+    )
+    graph_metrics: Optional[Dict[str, Dict[str, float]]] = Field(
+        default=None,
+        description="Métricas calculadas sobre el subgrafo (pagerank/degree/betweenness).",
+    )
+    graph_edges: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Lista de relaciones del subgrafo (from,to,type).",
+    )
+    communities_detected: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Comunidades detectadas (community_id, top_nodes).",
+    )
+    evidence_candidates: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Fragmentos candidatos con fragment_id, doc_id, snippet y score.",
+    )
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Filtros aplicados desde la UI")
+    max_central: Optional[int] = Field(default=10, description="Máximo de nodos centrales a devolver (<=10)")
 
 # Create routers
 graphrag_router = APIRouter(prefix="/api/graphrag", tags=["GraphRAG"])
@@ -92,11 +116,31 @@ async def api_run_gds_analysis(
     """Execute Graph Data Science algorithms (Louvain, PageRank, Betweenness)."""
     clients = build_neo4j_only(settings)
     try:
+        from app.project_state import resolve_project
+
+        try:
+            project_id = resolve_project(payload.project, allow_create=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        api_logger.info(
+            "api.gds.start",
+            project=project_id,
+            algorithm=payload.algorithm,
+            persist=payload.persist,
+        )
         results = run_gds_analysis(
             cast(ServiceClients, clients),
             settings,
             payload.algorithm,
             persist=payload.persist,
+            project=project_id,
+        )
+        api_logger.info(
+            "api.gds.complete",
+            project=project_id,
+            algorithm=payload.algorithm,
+            rows=len(results),
         )
         return results
     except AxialError as exc:
@@ -154,7 +198,7 @@ async def api_graphrag_query(
 # Link Prediction Endpoints
 @axial_router.get("/predict")
 async def api_axial_predict(
-    source_type: str = Query(default="Categoria"),
+    source_type: str = Query(default="Codigo"),
     target_type: str = Query(default="Codigo"),
     algorithm: str = Query(default="common_neighbors"),
     top_k: int = Query(default=10, ge=1, le=50),
@@ -167,17 +211,20 @@ async def api_axial_predict(
     Predice enlaces faltantes en el grafo axial.
     
     Usa algoritmos de link prediction para sugerir relaciones
-    que podrian estar faltando entre categorias y codigos.
+    que podrian estar faltando entre cÃ³digos (CÃ³digoâ†”CÃ³digo).
     """
     from app.link_prediction import suggest_links, suggest_axial_relations
+    from app.project_state import resolve_project
     
     clients = build_clients_or_error(settings)
     try:
+        project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
         api_logger.info(
             "api.predict.start",
             algorithm=algorithm,
             source_type=source_type,
             target_type=target_type,
+            project=project_id,
         )
         
         if categoria:
@@ -185,7 +232,7 @@ async def api_axial_predict(
             suggestions = suggest_axial_relations(
                 clients, settings,
                 categoria=categoria,
-                project=project,
+                project=project_id,
                 top_k=top_k,
             )
         else:
@@ -196,12 +243,12 @@ async def api_axial_predict(
                 target_type=target_type,
                 algorithm=algorithm,
                 top_k=top_k,
-                project=project,
+                project=project_id,
             )
         
         api_logger.info("api.predict.complete", suggestions=len(suggestions))
         
-        return {"suggestions": suggestions, "algorithm": algorithm}
+        return {"suggestions": suggestions, "algorithm": algorithm, "project": project_id}
         
     except Exception as exc:
         api_logger.error("api.predict.error", error=str(exc))
@@ -222,13 +269,15 @@ async def api_axial_community_links(
     son candidatos para nuevas relaciones.
     """
     from app.link_prediction import detect_missing_links_by_community
+    from app.project_state import resolve_project
     
     clients = build_clients_or_error(settings)
     try:
-        suggestions = detect_missing_links_by_community(clients, settings, project)
+        project_id = resolve_project(project, allow_create=False, pg=clients.postgres)
+        suggestions = detect_missing_links_by_community(clients, settings, project_id)
         
         return {
-            "project": project,
+            "project": project_id,
             "suggestions": suggestions,
             "count": len(suggestions),
         }

@@ -27,9 +27,18 @@ from app.coding_runner_core import constant_comparison_sample, attach_evidence_t
 from app.settings import AppSettings, load_settings
 from app.project_state import resolve_project
 from app.error_handling import api_error, ErrorCode
+from backend.auth import User, get_current_user
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 _logger = structlog.get_logger()
+
+
+def _allow_local_artifacts_fallback() -> bool:
+    return os.getenv("ARTIFACTS_ALLOW_LOCAL_FALLBACK", "false").strip().lower() in {"1", "true", "yes"}
+
+
+async def require_auth(user: User = Depends(get_current_user)) -> User:
+    return user
 
 
 # ============================================================================
@@ -405,11 +414,12 @@ def _write_runner_report(
     synthesis: Dict[str, Any],
     codes_with_fragments: Optional[List[Dict[str, Any]]] = None,
     evidence_metrics: Optional[Dict[str, Any]] = None,
+    org_id: Optional[str] = None,
 ) -> str:
+    """Persist Runner post-run report (Blob-first, strict multi-tenant)."""
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    base_dir = Path("reports") / "runner" / project_id
-    base_dir.mkdir(parents=True, exist_ok=True)
-    file_path = base_dir / f"{ts}_runner_avance_{task_id}.md"
+    filename = f"{ts}_runner_avance_{task_id}.md"
+    logical_path = f"reports/runner/{project_id}/{filename}"
 
     lr = discovery_result.get("final_landing_rate") or {}
     sample = discovery_result.get("sample_fragments") or []
@@ -527,8 +537,37 @@ def _write_runner_report(
     lines.append("\n---")
     lines.append("*Generado automáticamente por Runner Discovery (post-run).*")
 
-    file_path.write_text("\n".join(lines), encoding="utf-8")
-    return str(file_path)
+    content = "\n".join(lines) + "\n"
+
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, tenant_upload_text
+
+        strict = bool(org_id)
+        tenant_upload_text(
+            org_id=org_id or None,
+            project_id=project_id,
+            container=CONTAINER_REPORTS,
+            logical_path=logical_path,
+            text=content,
+            content_type="text/markdown; charset=utf-8",
+            strict_tenant=strict,
+        )
+        return logical_path
+    except Exception as exc:
+        _logger.warning("agent.runner_report.blob_write_failed", error=str(exc)[:200], project_id=project_id, task_id=task_id)
+
+    # Legacy/local fallback (dev).
+    if not _allow_local_artifacts_fallback():
+        return logical_path
+    try:
+        base_dir = Path("reports") / "runner" / project_id
+        base_dir.mkdir(parents=True, exist_ok=True)
+        file_path = base_dir / filename
+        file_path.write_text(content, encoding="utf-8")
+        return str(file_path)
+    except Exception as exc:
+        _logger.warning("agent.runner_report.local_write_failed", error=str(exc)[:200], project_id=project_id, task_id=task_id)
+        return logical_path
 
 
 class DiscoveryRunRequest(BaseModel):
@@ -585,7 +624,7 @@ def build_clients_or_error(settings: AppSettings) -> ServiceClients:
 async def execute_agent(
     request: AgentExecuteRequest,
     background_tasks: BackgroundTasks,
-    # user: User = Depends(require_auth),  # Uncomment when integrating
+    user: User = Depends(require_auth),
 ):
     """Inicia el agente de investigación autónoma."""
     task_id = f"agent_{request.project_id}_{datetime.now().strftime('%H%M%S')}"
@@ -621,6 +660,7 @@ async def execute_agent(
         iterations_per_interview=request.iterations_per_interview,
         discovery_only=request.discovery_only,
         use_constant_comparison=request.use_constant_comparison,
+        org_id=str(getattr(user, "organization_id", None) or ""),
     )
 
     return {
@@ -788,6 +828,7 @@ async def _run_agent_task(
     iterations_per_interview: int = 4,
     discovery_only: bool = False,
     use_constant_comparison: bool = True,
+    org_id: str = "",
 ):
     """Ejecuta el agente en background, usando run_discovery_iterations para Discovery."""
     try:
@@ -936,6 +977,7 @@ async def _run_agent_task(
                     synthesis=synthesis,
                     codes_with_fragments=codes_with_fragments,
                     evidence_metrics=evidence_metrics,
+                    org_id=org_id,
                 )
 
                 post_run = {

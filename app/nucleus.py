@@ -66,10 +66,11 @@ def centrality_overview(
     categoria: Optional[str] = None,
     algorithm: str = "pagerank",
     top_k: int = 10,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     from .axial import run_gds_analysis
 
-    results = run_gds_analysis(clients, settings, algorithm)
+    results = run_gds_analysis(clients, settings, algorithm, project=project)
     categories = [
         row
         for row in results
@@ -109,8 +110,11 @@ def centrality_report(
     settings: AppSettings,
     algorithm: str = "pagerank",
     top_k: int = 10,
+    project: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    overview = centrality_overview(clients, settings, categoria=None, algorithm=algorithm, top_k=top_k)
+    overview = centrality_overview(
+        clients, settings, categoria=None, algorithm=algorithm, top_k=top_k, project=project
+    )
     return overview["top"]
 
 
@@ -231,6 +235,7 @@ def nucleus_report(
         categoria=categoria,
         algorithm=algorithm,
         top_k=centrality_top,
+        project=project_id,
     )
     coverage = coverage_report(clients, categoria, quote_limit=quote_limit, project=project_id)
 

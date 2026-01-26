@@ -427,8 +427,10 @@ class GraphAlgorithms:
     def _extract_graph_data_from_neo4j(self, project_id: str) -> Tuple[nx.DiGraph, Dict[str, Dict]]:
         """Extrae grafo desde Neo4j/Memgraph."""
         query = """
-        MATCH (s)-[:REL]->(t) 
+        MATCH (s)-[r:REL]->(t)
         WHERE s.project_id = $project_id AND t.project_id = $project_id
+          AND coalesce(r.origen, '') <> 'descubierta'
+          AND coalesce(r.source, '') <> 'descubierta'
         RETURN id(s) as sid, s.nombre as sname, labels(s) as slabels, 
                id(t) as tid, t.nombre as tname, labels(t) as tlabels
         """
@@ -775,25 +777,30 @@ class GraphAlgorithms:
         with self.clients.neo4j.session(database=self.settings.neo4j.database) as session:
             try:
                 # Crear proyección
-                self._create_gds_projection(session, graph_name, project_id)
+                meta = self._create_gds_projection(session, graph_name, project_id)
                 
                 # Ejecutar algoritmo
                 if persist:
-                    session.run(
-                        "CALL gds.louvain.write($graph, {writeProperty: 'community_id'})",
-                        graph=graph_name
-                    ).consume()
+                    config: Dict[str, Any] = {"writeProperty": "community_id"}
+                    weight_prop = meta.get("weight_property")
+                    if weight_prop:
+                        config["relationshipWeightProperty"] = weight_prop
+                    session.run("CALL gds.louvain.write($graph, $config)", graph=graph_name, config=config).consume()
                 
                 # Stream results
                 query = """
-                CALL gds.louvain.stream($graph)
+                CALL gds.louvain.stream($graph, $config)
                 YIELD nodeId, communityId
                 RETURN gds.util.asNode(nodeId).nombre AS nombre, 
                        labels(gds.util.asNode(nodeId)) AS etiquetas, 
                        communityId AS community_id
                 ORDER BY communityId, nombre
                 """
-                results = [dict(r) for r in session.run(query, graph=graph_name)]
+                stream_config: Dict[str, Any] = {}
+                weight_prop = meta.get("weight_property")
+                if weight_prop:
+                    stream_config["relationshipWeightProperty"] = weight_prop
+                results = [dict(r) for r in session.run(query, graph=graph_name, config=stream_config)]
                 
             finally:
                 self._drop_gds_projection(session, graph_name)
@@ -815,7 +822,7 @@ class GraphAlgorithms:
         
         with self.clients.neo4j.session(database=self.settings.neo4j.database) as session:
             try:
-                self._create_gds_projection(session, graph_name, project_id)
+                meta = self._create_gds_projection(session, graph_name, project_id)
                 
                 config = {
                     "dampingFactor": damping_factor,
@@ -888,49 +895,100 @@ class GraphAlgorithms:
                 self._create_gds_projection(session, graph_name, project_id)
                 
                 if persist:
-                    session.run(
-                        "CALL gds.leiden.write($graph, {writeProperty: 'community_id'})",
-                        graph=graph_name
-                    ).consume()
+                    config: Dict[str, Any] = {"writeProperty": "community_id"}
+                    weight_prop = meta.get("weight_property")
+                    if weight_prop:
+                        config["relationshipWeightProperty"] = weight_prop
+                    session.run("CALL gds.leiden.write($graph, $config)", graph=graph_name, config=config).consume()
                 
                 query = """
-                CALL gds.leiden.stream($graph)
+                CALL gds.leiden.stream($graph, $config)
                 YIELD nodeId, communityId
                 RETURN gds.util.asNode(nodeId).nombre AS nombre, 
                        labels(gds.util.asNode(nodeId)) AS etiquetas, 
                        communityId AS community_id
                 ORDER BY communityId, nombre
                 """
-                results = [dict(r) for r in session.run(query, graph=graph_name)]
+                stream_config: Dict[str, Any] = {}
+                weight_prop = meta.get("weight_property")
+                if weight_prop:
+                    stream_config["relationshipWeightProperty"] = weight_prop
+                results = [dict(r) for r in session.run(query, graph=graph_name, config=stream_config)]
                 
             finally:
                 self._drop_gds_projection(session, graph_name)
         
         return results
 
-    def _create_gds_projection(self, session, graph_name: str, project_id: str) -> None:
-        """Crea proyección GDS con filtro de proyecto."""
-        node_query = f"""
-                        MATCH (n)
-                        WHERE n.project_id = '{project_id}'
-                            AND (
-                                n:Categoria OR (n:Codigo AND coalesce(n.status,'active') <> 'merged')
-                            )
-            RETURN id(n) AS id
+    def _create_gds_projection(self, session, graph_name: str, project_id: str) -> Dict[str, Any]:
+        """Crea proyección GDS filtrada por proyecto.
+
+        - Preferido: nodos Categoria/Codigo + relaciones axiales (:REL).
+        - Fallback (sin axial): grafo de co-ocurrencia Codigo–Codigo desde
+          (:Fragmento)-[:TIENE_CODIGO]->(:Codigo).
+
+        Esto evita el caso degenerado donde Louvain/Leiden asigna una comunidad
+        por nodo debido a ausencia de edges.
         """
-        rel_query = f"""
-            MATCH (s)-[r:REL]->(t) 
-                        WHERE s.project_id = '{project_id}' AND t.project_id = '{project_id}'
-                            AND (NOT s:Codigo OR coalesce(s.status,'active') <> 'merged')
-                            AND (NOT t:Codigo OR coalesce(t.status,'active') <> 'merged')
-            RETURN id(s) AS source, id(t) AS target, type(r) AS type
-        """
+        rel_count = 0
+        try:
+            rec = session.run(
+                """
+                MATCH (s)-[r:REL]->(t)
+                WHERE s.project_id = $project_id AND t.project_id = $project_id
+                RETURN count(r) AS c
+                """,
+                project_id=project_id,
+            ).single()
+            rel_count = int(rec["c"]) if rec and rec.get("c") is not None else 0
+        except Exception:
+            rel_count = 0
+
+        if rel_count > 0:
+            node_query = f"""
+                MATCH (n)
+                WHERE n.project_id = '{project_id}'
+                  AND (
+                    n:Categoria OR (n:Codigo AND coalesce(n.status,'active') <> 'merged')
+                  )
+                RETURN id(n) AS id
+            """
+            rel_query = f"""
+                MATCH (s)-[r:REL]->(t)
+                WHERE s.project_id = '{project_id}' AND t.project_id = '{project_id}'
+                  AND (NOT s:Codigo OR coalesce(s.status,'active') <> 'merged')
+                  AND (NOT t:Codigo OR coalesce(t.status,'active') <> 'merged')
+                RETURN id(s) AS source, id(t) AS target, type(r) AS type
+            """
+            weight_property = None
+            mode = "axial_rel"
+        else:
+            node_query = f"""
+                MATCH (n:Codigo)
+                WHERE n.project_id = '{project_id}'
+                  AND coalesce(n.status,'active') <> 'merged'
+                RETURN id(n) AS id
+            """
+            rel_query = f"""
+                MATCH (c1:Codigo {{project_id: '{project_id}'}})<-[:TIENE_CODIGO]-(f:Fragmento {{project_id: '{project_id}'}})-[:TIENE_CODIGO]->(c2:Codigo {{project_id: '{project_id}'}})
+                WHERE id(c1) < id(c2)
+                  AND coalesce(c1.status,'active') <> 'merged'
+                  AND coalesce(c2.status,'active') <> 'merged'
+                WITH id(c1) AS source, id(c2) AS target, count(*) AS weight
+                WHERE weight >= 2
+                RETURN source, target, 'COOCCURS' AS type, weight AS weight
+            """
+            weight_property = "weight"
+            mode = "code_cooccurrence"
+
         session.run(
             "CALL gds.graph.project.cypher($graph_name, $node_query, $rel_query)",
             graph_name=graph_name,
             node_query=node_query,
             rel_query=rel_query,
         ).consume()
+
+        return {"mode": mode, "weight_property": weight_property, "axial_rel_count": rel_count}
 
     def _drop_gds_projection(self, session, graph_name: str) -> None:
         """Elimina proyección GDS."""

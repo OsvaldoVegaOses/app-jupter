@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.clients import ServiceClients, build_service_clients
 from app.settings import AppSettings, load_settings
-from app.blob_storage import upload_file, CONTAINER_INTERVIEWS
+from app.blob_storage import upload_file, CONTAINER_INTERVIEWS, tenant_upload, TenantRequiredError
 from app.ingestion import ingest_documents
 from app.documents import load_fragments
 from app.project_state import resolve_project
@@ -131,21 +131,34 @@ async def upload_interview(
     """Step 1: Upload file to Azure and register in DB."""
     logger.info("upload.start", filename=file.filename, project=project)
     
-    # 1. Upload to Azure
+    # 1. Upload to Azure (tenant-aware)
     try:
         content = await file.read()
-        blob_path = f"{project}/{file.filename}"
-        
-        # upload_file is synchronous in app/blob_storage.py
-        blob_url = upload_file(
-            container=CONTAINER_INTERVIEWS, 
-            blob_name=blob_path,
-            data=content,
-            content_type=file.content_type
-        )
+        logical = f"interviews/{file.filename}"
+        org_id = getattr(user, "organization_id", None)
+        if not org_id:
+            raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+
+        try:
+            blob_info = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project,
+                logical_path=logical,
+                data=content,
+                content_type=file.content_type,
+            )
+            blob_url = blob_info["url"]
+        except TenantRequiredError:
+            raise HTTPException(status_code=409, detail="Missing organization_id (tenant). Contact admin or use a tenant-scoped API key.")
+        except Exception as e:
+            logger.error("upload.azure_failed", error=str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to upload to Azure: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("upload.azure_failed", error=str(e))
-        raise HTTPException(500, f"Failed to upload to Azure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload to Azure: {str(e)}")
 
     # 2. Register in DB
     try:

@@ -313,6 +313,8 @@ def sync_axial_relationships(
     has_evidencia = "evidencia" in cols
     has_fragmento_id = "fragmento_id" in cols
     has_memo = "memo" in cols
+    has_estado = "estado" in cols
+    has_code_id = "code_id" in cols
     has_relacion = "relacion" in cols
     has_tipo_relacion = "tipo_relacion" in cols
 
@@ -321,6 +323,8 @@ def sync_axial_relationships(
         "categoria",
         "codigo",
     ]
+    if has_code_id:
+        select_fields.append("code_id")
     if has_relacion:
         select_fields.append("relacion")
     if has_tipo_relacion:
@@ -341,6 +345,7 @@ def sync_axial_relationships(
                 SELECT {', '.join(select_fields)}
                   FROM analisis_axial
                  WHERE {project_col} = %s
+                   {"AND estado = 'validado'" if has_estado else ""}
                  ORDER BY {order_by}, categoria, codigo
                  LIMIT %s OFFSET %s
                 """,
@@ -374,6 +379,7 @@ def sync_axial_relationships(
     idx_project = _get_idx("project_id")
     idx_categoria = _get_idx("categoria")
     idx_codigo = _get_idx("codigo")
+    idx_code_id = _get_idx("code_id")
     idx_relacion = _get_idx("relacion")
     idx_tipo_relacion = _get_idx("tipo_relacion")
     idx_evidencia = _get_idx("evidencia")
@@ -404,11 +410,19 @@ def sync_axial_relationships(
         )
         memo = row[idx_memo] if idx_memo is not None else None
 
+        code_id = None
+        if idx_code_id is not None:
+            try:
+                code_id = int(row[idx_code_id]) if row[idx_code_id] is not None else None
+            except Exception:
+                code_id = None
+
         prepared.append(
             {
                 "project_id": project_id,
                 "categoria": categoria,
                 "codigo": codigo,
+                "code_id": code_id,
                 "relacion": str(relacion),
                 "evidencia": evidencia,
                 "memo": memo,

@@ -72,6 +72,8 @@ python scripts/healthcheck.py --env .env
 | Script | Descripción |
 |--------|-------------|
 | `cleanup_projects.py` | Limpieza de proyectos |
+| `cleanup_axial_ai_analyses.py` | Retención de artefactos IA axial (`axial_ai_analyses`) |
+| `retry_link_predictions_neo4j.py` | Reintentos automáticos de sync Neo4j para link predictions |
 | `clear_projects.py` | Borrar datos de proyectos |
 | `delete_file_data.py` | Eliminar datos de archivo específico |
 | `remap_ghost_codes.py` | Corregir códigos huérfanos |
