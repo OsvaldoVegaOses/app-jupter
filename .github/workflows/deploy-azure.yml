@@ -14,32 +14,40 @@ jobs:
       ACR_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
       RG: ${{ secrets.AZURE_RESOURCE_GROUP }}
       TAG: ${{ github.event.workflow_run.head_sha }}
+      # map secrets into env so they can be referenced in step `if` expressions
+      AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+      AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Login to Azure with service principal
-        if: ${{ secrets.AZURE_CREDENTIALS != '' }}
+        if: ${{ env.AZURE_CREDENTIALS != '' }}
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          creds: ${{ env.AZURE_CREDENTIALS }}
 
       - name: Login to Azure via OIDC
-        if: ${{ secrets.AZURE_CREDENTIALS == '' }}
+        if: ${{ env.AZURE_CREDENTIALS == '' }}
         uses: azure/login@v2
         with:
           enable-oidc: true
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Ensure ACR registry credentials set on Container Apps (if ACR username provided)
-        if: ${{ secrets.ACR_USERNAME != '' }}
+        if: ${{ env.ACR_USERNAME != '' }}
         run: |
-          ACR_USER=${{ secrets.ACR_USERNAME }}
-          ACR_PASS=${{ secrets.ACR_PASSWORD }}
-          ACR_SERVER=${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_USER=${{ env.ACR_USERNAME }}
+          ACR_PASS=${{ env.ACR_PASSWORD }}
+          ACR_SERVER=${{ env.ACR_SERVER }}
           # set registry credentials for axial-api (and other apps if present)
           az containerapp registry set -g "$RG" -n axial-api --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
           az containerapp registry set -g "$RG" -n axial-worker --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
