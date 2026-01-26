@@ -8,6 +8,10 @@ param()
 
 Push-Location -Path (Join-Path $PSScriptRoot '..')
 $backend = $env:BACKEND_URL -or 'http://127.0.0.1:8000'
+# Normalize common mis-set values (e.g., PowerShell boolean True/False from CI environments)
+if ($backend -is [bool] -or ($backend -is [string] -and $backend -match '^(True|False)$')) {
+    $backend = 'http://127.0.0.1:8000'
+}
 $apiKey = $env:API_KEY
 $apiOrg = $env:API_KEY_ORG_ID
 [void] $apiOrg
