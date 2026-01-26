@@ -51,12 +51,15 @@ describe("IngestionPanel", () => {
     render(<IngestionPanel {...defaultProps} />);
 
     // accept several possible label forms (legacy or updated wording)
-    const inputsField = screen.getByLabelText(/entradas|entradas.*ruta.*patron/i);
-    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta|ingestar archivos|ingestar/i });
+    // New ingestion UI uses a dropzone file input; select it and upload a file
+    const fileInput = screen.getByLabelText(/click para seleccionar|arrastra archivos/i) as HTMLInputElement;
+    const submitButton = screen.getByRole("button", { name: /ejecutar ingesta|ingestar archivos|ingestar|📥 Ingestar Archivos/i });
 
     expect(submitButton).toBeDisabled();
 
-    await user.type(inputsField, "data/*.docx");
+    // Simulate file upload
+    const file = new File(["dummy content"], "entrevista1.docx", { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+    await user.upload(fileInput, file);
 
     // Now button should enable
     await waitFor(() => expect(submitButton).toBeEnabled());
