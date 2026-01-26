@@ -54,8 +54,9 @@ jobs:
           az containerapp registry set -g "$RG" -n axial-web --server "$ACR_SERVER" --username "$ACR_USER" --password "$ACR_PASS" || true
 
       - name: Update Container Apps images
+        if: ${{ env.AZURE_CREDENTIALS != '' || (env.AZURE_CLIENT_ID != '' && env.AZURE_TENANT_ID != '') }}
         run: |
-          ACR_SERVER=${{ secrets.ACR_LOGIN_SERVER }}
+          ACR_SERVER=${{ env.ACR_SERVER }}
           echo "Updating axial-api -> $ACR_SERVER/axial-api:$TAG"
           az containerapp update -g "$RG" -n axial-api --image "$ACR_SERVER/axial-api:$TAG"
           # update optional apps if they exist
@@ -63,6 +64,7 @@ jobs:
           az containerapp show -g "$RG" -n axial-web >/dev/null 2>&1 && az containerapp update -g "$RG" -n axial-web --image "$ACR_SERVER/axial-web:$TAG" || echo "axial-web not found, skipping"
 
       - name: Inject secrets and env (storage + flags)
+        if: ${{ env.AZURE_CREDENTIALS != '' || (env.AZURE_CLIENT_ID != '' && env.AZURE_TENANT_ID != '') }}
         run: |
           set -euo pipefail
           if [ -n "${AZURE_STORAGE_CONNECTION_STRING:-}" ]; then
