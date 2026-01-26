@@ -56,11 +56,12 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Prefer editable install if project exposes a package
-          if [ -f pyproject.toml ]; then
-            pip install -e .
-          fi
-          if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
+              # Prefer editable install from the backend folder if packaging metadata exists there
+              if [ -f backend/pyproject.toml ] || [ -f backend/setup.cfg ] || [ -f backend/setup.py ]; then
+                pip install -e backend
+              fi
+              # Fallback: install backend requirements and top-level requirements
+              if [ -f backend/requirements.txt ]; then pip install -r backend/requirements.txt; fi
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Start backend
