@@ -486,6 +486,14 @@ export default defineConfig(({ mode }) => {
       globals: true,
       setupFiles: "./src/test/setup.ts",
       restoreMocks: true,
+      // Only include project source tests and exclude E2E and node_modules
+      include: [
+        "src/**/*.test.{ts,tsx,js,jsx}",
+        "src/**/*.spec.{ts,tsx,js,jsx}",
+        "tests/**/*.test.{ts,tsx,js,jsx}",
+        "tests/**/*.spec.{ts,tsx,js,jsx}"
+      ],
+      exclude: ["tests/e2e/**", "node_modules/**"],
       coverage: {
         provider: "v8",
         reporter: ["text", "json-summary", "html"],
