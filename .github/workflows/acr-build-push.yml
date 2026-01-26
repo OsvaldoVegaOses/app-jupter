@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      IMAGE_NAME: appjupter/backend
+      IMAGE_NAME: axial-api
 
     steps:
       - name: Checkout
