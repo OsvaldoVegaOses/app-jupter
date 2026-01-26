@@ -20,11 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 from app.clients import build_service_clients
 from app.logging_utils import configure_logging
 from app.settings import load_settings
-from app.doctoral_reports import generate_stage4_report
+from app.stage_reports import generate_stage4_report
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Generate Stage 4 doctoral report")
+    parser = argparse.ArgumentParser(description="Generate Stage 4 analytic report")
     parser.add_argument("--env", default=None, help="Path to .env (optional)")
     parser.add_argument("--project", default="default", help="Project ID (project_id)")
     parser.add_argument("--out", default=None, help="Output markdown path")

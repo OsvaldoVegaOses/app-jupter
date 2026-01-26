@@ -27,6 +27,7 @@ import {
     detectDuplicates,
     checkBatchCodes,
     revertValidatedCandidates,
+    logDiscoveryNavigation,
     CandidateCode,
     CandidateStats,
     BacklogHealth,
@@ -276,6 +277,19 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
     const handleValidate = async (id: number) => {
         try {
             await validateCandidate(id, project);
+            // E3-1.2: Log validation action
+            try {
+                const candidate = candidates.find(c => c.id === id);
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: candidate ? [candidate.codigo] : [],
+                    negativos: [],
+                    target_text: candidate?.cita || null,
+                    fragments_count: 1,
+                    codigos_sugeridos: [],
+                    action_taken: "e3_validate",
+                });
+            } catch { /* non-blocking */ }
             await loadCandidates();
             await loadStats();
         } catch (err) {
@@ -287,6 +301,19 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
         const memo = prompt("Razón del rechazo (opcional):");
         try {
             await rejectCandidate(id, project, memo || undefined);
+            // E3-1.2: Log rejection action
+            try {
+                const candidate = candidates.find(c => c.id === id);
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: [],
+                    negativos: candidate ? [candidate.codigo] : [],
+                    target_text: candidate?.cita || null,
+                    fragments_count: 1,
+                    codigos_sugeridos: [],
+                    action_taken: "e3_reject",
+                });
+            } catch { /* non-blocking */ }
             await loadCandidates();
             await loadStats();
         } catch (err) {
@@ -296,27 +323,69 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
     const handleBatchValidate = async () => {
         if (selected.size === 0) return;
+        // E3-4.1: Confirmación antes de batch validate
+        if (!confirm(`¿Validar ${selected.size} candidato(s) seleccionado(s)?\n\nEsta acción marca los candidatos como listos para promoción.`)) {
+            return;
+        }
+        let successCount = 0;
+        const validatedCodes: string[] = [];
         for (const id of selected) {
             try {
                 await validateCandidate(id, project);
+                const candidate = candidates.find(c => c.id === id);
+                if (candidate) validatedCodes.push(candidate.codigo);
+                successCount++;
             } catch (err) {
                 console.error(`Error validating ${id}:`, err);
             }
         }
+        // E3-1.2: Log batch validation
+        try {
+            await logDiscoveryNavigation({
+                project,
+                positivos: validatedCodes,
+                negativos: [],
+                target_text: null,
+                fragments_count: successCount,
+                codigos_sugeridos: [],
+                action_taken: "e3_validate",
+            });
+        } catch { /* non-blocking */ }
         await loadCandidates();
         await loadStats();
     };
 
     const handleBatchReject = async () => {
         if (selected.size === 0) return;
+        // E3-4.1: Confirmación antes de batch reject
+        if (!confirm(`¿Rechazar ${selected.size} candidato(s) seleccionado(s)?\n\nEsta acción es reversible desde el historial.`)) {
+            return;
+        }
         const memo = prompt("Razón del rechazo (opcional):");
+        let successCount = 0;
+        const rejectedCodes: string[] = [];
         for (const id of selected) {
             try {
                 await rejectCandidate(id, project, memo || undefined);
+                const candidate = candidates.find(c => c.id === id);
+                if (candidate) rejectedCodes.push(candidate.codigo);
+                successCount++;
             } catch (err) {
                 console.error(`Error rejecting ${id}:`, err);
             }
         }
+        // E3-1.2: Log batch rejection
+        try {
+            await logDiscoveryNavigation({
+                project,
+                positivos: [],
+                negativos: rejectedCodes,
+                target_text: null,
+                fragments_count: successCount,
+                codigos_sugeridos: [],
+                action_taken: "e3_reject",
+            });
+        } catch { /* non-blocking */ }
         await loadCandidates();
         await loadStats();
     };
@@ -361,7 +430,7 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
         const notaEvidencia =
             "\n\nNota: solo se promueven candidatos validados con evidencia (fragmento_id válido).";
-        if (!confirm(`¿Promover ${totalPorPromover} candidato(s) validados (pendientes) a la lista definitiva?${notaEvidencia}`)) return;
+        if (!confirm(`¿Promover ${totalPorPromover} candidato(s) validados a la Lista Definitiva?${notaEvidencia}`)) return;
         try {
             const result = await promoteCandidates(project, { promoteAllValidated: true });
 
@@ -369,13 +438,35 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
             const eligible = (result.eligible_total ?? null);
             const skipped = (result.skipped_total ?? null);
 
+            // E3-1.2: Log promotion action
+            try {
+                await logDiscoveryNavigation({
+                    project,
+                    positivos: [],
+                    negativos: [],
+                    target_text: null,
+                    fragments_count: promoted,
+                    codigos_sugeridos: [],
+                    ai_synthesis: `promoted=${promoted}, skipped=${skipped ?? 0}`,
+                    action_taken: "e3_promote",
+                });
+            } catch { /* non-blocking */ }
+
             const details: string[] = [];
             if (typeof eligible === "number") details.push(`elegibles: ${eligible}`);
             if (typeof skipped === "number" && skipped > 0) details.push(`omitidos (sin evidencia): ${skipped}`);
+            
+            // Neo4j sync metrics
+            const neo4jMerged = result.neo4j_merged ?? 0;
+            const neo4jMissing = result.neo4j_missing_fragments ?? 0;
+            const neo4jInfo = neo4jMerged > 0 
+                ? `\n🔗 Neo4j: ${neo4jMerged} relación(es) sincronizada(s)${neo4jMissing > 0 ? `, ${neo4jMissing} fragmento(s) pendiente(s)` : ''}`
+                : '';
 
             alert(
                 `✅ ${promoted} fila(s) promovida(s) a la lista definitiva.` +
-                (details.length ? `\n(${details.join(" · ")})` : "")
+                (details.length ? `\n(${details.join(" · ")})` : "") +
+                neo4jInfo
             );
             await loadCandidates();
             await loadStats();
@@ -855,7 +946,10 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                 if (toPromote.length > 0) {
                     try {
                         const promoteResult = await promoteCandidates(project, { candidateIds: toPromote.map(c => c.id) });
-                        alert(`✅ ${promoteResult.promoted_count} códigos promovidos a la Lista Definitiva.`);
+                        const neo4jInfo = (promoteResult.neo4j_merged ?? 0) > 0
+                            ? `\n🔗 Neo4j: ${promoteResult.neo4j_merged} relación(es) sincronizada(s)`
+                            : '';
+                        alert(`✅ ${promoteResult.promoted_count} códigos promovidos a la Lista Definitiva.${neo4jInfo}`);
                         await loadCandidates();
                         await loadStats();
                     } catch (err) {
@@ -1146,6 +1240,31 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                     </label>
                 </div>
             </div>
+
+            {/* Promote Button - Visible */}
+            {stats && ((stats.validated_unpromoted_total ?? 0) > 0) && (
+                <button
+                    onClick={handlePromote}
+                    disabled={loading}
+                    style={{
+                        background: loading ? "#9ca3af" : "linear-gradient(135deg, #059669, #10b981)",
+                        color: "white",
+                        border: "none",
+                        padding: "10px 20px",
+                        borderRadius: "8px",
+                        cursor: loading ? "not-allowed" : "pointer",
+                        fontWeight: 600,
+                        fontSize: "0.95rem",
+                        marginBottom: "1rem",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                    }}
+                    title="Promueve todos los códigos validados (no promovidos aún) a la lista definitiva y sincroniza con Neo4j"
+                >
+                    ⬆️ Promover {stats.validated_unpromoted_total} códigos validados a Lista Definitiva
+                </button>
+            )}
 
             {/* Batch Actions */}
             {filterEstado === "pendiente" && selected.size > 0 && (
@@ -1932,7 +2051,7 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                         className="btn btn--promote"
                         disabled={!stats || ((stats.validated_unpromoted_total ?? (stats.totals?.validado ?? 0)) <= 0)}
                     >
-                        ⬆️ Promover {stats.validated_unpromoted_total ?? stats.totals.validado} códigos (pendientes) a Lista Definitiva
+                        ⬆️ Promover {stats.validated_unpromoted_total ?? stats.totals.validado} códigos validados a Lista Definitiva
                     </button>
                 </div>
             )}

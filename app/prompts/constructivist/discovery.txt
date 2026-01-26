@@ -1,0 +1,64 @@
+ETAPA: SÍNTESIS DISCOVERY (Enfoque Constructivista)
+
+ENTRADA ESPERADA:
+- query: string (consulta semántica original)
+- top_fragments: lista de {evidence_id: int, text: string, source: string, score: float}
+- anchors: lista de strings (anclas positivas usadas, opcional)
+- negatives: lista de strings (anclas negativas usadas, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Sintetizar fragmentos recuperados semánticamente, identificando patrones emergentes
+desde una perspectiva situada y reflexiva.
+
+PRINCIPIOS:
+- Esta síntesis representa UNA lectura posible, no LA verdad del dato
+- Los códigos sugeridos son hipótesis de trabajo, no conclusiones
+- El contexto de búsqueda (anclas, negativos) influye en lo que encontramos
+
+INSTRUCCIONES:
+1. Lee los fragmentos recuperados buscando procesos y experiencias
+2. Sintetiza hallazgos como statements epistémicos diferenciados
+3. Sugiere códigos en formato gerundio (snake_case)
+4. Propón refinamientos para profundizar la exploración
+
+FORMATO memo_sintesis (obligatorio):
+- OBSERVATION: Lo que los fragmentos dicen literalmente (con evidence_ids)
+- INTERPRETATION: Tu lectura del patrón (con evidence_ids)
+- HYPOTHESIS: Proposición tentativa para explorar
+- NORMATIVE_INFERENCE: Implicaciones si aplica
+
+LIMITACIONES A DECLARAR:
+- Número de fragmentos analizados
+- Sesgo de la query utilizada
+- Lo que podría estar quedando fuera
+
+EJEMPLO:
+{
+  "memo_sintesis": [
+    {
+      "type": "OBSERVATION",
+      "text": "Tres fragmentos mencionan 'ya no es como antes' al referirse al barrio.",
+      "evidence_ids": [1, 3, 7]
+    },
+    {
+      "type": "INTERPRETATION",
+      "text": "Esto sugiere un proceso de pérdida de referentes identitarios.",
+      "evidence_ids": [1, 3, 7]
+    },
+    {
+      "type": "HYPOTHESIS",
+      "text": "La nostalgia podría funcionar como mecanismo de resistencia simbólica."
+    }
+  ],
+  "codigos_sugeridos": [
+    "experimentando_perdida",
+    "añorando_comunidad_anterior",
+    "resistiendo_cambio_demografico"
+  ],
+  "refinamiento_busqueda": {
+    "positivos": ["cambio", "vecinos nuevos"],
+    "negativos": ["política municipal"],
+    "target": null
+  }
+}

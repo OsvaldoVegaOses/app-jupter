@@ -104,6 +104,7 @@ OpenCodeRow = Tuple[
     str,  # cita
     Optional[str],  # fuente
     Optional[str],  # memo
+    Optional[int],  # code_id (new)
 ]
 
 AxialRow = Tuple[
@@ -486,6 +487,11 @@ def log_discovery_navigation(
     ai_synthesis: Optional[str] = None,
     action_taken: str = "search",
     busqueda_origen_id: Optional[str] = None,
+    # E3-1.2: Additional fields for E3 traceability
+    seed_fragmento_id: Optional[str] = None,
+    scope_archivo: Optional[str] = None,
+    top_k: Optional[int] = None,
+    include_coded: Optional[bool] = None,
 ) -> str:
     """
     Registra una navegación de búsqueda Discovery para trazabilidad.
@@ -499,13 +505,28 @@ def log_discovery_navigation(
         codigos_sugeridos: Códigos sugeridos por IA (si aplica)
         refinamientos_aplicados: Refinamientos aplicados desde IA
         ai_synthesis: Texto de síntesis IA
-        action_taken: Acción realizada ('search', 'refine', 'send_codes')
+        action_taken: Acción realizada ('search', 'refine', 'send_codes', 'e3_*')
         busqueda_origen_id: UUID de búsqueda padre (si es refinamiento)
+        seed_fragmento_id: E3 - Fragmento semilla para sugerencias
+        scope_archivo: E3 - Filtro de scope por archivo
+        top_k: E3 - Cantidad de fragmentos similares solicitados
+        include_coded: E3 - Incluir fragmentos ya codificados
         
     Returns:
         UUID de la nueva entrada
     """
     ensure_discovery_navigation_table(pg)
+    
+    # E3-1.2: Merge E3 fields into refinamientos_aplicados for storage
+    merged_refinements = dict(refinamientos_aplicados or {})
+    if seed_fragmento_id is not None:
+        merged_refinements["seed_fragmento_id"] = seed_fragmento_id
+    if scope_archivo is not None:
+        merged_refinements["scope_archivo"] = scope_archivo
+    if top_k is not None:
+        merged_refinements["top_k"] = top_k
+    if include_coded is not None:
+        merged_refinements["include_coded"] = include_coded
     
     sql = """
     INSERT INTO discovery_navigation_log (
@@ -534,7 +555,7 @@ def log_discovery_navigation(
                 target_text,
                 fragments_count,
                 codigos_sugeridos or [],
-                Json(refinamientos_aplicados) if refinamientos_aplicados else None,
+                Json(merged_refinements) if merged_refinements else None,
                 ai_synthesis,
                 action_taken,
             ),
@@ -1643,6 +1664,8 @@ def ensure_open_coding_table(pg: PGConnection) -> None:
         CREATE INDEX IF NOT EXISTS ix_aca_project_archivo ON analisis_codigos_abiertos(project_id, archivo);
         CREATE INDEX IF NOT EXISTS ix_aca_created_at ON analisis_codigos_abiertos(created_at);
             ALTER TABLE analisis_codigos_abiertos ADD COLUMN IF NOT EXISTS memo TEXT;
+            ALTER TABLE analisis_codigos_abiertos ADD COLUMN IF NOT EXISTS code_id BIGINT;
+        CREATE INDEX IF NOT EXISTS ix_aca_project_code_id ON analisis_codigos_abiertos(project_id, code_id) WHERE code_id IS NOT NULL;
         """
         with pg.cursor() as cur:
             cur.execute(sql)
@@ -1729,21 +1752,35 @@ def ensure_code_catalog_entry(
     codigo: str,
     *,
     status: str = "active",
-) -> None:
-    """Crea (si falta) una fila en `catalogo_codigos` para un código."""
+) -> Optional[int]:
+    """Crea (si falta) una fila en `catalogo_codigos` para un código.
+    
+    Returns:
+        El code_id del registro (existente o creado), o None si codigo es vacío.
+    """
     if not codigo or not str(codigo).strip():
-        return
+        return None
 
     ensure_codes_catalog_table(pg)
+    codigo_clean = str(codigo).strip()
+    
     with pg.cursor() as cur:
+        # INSERT con RETURNING para obtener code_id
         cur.execute(
             """
             INSERT INTO catalogo_codigos (project_id, codigo, status)
             VALUES (%s, %s, %s)
-            ON CONFLICT (project_id, codigo) DO NOTHING
+            ON CONFLICT (project_id, codigo) DO UPDATE SET updated_at = NOW()
+            RETURNING code_id
             """,
-            (project_id, str(codigo).strip(), status),
+            (project_id, codigo_clean, status),
         )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+    
+    # Fallback: consultar el code_id existente
+    return get_code_id_for_codigo(pg, project_id, codigo_clean)
 
 
 def resolve_canonical_codigo(
@@ -1857,6 +1894,147 @@ def resolve_canonical_codigos_bulk(
     return current
 
 
+def resolve_canonical_code_id(
+    pg: PGConnection,
+    project_id: str,
+    code_id: int,
+    *,
+    max_hops: int = 10,
+) -> Optional[int]:
+    """Resuelve un code_id hacia su canónico siguiendo `canonical_code_id`.
+
+    A diferencia de resolve_canonical_codigo (que opera por texto), esta función
+    usa la identidad estable por ID, que es el camino preferido para Fase 1.5+.
+
+    Args:
+        pg: Conexión PostgreSQL.
+        project_id: ID del proyecto.
+        code_id: ID del código a resolver.
+        max_hops: Máximo de saltos para evitar loops infinitos.
+
+    Returns:
+        El code_id canónico final, o None si:
+        - El code_id no existe en el catálogo.
+        - Se detecta un ciclo.
+
+    Example:
+        >>> # Código canónico (sin puntero) → retorna sí mismo
+        >>> resolve_canonical_code_id(pg, "jd-007", 42)
+        42
+
+        >>> # Código merged (42 → 100) → retorna canónico
+        >>> resolve_canonical_code_id(pg, "jd-007", 42)
+        100
+
+        >>> # Código inexistente → None
+        >>> resolve_canonical_code_id(pg, "jd-007", 99999)
+        None
+    """
+    if code_id is None:
+        return None
+
+    ensure_codes_catalog_table(pg)
+
+    current = int(code_id)
+    seen: set[int] = set()
+
+    for _ in range(max_hops):
+        if current in seen:
+            # Ciclo detectado
+            _logger.warning(
+                "resolve_canonical_code_id.cycle_detected project=%s code_id=%s cycle_at=%s path=%s",
+                project_id, code_id, current, list(seen),
+            )
+            return None
+        seen.add(current)
+
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                SELECT code_id, canonical_code_id, status
+                  FROM catalogo_codigos
+                 WHERE project_id = %s AND code_id = %s
+                """,
+                (project_id, current),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            # code_id no existe
+            if current == code_id:
+                # El ID original no existe
+                return None
+            # Llegamos a un puntero que no existe (inconsistencia)
+            _logger.warning(
+                "resolve_canonical_code_id.dangling_pointer project=%s original_code_id=%s dangling_id=%s",
+                project_id, code_id, current,
+            )
+            return None
+
+        db_code_id, canonical_code_id, status = row[0], row[1], row[2]
+
+        # Caso 1: Es canónico (canonical_code_id es NULL)
+        if canonical_code_id is None:
+            return int(db_code_id)
+
+        # Caso 2: Self-canonical (canonical_code_id = code_id) — estado esperado
+        if int(canonical_code_id) == int(db_code_id):
+            return int(db_code_id)
+
+        # Caso 3: Merged/superseded — seguir la cadena
+        if status in ("merged", "superseded"):
+            current = int(canonical_code_id)
+            continue
+
+        # Caso 4: Activo con canonical_code_id (inusual pero válido)
+        # Podría ser un alias temporal; retornamos el target
+        return int(canonical_code_id)
+
+    # Se excedió max_hops — posible ciclo largo o cadena muy profunda
+    _logger.warning(
+        "resolve_canonical_code_id.max_hops_exceeded project=%s code_id=%s max_hops=%s",
+        project_id, code_id, max_hops,
+    )
+    return None
+
+
+def get_code_id_for_codigo(
+    pg: PGConnection,
+    project_id: str,
+    codigo: str,
+) -> Optional[int]:
+    """Obtiene el code_id para un código por su label (texto).
+
+    Útil para transición: cuando se recibe texto y se necesita operar por ID.
+
+    Args:
+        pg: Conexión PostgreSQL.
+        project_id: ID del proyecto.
+        codigo: Label del código (texto).
+
+    Returns:
+        El code_id si existe, None si no.
+    """
+    if not codigo or not str(codigo).strip():
+        return None
+
+    ensure_codes_catalog_table(pg)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT code_id
+              FROM catalogo_codigos
+             WHERE project_id = %s AND lower(codigo) = lower(%s)
+            """,
+            (project_id, str(codigo).strip()),
+        )
+        row = cur.fetchone()
+
+    if row and row[0] is not None:
+        return int(row[0])
+    return None
+
 
 def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     """
@@ -1864,6 +2042,8 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     
     IMPORTANTE: Filtra automáticamente registros con fragmento_id vacío o None
     para mantener la coherencia de datos.
+    
+    OpenCodeRow: (project_id, fragmento_id, codigo, archivo, cita, fuente, memo, code_id)
     """
     # Filtrar registros con fragmento_id inválido
     valid_data = [
@@ -1873,6 +2053,15 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
     
     if not valid_data:
         return
+    
+    # Si code_id no está en la tupla (compatibilidad), agregar None
+    normalized = []
+    for row in valid_data:
+        if len(row) == 7:
+            # Legacy: agregar code_id=None
+            normalized.append((*row, None))
+        else:
+            normalized.append(row)
         
     sql = """
     INSERT INTO analisis_codigos_abiertos (
@@ -1882,17 +2071,19 @@ def upsert_open_codes(pg: PGConnection, rows: Iterable[OpenCodeRow]) -> None:
         archivo,
         cita,
         fuente,
-        memo
+        memo,
+        code_id
     )
     VALUES %s
     ON CONFLICT (project_id, fragmento_id, codigo) DO UPDATE SET
         cita = EXCLUDED.cita,
         fuente = EXCLUDED.fuente,
         memo = EXCLUDED.memo,
+        code_id = COALESCE(EXCLUDED.code_id, analisis_codigos_abiertos.code_id),
         created_at = analisis_codigos_abiertos.created_at;
     """
     with pg.cursor() as cur:
-        execute_values(cur, sql, valid_data, page_size=200)
+        execute_values(cur, sql, normalized, page_size=200)
 
 
 def merge_definitive_codes_by_code(
@@ -2673,14 +2864,18 @@ def get_fragment_context(pg: PGConnection, fragment_id: str, project: Optional[s
 
 
 def get_citations_by_code(pg: PGConnection, codigo: str, project: Optional[str] = None) -> List[Dict[str, Any]]:
+    project_id = project or "default"
     sql = """
-    SELECT fragmento_id, codigo, archivo, cita, fuente, memo, created_at
-      FROM analisis_codigos_abiertos
-     WHERE codigo = %s AND project_id = %s
-     ORDER BY created_at DESC
+    SELECT aca.fragmento_id, aca.codigo, aca.archivo, aca.cita, aca.fuente, aca.memo, aca.created_at,
+           cc.code_id
+      FROM analisis_codigos_abiertos aca
+      LEFT JOIN catalogo_codigos cc
+        ON cc.project_id = aca.project_id AND cc.codigo = aca.codigo
+     WHERE aca.codigo = %s AND aca.project_id = %s
+     ORDER BY aca.created_at DESC
     """
     with pg.cursor() as cur:
-        cur.execute(sql, (codigo, project or "default"))
+        cur.execute(sql, (codigo, project_id))
         rows = cur.fetchall()
     return [
         {
@@ -2691,6 +2886,7 @@ def get_citations_by_code(pg: PGConnection, codigo: str, project: Optional[str] 
             "fuente": r[4],
             "memo": r[5],
             "created_at": r[6].isoformat().replace("+00:00", "Z") if r[6] else None,
+            "code_id": int(r[7]) if r[7] is not None else None,
         }
         for r in rows
     ]
@@ -3000,7 +3196,7 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
         archivo: Filtrar códigos que aparecen en este archivo de entrevista
         
     Returns:
-        Lista de códigos con citas, fragmentos y fechas
+        Lista de códigos con citas, fragmentos, fechas y code_id
     """
     clauses: List[str] = []
     params: List[Any] = []
@@ -3020,12 +3216,13 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
                      MIN(aca.created_at) AS primera_cita,
                      MAX(aca.created_at) AS ultima_cita,
            COALESCE(cc.status, 'active') AS status,
-           cc.canonical_codigo
+           cc.canonical_codigo,
+           cc.code_id
       FROM analisis_codigos_abiertos aca
       LEFT JOIN catalogo_codigos cc
         ON cc.project_id = aca.project_id AND cc.codigo = aca.codigo
       {where}
-     GROUP BY aca.codigo, cc.status, cc.canonical_codigo
+     GROUP BY aca.codigo, cc.status, cc.canonical_codigo, cc.code_id
          ORDER BY MAX(aca.created_at) DESC NULLS LAST, aca.codigo ASC
      LIMIT %s
     """
@@ -3042,6 +3239,7 @@ def list_codes_summary(pg: PGConnection, project: Optional[str] = None, limit: i
             "ultima_cita": row[4].isoformat().replace("+00:00", "Z") if row[4] else None,
             "status": row[5],
             "canonical_codigo": row[6],
+            "code_id": int(row[7]) if row[7] is not None else None,
         }
         for row in rows
     ]
@@ -4520,6 +4718,8 @@ def ensure_candidate_codes_table(pg: PGConnection) -> None:
     CREATE INDEX IF NOT EXISTS ix_cc_created_at ON codigos_candidatos(created_at DESC);
     CREATE INDEX IF NOT EXISTS ix_cc_archivo ON codigos_candidatos(archivo);
     CREATE INDEX IF NOT EXISTS ix_cc_codigo ON codigos_candidatos(codigo);
+    ALTER TABLE codigos_candidatos ADD COLUMN IF NOT EXISTS code_id BIGINT;
+    CREATE INDEX IF NOT EXISTS ix_cc_project_code_id ON codigos_candidatos(project_id, code_id) WHERE code_id IS NOT NULL;
     """
     with pg.cursor() as cur:
         cur.execute(sql)
@@ -4541,6 +4741,418 @@ def ensure_candidate_codes_table(pg: PGConnection) -> None:
                     )
                 pg.commit()
                 _candidate_codes_table_promote_migrated = True
+
+
+# =============================================================================
+# LINK PREDICTIONS TABLE (Codificación Axial)
+# =============================================================================
+
+_link_predictions_table_created = False
+
+
+def ensure_link_predictions_table(pg: PGConnection) -> None:
+    """
+    Crea la tabla link_predictions para almacenar predicciones de relaciones axiales.
+    
+    Las predicciones de Link Prediction son hipótesis de relaciones entre códigos,
+    no códigos con citas. Pertenecen metodológicamente a la Codificación Axial.
+    
+    Estados: pendiente, validado, rechazado
+    Al validar: se crea la relación axial en Neo4j
+    """
+    global _link_predictions_table_created
+    if _link_predictions_table_created:
+        return
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_predictions (
+                id SERIAL PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                source_code TEXT NOT NULL,
+                target_code TEXT NOT NULL,
+                relation_type TEXT NOT NULL DEFAULT 'asociado_con',
+                algorithm TEXT NOT NULL DEFAULT 'common_neighbors',
+                score FLOAT NOT NULL DEFAULT 0.0,
+                rank INTEGER,
+                estado TEXT NOT NULL DEFAULT 'pendiente',
+                validado_por TEXT,
+                validado_en TIMESTAMPTZ,
+                memo TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                
+                CONSTRAINT uq_lp_project_codes UNIQUE (project_id, source_code, target_code, algorithm)
+            );
+            
+            CREATE INDEX IF NOT EXISTS ix_lp_project_estado 
+                ON link_predictions(project_id, estado);
+            CREATE INDEX IF NOT EXISTS ix_lp_project_source 
+                ON link_predictions(project_id, source_code);
+            CREATE INDEX IF NOT EXISTS ix_lp_project_target 
+                ON link_predictions(project_id, target_code);
+            """
+        )
+    pg.commit()
+    _link_predictions_table_created = True
+
+
+def insert_link_predictions(
+    pg: PGConnection,
+    predictions: List[Dict[str, Any]],
+) -> int:
+    """
+    Inserta predicciones de relaciones en la tabla link_predictions.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        predictions: Lista de dicts con:
+            - project_id, source_code, target_code
+            - relation_type (default: 'asociado_con')
+            - algorithm (ej: 'common_neighbors', 'adamic_adar')
+            - score, rank (opcionales)
+            - memo (opcional)
+    
+    Returns:
+        Número de predicciones insertadas
+    """
+    ensure_link_predictions_table(pg)
+    if not predictions:
+        return 0
+    
+    sql = """
+    INSERT INTO link_predictions (
+        project_id, source_code, target_code, relation_type,
+        algorithm, score, rank, memo
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (project_id, source_code, target_code, algorithm) DO UPDATE SET
+        score = EXCLUDED.score,
+        rank = EXCLUDED.rank,
+        memo = COALESCE(EXCLUDED.memo, link_predictions.memo),
+        updated_at = NOW()
+    """
+    
+    count = 0
+    with pg.cursor() as cur:
+        for p in predictions:
+            if not p.get("source_code") or not p.get("target_code"):
+                continue
+            cur.execute(
+                sql,
+                (
+                    p.get("project_id", "default"),
+                    p["source_code"],
+                    p["target_code"],
+                    p.get("relation_type", "asociado_con"),
+                    p.get("algorithm", "common_neighbors"),
+                    p.get("score", 0.0),
+                    p.get("rank"),
+                    p.get("memo"),
+                ),
+            )
+            count += 1
+    pg.commit()
+    return count
+
+
+def get_link_predictions(
+    pg: PGConnection,
+    project_id: str,
+    estado: Optional[str] = None,
+    algorithm: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene predicciones de relaciones para un proyecto.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto
+        estado: Filtrar por estado (pendiente, validado, rechazado)
+        limit: Máximo de resultados
+        offset: Desplazamiento para paginación
+    
+    Returns:
+        Lista de predicciones
+    """
+    ensure_link_predictions_table(pg)
+    
+    sql = """
+    SELECT id, project_id, source_code, target_code, relation_type,
+           algorithm, score, rank, estado, validado_por, validado_en,
+           memo, created_at, updated_at
+    FROM link_predictions
+    WHERE project_id = %s
+    """
+    params: List[Any] = [project_id]
+    
+    if estado:
+        sql += " AND estado = %s"
+        params.append(estado)
+
+    if algorithm:
+        sql += " AND algorithm = %s"
+        params.append(algorithm)
+
+    sql += " ORDER BY score DESC, created_at DESC LIMIT %s OFFSET %s"
+    params.extend([limit, offset])
+    
+    with pg.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+    
+    return [
+        {
+            "id": r[0],
+            "project_id": r[1],
+            "source_code": r[2],
+            "target_code": r[3],
+            "relation_type": r[4],
+            "algorithm": r[5],
+            "score": r[6],
+            "rank": r[7],
+            "estado": r[8],
+            "validado_por": r[9],
+            "validado_en": r[10].isoformat() if r[10] else None,
+            "memo": r[11],
+            "created_at": r[12].isoformat() if r[12] else None,
+            "updated_at": r[13].isoformat() if r[13] else None,
+        }
+        for r in rows
+    ]
+
+
+def count_link_predictions(
+    pg: PGConnection,
+    project_id: str,
+    estado: Optional[str] = None,
+    algorithm: Optional[str] = None,
+) -> int:
+    """
+    Cuenta predicciones de relaciones para un proyecto (con filtros opcionales).
+    """
+    ensure_link_predictions_table(pg)
+
+    sql = "SELECT COUNT(*) FROM link_predictions WHERE project_id = %s"
+    params: List[Any] = [project_id]
+
+    if estado:
+        sql += " AND estado = %s"
+        params.append(estado)
+
+    if algorithm:
+        sql += " AND algorithm = %s"
+        params.append(algorithm)
+
+    with pg.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        r = cur.fetchone()
+        return int(r[0] or 0) if r else 0
+
+
+def get_link_predictions_stats(
+    pg: PGConnection,
+    project_id: str,
+) -> Dict[str, Any]:
+    """
+    Obtiene estadísticas de predicciones de relaciones.
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT estado, COUNT(*) 
+            FROM link_predictions 
+            WHERE project_id = %s 
+            GROUP BY estado
+            """,
+            (project_id,),
+        )
+        totals = {r[0]: r[1] for r in cur.fetchall()}
+        
+        cur.execute(
+            """
+            SELECT algorithm, COUNT(*) 
+            FROM link_predictions 
+            WHERE project_id = %s 
+            GROUP BY algorithm
+            """,
+            (project_id,),
+        )
+        by_algorithm = {r[0]: r[1] for r in cur.fetchall()}
+    
+    return {
+        "totals": totals,
+        "by_algorithm": by_algorithm,
+        "total": sum(totals.values()),
+    }
+
+
+def update_link_prediction_estado(
+    pg: PGConnection,
+    prediction_id: int,
+    estado: str,
+    validado_por: Optional[str] = None,
+    memo: Optional[str] = None,
+    relation_type: Optional[str] = None,
+) -> bool:
+    """
+    Actualiza el estado de una predicción.
+    
+    Args:
+        pg: Conexión PostgreSQL
+        prediction_id: ID de la predicción
+        estado: Nuevo estado (pendiente, validado, rechazado)
+        validado_por: Usuario que valida
+        memo: Nota opcional
+    
+    Returns:
+        True si se actualizó
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE link_predictions
+            SET estado = %s,
+                relation_type = COALESCE(%s, relation_type),
+                validado_por = COALESCE(%s, validado_por),
+                validado_en = CASE WHEN %s IN ('validado', 'rechazado') THEN NOW() ELSE validado_en END,
+                memo = COALESCE(%s, memo),
+                updated_at = NOW()
+            WHERE id = %s
+            RETURNING id
+            """,
+            (estado, relation_type, validado_por, estado, memo, prediction_id),
+        )
+        result = cur.fetchone()
+    pg.commit()
+    return result is not None
+
+
+def batch_update_link_predictions_estado(
+    pg: PGConnection,
+    project_id: str,
+    prediction_ids: List[int],
+    estado: str,
+    validado_por: Optional[str] = None,
+) -> int:
+    """
+    Actualiza el estado de múltiples predicciones.
+    """
+    ensure_link_predictions_table(pg)
+    if not prediction_ids:
+        return 0
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE link_predictions
+            SET estado = %s,
+                validado_por = COALESCE(%s, validado_por),
+                validado_en = CASE WHEN %s IN ('validado', 'rechazado') THEN NOW() ELSE validado_en END,
+                updated_at = NOW()
+            WHERE project_id = %s AND id = ANY(%s)
+            """,
+            (estado, validado_por, estado, project_id, prediction_ids),
+        )
+        count = cur.rowcount
+    pg.commit()
+    return count
+
+
+def get_link_predictions_by_ids(
+    pg: PGConnection,
+    project_id: str,
+    prediction_ids: List[int],
+) -> List[Dict[str, Any]]:
+    """
+    Obtiene predicciones por IDs (filtradas por proyecto).
+    """
+    ensure_link_predictions_table(pg)
+    if not prediction_ids:
+        return []
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, source_code, target_code, relation_type,
+                   algorithm, score, rank, estado, validado_por, validado_en,
+                   memo, created_at, updated_at
+            FROM link_predictions
+            WHERE project_id = %s AND id = ANY(%s)
+            """,
+            (project_id, prediction_ids),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": r[0],
+            "project_id": r[1],
+            "source_code": r[2],
+            "target_code": r[3],
+            "relation_type": r[4],
+            "algorithm": r[5],
+            "score": r[6],
+            "rank": r[7],
+            "estado": r[8],
+            "validado_por": r[9],
+            "validado_en": r[10].isoformat() if r[10] else None,
+            "memo": r[11],
+            "created_at": r[12].isoformat() if r[12] else None,
+            "updated_at": r[13].isoformat() if r[13] else None,
+        }
+        for r in rows
+    ]
+
+
+def get_link_prediction_by_id(
+    pg: PGConnection,
+    prediction_id: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene una predicción por ID.
+    """
+    ensure_link_predictions_table(pg)
+    
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, source_code, target_code, relation_type,
+                   algorithm, score, rank, estado, validado_por, validado_en,
+                   memo, created_at, updated_at
+            FROM link_predictions
+            WHERE id = %s
+            """,
+            (prediction_id,),
+        )
+        r = cur.fetchone()
+    
+    if not r:
+        return None
+    
+    return {
+        "id": r[0],
+        "project_id": r[1],
+        "source_code": r[2],
+        "target_code": r[3],
+        "relation_type": r[4],
+        "algorithm": r[5],
+        "score": r[6],
+        "rank": r[7],
+        "estado": r[8],
+        "validado_por": r[9],
+        "validado_en": r[10].isoformat() if r[10] else None,
+        "memo": r[11],
+        "created_at": r[12].isoformat() if r[12] else None,
+        "updated_at": r[13].isoformat() if r[13] else None,
+    }
 
 
 def count_pending_candidates(pg: PGConnection, project_id: str) -> int:
@@ -4625,10 +5237,13 @@ def insert_candidate_codes(
                 error=str(e),
             )
     
+    # Lookup code_id desde catalogo_codigos para cada candidato
+    ensure_codes_catalog_table(pg)
+    
     sql = """
     INSERT INTO codigos_candidatos (
         project_id, codigo, cita, fragmento_id, archivo,
-        fuente_origen, fuente_detalle, score_confianza, estado, memo
+        fuente_origen, fuente_detalle, score_confianza, estado, memo, code_id
     )
     VALUES %s
     ON CONFLICT (project_id, codigo, fragmento_id) DO UPDATE SET
@@ -4636,13 +5251,23 @@ def insert_candidate_codes(
         fuente_detalle = COALESCE(EXCLUDED.fuente_detalle, codigos_candidatos.fuente_detalle),
         score_confianza = COALESCE(EXCLUDED.score_confianza, codigos_candidatos.score_confianza),
         memo = COALESCE(EXCLUDED.memo, codigos_candidatos.memo),
+        code_id = COALESCE(EXCLUDED.code_id, codigos_candidatos.code_id),
         updated_at = NOW()
     """
     
-    rows = [
-        (
-            c.get("project_id", "default"),
-            c.get("codigo", ""),
+    rows = []
+    for c in processed_candidates:
+        if not c.get("codigo"):
+            continue
+        project_id = c.get("project_id", "default")
+        codigo = c.get("codigo", "")
+        # Lookup code_id if not provided
+        code_id = c.get("code_id")
+        if code_id is None:
+            code_id = get_code_id_for_codigo(pg, project_id, codigo)
+        rows.append((
+            project_id,
+            codigo,
             c.get("cita"),
             c.get("fragmento_id"),
             c.get("archivo"),
@@ -4651,10 +5276,8 @@ def insert_candidate_codes(
             c.get("score_confianza"),
             c.get("estado", "pendiente"),
             c.get("memo"),
-        )
-        for c in processed_candidates
-        if c.get("codigo")
-    ]
+            code_id,
+        ))
     
     with pg.cursor() as cur:
         execute_values(cur, sql, rows, page_size=100)
@@ -5878,9 +6501,10 @@ def promote_to_definitive(
     # Obtener candidatos validados
     # IMPORTANTE: Excluir fragmento_id NULL o vacío para mantener coherencia
     # Selección: por IDs o por 'todos los validados'
+    # Incluye code_id para propagación end-to-end (migration 018)
     if promote_all_validated:
         sql_select = """
-        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id
           FROM codigos_candidatos
          WHERE project_id = %s
            AND estado = 'validado'
@@ -5892,7 +6516,7 @@ def promote_to_definitive(
         mode = "all_validated"
     else:
         sql_select = """
-        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo
+        SELECT id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id
           FROM codigos_candidatos
          WHERE project_id = %s
            AND id = ANY(%s)
@@ -5918,7 +6542,7 @@ def promote_to_definitive(
         }
     
     # Insertar en tabla definitiva, resolviendo a código canónico si corresponde.
-    # rows: (id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo)
+    # rows: (id, project_id, fragmento_id, codigo, archivo, cita, fuente_detalle, memo, code_id)
     open_rows: List[OpenCodeRow] = []
     for r in rows:
         original_codigo = str(r[3]) if r[3] is not None else ""
@@ -5933,7 +6557,13 @@ def promote_to_definitive(
             else:
                 final_memo = f"{prefix}{final_memo}"
 
-        open_rows.append((r[1], r[2], canonical_codigo or original_codigo, r[4], r[5], r[6], final_memo))
+        # Resolver code_id: usar el del candidato, o buscar el canónico
+        candidate_code_id = r[8] if len(r) > 8 else None
+        resolved_code_id = candidate_code_id
+        if resolved_code_id is None and canonical_codigo:
+            resolved_code_id = get_code_id_for_codigo(pg, project_id, canonical_codigo)
+
+        open_rows.append((r[1], r[2], canonical_codigo or original_codigo, r[4], r[5], r[6], final_memo, resolved_code_id))
     upsert_open_codes(pg, open_rows)
 
     # Marcar candidatos como promovidos (best-effort, idempotente)
@@ -5992,12 +6622,21 @@ def promote_to_definitive(
     eligible_total = promoted_count
     skipped_total = max(validated_total - eligible_total, 0) if promote_all_validated else 0
 
+    # Construir lista de pares (fragment_id, canonical_codigo) para sync Neo4j
+    # open_rows: (project_id, fragmento_id, codigo, archivo, cita, fuente, memo, code_id)
+    neo4j_sync_rows = [
+        {"fragment_id": r[1], "codigo": r[2]}
+        for r in open_rows
+        if r[1] and r[2]
+    ]
+
     return {
         "mode": mode,
         "validated_total": validated_total,
         "eligible_total": eligible_total,
         "promoted_count": promoted_count,
         "skipped_total": skipped_total,
+        "neo4j_sync_rows": neo4j_sync_rows,
     }
 
 
@@ -6666,7 +7305,7 @@ def ensure_projects_table(pg: PGConnection) -> None:
 def list_projects_db(pg: PGConnection, org_id: Optional[str] = None, owner_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Lista proyectos desde PostgreSQL."""
     base_sql = """
-    SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+    SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
     FROM proyectos
     """
     conditions = []
@@ -6698,6 +7337,7 @@ def list_projects_db(pg: PGConnection, org_id: Optional[str] = None, owner_id: O
             "config": row[5] or {},
             "created_at": row[6].isoformat() if row[6] else None,
             "updated_at": row[7].isoformat() if row[7] else None,
+            "epistemic_mode": row[8] or "constructivist",
         }
         for row in rows
     ]
@@ -6714,13 +7354,13 @@ def get_project_db(pg: PGConnection, project_id: str, org_id: Optional[str] = No
     """
     if org_id:
         sql = """
-        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
         FROM proyectos WHERE id = %s AND org_id = %s
         """
         params = (project_id, org_id)
     else:
         sql = """
-        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at
+        SELECT id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
         FROM proyectos WHERE id = %s
         """
         params = (project_id,)
@@ -6740,6 +7380,7 @@ def get_project_db(pg: PGConnection, project_id: str, org_id: Optional[str] = No
         "config": row[5] or {},
         "created_at": row[6].isoformat() if row[6] else None,
         "updated_at": row[7].isoformat() if row[7] else None,
+        "epistemic_mode": row[8] or "constructivist",
     }
 
 
@@ -6770,8 +7411,13 @@ def create_project_db(
     org_id: Optional[str] = None,
     owner_id: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
+    epistemic_mode: str = "constructivist",
 ) -> Dict[str, Any]:
     """Crea un nuevo proyecto en PostgreSQL."""
+    # Validar epistemic_mode
+    if epistemic_mode not in ("constructivist", "post_positivist"):
+        epistemic_mode = "constructivist"
+    
     default_config = {
         "discovery_threshold": 0.30,
         "analysis_temperature": 0.3,
@@ -6780,12 +7426,12 @@ def create_project_db(
     final_config = {**default_config, **(config or {})}
     
     sql = """
-    INSERT INTO proyectos (id, name, description, org_id, owner_id, config)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    RETURNING id, name, description, org_id, owner_id, config, created_at, updated_at
+    INSERT INTO proyectos (id, name, description, org_id, owner_id, config, epistemic_mode)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    RETURNING id, name, description, org_id, owner_id, config, created_at, updated_at, epistemic_mode
     """
     with pg.cursor() as cur:
-        cur.execute(sql, (project_id, name, description, org_id, owner_id, Json(final_config)))
+        cur.execute(sql, (project_id, name, description, org_id, owner_id, Json(final_config), epistemic_mode))
         row = cur.fetchone()
     pg.commit()
     if row is None:
@@ -6800,6 +7446,7 @@ def create_project_db(
         "config": row[5],
         "created_at": row[6].isoformat() if row[6] else None,
         "updated_at": row[7].isoformat() if row[7] else None,
+        "epistemic_mode": row[8] if len(row) > 8 else "constructivist",
     }
 
 
@@ -6889,6 +7536,109 @@ def ensure_default_project_db(pg: PGConnection) -> None:
             "UPDATE proyectos SET org_id = 'default_org' WHERE id = 'default' AND (org_id IS NULL OR org_id = '')"
         )
     pg.commit()
+
+
+# =============================================================================
+# Epistemic Mode (per-project methodology configuration)
+# =============================================================================
+
+def get_project_epistemic_mode(pg: PGConnection, project_id: str) -> "EpistemicMode":
+    """Get the epistemic mode configured for a project.
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        
+    Returns:
+        EpistemicMode (defaults to CONSTRUCTIVIST if not set or invalid)
+    """
+    from app.settings import EpistemicMode
+    
+    query = "SELECT epistemic_mode FROM proyectos WHERE id = %s"
+    with pg.cursor() as cur:
+        cur.execute(query, (project_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            return EpistemicMode.from_string(row[0])
+    return EpistemicMode.CONSTRUCTIVIST
+
+
+def set_project_epistemic_mode(
+    pg: PGConnection, 
+    project_id: str, 
+    mode: "EpistemicMode"
+) -> Tuple[bool, str]:
+    """Set epistemic mode for a project.
+    
+    Fails if project already has axial relations (mode lock enforcement).
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        mode: EpistemicMode to set
+        
+    Returns:
+        Tuple[success: bool, message: str]
+    """
+    from app.settings import EpistemicMode
+    
+    # Check for existing axial relations (lock de modo)
+    check_axial = """
+        SELECT COUNT(*) FROM axial_relationships 
+        WHERE project_id = %s
+    """
+    with pg.cursor() as cur:
+        cur.execute(check_axial, (project_id,))
+        result = cur.fetchone()
+        axial_count = result[0] if result else 0
+        
+        if axial_count > 0:
+            _logger.warning(
+                "epistemic_mode.change_blocked",
+                project_id=project_id,
+                axial_count=axial_count,
+                reason="project_has_axial_relations",
+            )
+            return False, f"Cannot change epistemic_mode: project has {axial_count} axial relations"
+        
+        # Safe to update
+        update = """
+            UPDATE proyectos 
+            SET epistemic_mode = %s, updated_at = NOW()
+            WHERE id = %s
+            RETURNING epistemic_mode
+        """
+        cur.execute(update, (mode.value, project_id))
+        updated = cur.fetchone()
+        
+        if updated is None:
+            return False, f"Project {project_id} not found"
+        
+        pg.commit()
+        
+        _logger.info(
+            "epistemic_mode.updated",
+            project_id=project_id,
+            mode=mode.value,
+        )
+        return True, f"epistemic_mode set to {mode.value}"
+
+
+def has_axial_relations(pg: PGConnection, project_id: str) -> bool:
+    """Check if a project has any axial relations (for mode lock check).
+    
+    Args:
+        pg: PostgreSQL connection
+        project_id: Project identifier
+        
+    Returns:
+        True if project has at least one axial relation
+    """
+    query = "SELECT COUNT(*) > 0 FROM axial_relationships WHERE project_id = %s"
+    with pg.cursor() as cur:
+        cur.execute(query, (project_id,))
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
 # =============================================================================
@@ -6982,3 +7732,134 @@ def save_project_stage_db(
         "updated_at": row[6].isoformat() if row[6] else None,
     }
 
+
+def check_axial_ready(pg: PGConnection, project_id: str) -> Tuple[bool, List[str]]:
+    """
+    Verifica si la infraestructura ontológica está lista para operaciones axiales.
+    
+    Ejecuta las mismas validaciones que `/api/admin/code-id/status`:
+    - Columnas requeridas existen
+    - No hay `code_id` faltantes
+    - No hay `canonical_code_id` faltantes para códigos no canónicos
+    - No hay divergencias entre texto y ID
+    - No hay ciclos no triviales en la cadena canónica
+    
+    Args:
+        pg: Conexión PostgreSQL
+        project_id: ID del proyecto a validar
+        
+    Returns:
+        Tuple[bool, List[str]]: (axial_ready, blocking_reasons)
+        - axial_ready: True si puede proceder con operaciones axiales
+        - blocking_reasons: Lista de razones de bloqueo (vacía si ready)
+        
+    Example:
+        >>> ready, reasons = check_axial_ready(pg, "jd-007")
+        >>> if not ready:
+        ...     raise HTTPException(409, detail={"blocking_reasons": reasons})
+    """
+    blocking_reasons: List[str] = []
+    
+    # 1. Verificar que las columnas requeridas existen
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'catalogo_codigos'
+        """)
+        columns = {row[0] for row in cur.fetchall()}
+    
+    has_code_id = "code_id" in columns
+    has_canonical_code_id = "canonical_code_id" in columns
+    supported = has_code_id and has_canonical_code_id
+    
+    if not supported:
+        blocking_reasons.append("supported=false")
+        return False, blocking_reasons
+    
+    # 2. Verificar missing_code_id
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos 
+            WHERE project_id = %s AND code_id IS NULL
+        """, (project_id,))
+        missing_code_id = int((cur.fetchone() or [0])[0] or 0)
+    
+    if missing_code_id > 0:
+        blocking_reasons.append("missing_code_id")
+    
+    # 3. Verificar missing_canonical_code_id para no-canónicos
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos 
+            WHERE project_id = %s 
+              AND canonical_codigo IS NOT NULL 
+              AND canonical_codigo != codigo
+              AND canonical_code_id IS NULL
+        """, (project_id,))
+        missing_canonical = int((cur.fetchone() or [0])[0] or 0)
+    
+    if missing_canonical > 0:
+        blocking_reasons.append("missing_canonical_code_id")
+    
+    # 4. Verificar divergencias texto vs ID
+    with pg.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) FROM catalogo_codigos c
+            WHERE c.project_id = %s
+              AND c.canonical_code_id IS NOT NULL
+              AND c.canonical_codigo IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalogo_codigos t
+                  WHERE t.project_id = c.project_id
+                    AND t.code_id = c.canonical_code_id
+                    AND LOWER(TRIM(t.codigo)) = LOWER(TRIM(c.canonical_codigo))
+              )
+        """, (project_id,))
+        divergences = int((cur.fetchone() or [0])[0] or 0)
+    
+    if divergences > 0:
+        blocking_reasons.append("divergences_text_vs_id")
+    
+    # 5. Detectar ciclos no triviales (profundidad > 2)
+    with pg.cursor() as cur:
+        cur.execute("""
+            WITH RECURSIVE walk AS (
+              SELECT project_id,
+                     code_id,
+                     canonical_code_id,
+                     ARRAY[code_id] AS path,
+                     FALSE AS cycle
+                FROM catalogo_codigos
+               WHERE project_id = %s
+                 AND code_id IS NOT NULL
+                 AND canonical_code_id IS NOT NULL
+              UNION ALL
+              SELECT w.project_id,
+                     c.code_id,
+                     c.canonical_code_id,
+                     w.path || c.code_id,
+                     (c.code_id = ANY(w.path)) AS cycle
+                FROM walk w
+                JOIN catalogo_codigos c
+                  ON c.project_id = w.project_id
+                 AND c.code_id = w.canonical_code_id
+               WHERE w.cycle = FALSE
+                 AND array_length(w.path, 1) < 25
+                 AND c.code_id IS NOT NULL
+            )
+            SELECT COUNT(DISTINCT n)::INT
+              FROM (
+                  SELECT unnest(path) AS n
+                    FROM walk
+                   WHERE cycle = TRUE
+                     AND array_length(path, 1) > 2
+              ) s
+        """, (project_id,))
+        cycle_nodes = int((cur.fetchone() or [0])[0] or 0)
+    
+    if cycle_nodes > 0:
+        blocking_reasons.append("cycles_non_trivial")
+    
+    axial_ready = len(blocking_reasons) == 0
+    return axial_ready, blocking_reasons

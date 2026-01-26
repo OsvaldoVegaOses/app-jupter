@@ -57,6 +57,8 @@ This document explains the responsibilities of each module that was carved out o
 - `frontend/src/components/CodingPanel.tsx`: **Coding Interface Agent**. Handles code assignment, semantic suggestions, and coverage metrics.
 - `frontend/src/components/DiscoveryPanel.tsx`: **Discovery Agent**. Semantic search with triplet exploration and "Propose as Code" functionality.
 - `frontend/src/components/ReportsPanel.tsx`: **Reporting Agent**. Displays stage reports and analysis results.
+- `frontend/src/components/LinkPredictionPanel.tsx`: **Link Prediction Agent**. Generates suggested axial relationships (algorithms + analysis).
+- `frontend/src/components/LinkPredictionValidationPanel.tsx`: **Axial Validation Agent**. Validates/rejects predicted relationships and syncs them to Neo4j.
 
 ### Candidate Codes Workflow (NEW)
 - `frontend/src/components/CodeValidationPanel.tsx`: **Validation Agent**. Bandeja for validating, rejecting, and merging candidate codes from all sources. Supports batch operations and promotion to definitive codes.
@@ -127,7 +129,7 @@ This document explains the responsibilities of each module that was carved out o
 ## Troubleshooting Agents (NEW - January 2026)
 
 ### Documentation
-- `docs/05-troubleshooting/connection_pool_issues.md`: **Troubleshooting Database**. Central registry of all known issues, root causes, and solutions. **READ THIS FIRST when debugging**.
+- `docs/09-troubleshooting-incidentes/connection_pool_issues.md`: **Troubleshooting Database**. Central registry of all known issues, root causes, and solutions. **READ THIS FIRST when debugging**.
 
 ### Diagnostic Flow
 ```

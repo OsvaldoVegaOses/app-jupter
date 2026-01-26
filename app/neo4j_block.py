@@ -61,12 +61,17 @@ def ensure_code_constraints(driver: Driver, database: str) -> None:
     Crea constraint de unicidad compuesta para nodos Codigo.
     
     Permite que diferentes proyectos tengan códigos con el mismo nombre
-    sin colisión.
+    sin colisión. También crea índice para code_id (identidad estable).
     """
     with driver.session(database=database) as session:
         session.run("""
             CREATE CONSTRAINT codigo_nombre_project IF NOT EXISTS 
             FOR (c:Codigo) REQUIRE (c.nombre, c.project_id) IS UNIQUE
+        """)
+        # Índice para code_id (no unique constraint porque puede ser NULL en nodos legacy)
+        session.run("""
+            CREATE INDEX codigo_code_id_project IF NOT EXISTS 
+            FOR (c:Codigo) ON (c.code_id, c.project_id)
         """)
 
 
@@ -157,6 +162,84 @@ def merge_fragment_code(driver: Driver, database: str, fragment_id: str, codigo:
         session.run(cypher, fragment_id=fragment_id, codigo=codigo, project_id=project_id)
 
 
+def merge_fragment_codes_bulk(
+    driver: Driver,
+    database: str,
+    rows: Sequence[Dict[str, str]],
+    project_id: str,
+) -> Dict[str, Any]:
+    """
+    Asocia fragmentos con códigos en Neo4j en batch (UNWIND).
+    
+    Crea relaciones (:Fragmento)-[:TIENE_CODIGO]->(:Codigo) para múltiples
+    pares fragmento-código en una sola transacción.
+    
+    Args:
+        driver: Driver de Neo4j
+        database: Nombre de la base de datos
+        rows: Lista de dicts con keys 'fragment_id' y 'codigo'
+        project_id: ID del proyecto para aislamiento
+        
+    Returns:
+        Dict con métricas:
+        - merged_count: relaciones creadas/actualizadas
+        - missing_fragments: fragmentos no encontrados en Neo4j
+        - missing_fragment_ids: lista de IDs de fragmentos faltantes
+    """
+    if not rows:
+        return {"merged_count": 0, "missing_fragments": 0, "missing_fragment_ids": []}
+    
+    # Primer paso: verificar qué fragmentos existen en Neo4j
+    fragment_ids = list({r["fragment_id"] for r in rows if r.get("fragment_id")})
+    
+    check_cypher = """
+    UNWIND $fragment_ids AS fid
+    OPTIONAL MATCH (f:Fragmento {id: fid, project_id: $project_id})
+    RETURN fid, f IS NOT NULL AS exists
+    """
+    
+    existing_fragments = set()
+    with driver.session(database=database) as session:
+        result = session.run(check_cypher, fragment_ids=fragment_ids, project_id=project_id)
+        for record in result:
+            if record["exists"]:
+                existing_fragments.add(record["fid"])
+    
+    missing_fragment_ids = [fid for fid in fragment_ids if fid not in existing_fragments]
+    
+    # Filtrar solo los rows con fragmentos existentes
+    valid_rows = [r for r in rows if r.get("fragment_id") in existing_fragments]
+    
+    if not valid_rows:
+        return {
+            "merged_count": 0,
+            "missing_fragments": len(missing_fragment_ids),
+            "missing_fragment_ids": missing_fragment_ids,
+        }
+    
+    # Segundo paso: crear relaciones en batch
+    merge_cypher = """
+    UNWIND $rows AS row
+    MATCH (f:Fragmento {id: row.fragment_id, project_id: $project_id})
+    MERGE (c:Codigo {nombre: row.codigo, project_id: $project_id})
+    MERGE (f)-[rel:TIENE_CODIGO]->(c)
+    RETURN count(rel) AS merged
+    """
+    
+    rows_data = [{"fragment_id": r["fragment_id"], "codigo": r["codigo"]} for r in valid_rows]
+    
+    with driver.session(database=database) as session:
+        result = session.run(merge_cypher, rows=rows_data, project_id=project_id)
+        record = result.single()
+        merged_count = record["merged"] if record else 0
+    
+    return {
+        "merged_count": merged_count,
+        "missing_fragments": len(missing_fragment_ids),
+        "missing_fragment_ids": missing_fragment_ids,
+    }
+
+
 def delete_fragment_code(driver: Driver, database: str, fragment_id: str, codigo: str, project_id: str) -> int:
     """
     Elimina la relación TIENE_CODIGO entre un fragmento y un código en Neo4j.
@@ -196,6 +279,7 @@ def merge_category_code_relationship(
     evidencia: Sequence[str],
     memo: str | None = None,
     project_id: str | None = None,
+    code_id: int | None = None,
 ) -> None:
     """
     Crea una relación axial entre Categoria y Codigo.
@@ -212,6 +296,7 @@ def merge_category_code_relationship(
         evidencia: Lista de IDs de fragmentos que soportan la relación
         memo: Nota explicativa opcional
         project_id: ID del proyecto (requerido para aislamiento)
+        code_id: ID estable del código en catalogo_codigos (para identidad consistente)
         
     Raises:
         ValueError: Si el tipo de relación no es válido o falta project_id
@@ -221,15 +306,30 @@ def merge_category_code_relationship(
     if not project_id:
         raise ValueError("project_id es requerido para aislamiento entre proyectos")
     evidencia_unique = list(dict.fromkeys(evidencia))
-    cypher = """
-    MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
-    MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
-    SET cod.status = coalesce(cod.status, 'active')
-    MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
-    SET rel.evidencia = $evidencia,
-        rel.memo = $memo,
-        rel.actualizado_en = datetime()
-    """
+    
+    # Si tenemos code_id, usarlo para MERGE más estable (inmune a renombres)
+    if code_id is not None:
+        cypher = """
+        MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
+        MERGE (cod:Codigo {code_id: $code_id, project_id: $project_id})
+        SET cod.nombre = $codigo,
+            cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
+        SET rel.evidencia = $evidencia,
+            rel.memo = $memo,
+            rel.actualizado_en = datetime()
+        """
+    else:
+        # Fallback: MERGE por nombre (comportamiento legacy)
+        cypher = """
+        MERGE (cat:Categoria {nombre: $categoria, project_id: $project_id})
+        MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
+        SET cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
+        SET rel.evidencia = $evidencia,
+            rel.memo = $memo,
+            rel.actualizado_en = datetime()
+        """
     with driver.session(database=database) as session:
         session.run(
             cypher,
@@ -239,6 +339,7 @@ def merge_category_code_relationship(
             evidencia=evidencia_unique,
             memo=memo,
             project_id=project_id,
+            code_id=code_id,
         )
 
 
@@ -251,22 +352,158 @@ def merge_category_code_relationships(
     Inserta relaciones axiales en batch.
 
     Cada row debe incluir: categoria, codigo, relacion, evidencia, memo, project_id.
+    Opcionalmente puede incluir code_id para identidad estable.
     """
     data = list(rows)
     if not data:
         return
-    cypher = """
-    UNWIND $rows AS r
-    MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
-    MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
-    SET cod.status = coalesce(cod.status, 'active')
-    MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
-    SET rel.evidencia = r.evidencia,
-        rel.memo = r.memo,
-        rel.actualizado_en = datetime()
-    """
+    
+    # Verificar si alguna fila tiene code_id
+    has_code_id = any(row.get("code_id") is not None for row in data)
+    
+    if has_code_id:
+        # Usar code_id para MERGE cuando esté disponible
+        cypher = """
+        UNWIND $rows AS r
+        MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
+        FOREACH (_ IN CASE WHEN r.code_id IS NOT NULL THEN [1] ELSE [] END |
+            MERGE (cod:Codigo {code_id: r.code_id, project_id: r.project_id})
+            SET cod.nombre = r.codigo,
+                cod.status = coalesce(cod.status, 'active')
+            MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+            SET rel.evidencia = r.evidencia,
+                rel.memo = r.memo,
+                rel.actualizado_en = datetime()
+        )
+        FOREACH (_ IN CASE WHEN r.code_id IS NULL THEN [1] ELSE [] END |
+            MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
+            SET cod.status = coalesce(cod.status, 'active')
+            MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+            SET rel.evidencia = r.evidencia,
+                rel.memo = r.memo,
+                rel.actualizado_en = datetime()
+        )
+        """
+    else:
+        # Fallback legacy: MERGE por nombre
+        cypher = """
+        UNWIND $rows AS r
+        MERGE (cat:Categoria {nombre: r.categoria, project_id: r.project_id})
+        MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
+        SET cod.status = coalesce(cod.status, 'active')
+        MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
+        SET rel.evidencia = r.evidencia,
+            rel.memo = r.memo,
+            rel.actualizado_en = datetime()
+        """
     with driver.session(database=database) as session:
         session.run(cypher, rows=data)
+
+
+def merge_axial_relationship(
+    driver: Driver,
+    database: str,
+    project_id: str,
+    source_code: str,
+    target_code: str,
+    relation_type: str = "asociado_con",
+) -> bool:
+    """
+    Crea una relación entre dos códigos (Codificación Axial).
+    
+    Usado por Link Prediction cuando se valida una predicción.
+    Crea nodos :Codigo si no existen y la relación :REL entre ellos.
+    
+    Args:
+        driver: Driver de Neo4j
+        database: Nombre de la base de datos
+        project_id: ID del proyecto
+        source_code: Nombre del código origen
+        target_code: Nombre del código destino
+        relation_type: Tipo de relación (asociado_con, causa, condicion, etc)
+        
+    Returns:
+        True si se creó la relación, False si hubo error
+    """
+    if not source_code or not target_code or not project_id:
+        return False
+    
+    cypher = """
+    MERGE (c1:Codigo {nombre: $source_code, project_id: $project_id})
+    SET c1.status = coalesce(c1.status, 'active')
+    MERGE (c2:Codigo {nombre: $target_code, project_id: $project_id})
+    SET c2.status = coalesce(c2.status, 'active')
+    MERGE (c1)-[rel:REL {tipo: $relation_type}]->(c2)
+    SET rel.source = 'link_prediction',
+        rel.actualizado_en = datetime()
+    RETURN rel IS NOT NULL AS success
+    """
+    with driver.session(database=database) as session:
+        result = session.run(
+            cypher,
+            source_code=source_code,
+            target_code=target_code,
+            project_id=project_id,
+            relation_type=relation_type,
+        )
+        record = result.single()
+        return record["success"] if record else False
+
+
+def merge_axial_relationships_bulk(
+    driver: Driver,
+    database: str,
+    project_id: str,
+    rows: Sequence[Dict[str, str]],
+) -> int:
+    """
+    Crea relaciones axiales entre códigos en batch (UNWIND).
+    """
+    data = [
+        {
+            "source_code": r.get("source_code"),
+            "target_code": r.get("target_code"),
+            "relation_type": r.get("relation_type") or "asociado_con",
+        }
+        for r in rows
+        if r.get("source_code") and r.get("target_code")
+    ]
+    if not data:
+        return 0
+
+    cypher = """
+    UNWIND $rows AS row
+    MERGE (c1:Codigo {nombre: row.source_code, project_id: $project_id})
+    SET c1.status = coalesce(c1.status, 'active')
+    MERGE (c2:Codigo {nombre: row.target_code, project_id: $project_id})
+    SET c2.status = coalesce(c2.status, 'active')
+    MERGE (c1)-[rel:REL {tipo: row.relation_type}]->(c2)
+    SET rel.source = 'link_prediction',
+        rel.actualizado_en = datetime()
+    RETURN count(rel) AS merged
+    """
+    with driver.session(database=database) as session:
+        result = session.run(cypher, rows=data, project_id=project_id)
+        record = result.single()
+        return record["merged"] if record else 0
+
+
+def merge_code_code_relationship(
+    driver: Driver,
+    database: str,
+    project_id: str,
+    source_code: str,
+    target_code: str,
+    relation_type: str = "asociado_con",
+) -> bool:
+    return merge_axial_relationship(
+        driver=driver,
+        database=database,
+        project_id=project_id,
+        source_code=source_code,
+        target_code=target_code,
+        relation_type=relation_type,
+    )
 
 
 def mark_codigo_merged(
@@ -310,4 +547,3 @@ def mark_codigo_merged(
             merged_by=merged_by,
             memo=memo,
         ).consume()
-

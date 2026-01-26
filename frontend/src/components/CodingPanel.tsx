@@ -44,7 +44,7 @@ import type {
   InterviewSummary,
   InterviewSummaryResponse
 } from "../types";
-import { apiFetch, apiFetchJson, getCodingNext, postCodingFeedback, submitCandidate } from "../services/api";
+import { apiFetch, apiFetchJson, getCodingNext, postCodingFeedback, submitCandidate, logDiscoveryNavigation } from "../services/api";
 import { formatPercentage } from "../utils/format";
 import { FragmentContextModal } from "./FragmentContextModal";
 import { ActionSuggestionCard } from "./ActionSuggestionCard";
@@ -148,11 +148,38 @@ interface CodingSuggestRunnerResultResponse {
   report_path?: string | null;
 }
 
+// Clave de localStorage para persistir el scope de entrevista
+const INTERVIEW_SCOPE_KEY = "qualy-interview-scope";
+
 export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanelProps) {
   const [activeTab, setActiveTab] = useState<TabKey>("guided");
 
   // Filtro global de entrevista para Etapa 3 (análisis por entrevista individual)
-  const [activeInterviewFilter, setActiveInterviewFilter] = useState<string>("");
+  // Persistido en localStorage para mantener contexto entre sesiones
+  const [activeInterviewFilter, setActiveInterviewFilter] = useState<string>(() => {
+    try {
+      const stored = localStorage.getItem(`${INTERVIEW_SCOPE_KEY}-${project}`);
+      return stored || "";
+    } catch {
+      return "";
+    }
+  });
+
+  // Derivar el modo de scope del filtro activo
+  const scopeMode = activeInterviewFilter ? "case" : "project";
+
+  // Persistir el filtro de entrevista en localStorage cuando cambia
+  useEffect(() => {
+    try {
+      if (activeInterviewFilter) {
+        localStorage.setItem(`${INTERVIEW_SCOPE_KEY}-${project}`, activeInterviewFilter);
+      } else {
+        localStorage.removeItem(`${INTERVIEW_SCOPE_KEY}-${project}`);
+      }
+    } catch {
+      // localStorage no disponible
+    }
+  }, [activeInterviewFilter, project]);
 
   // Permite que otras vistas (p.ej. Inicio/Panorama) sugieran una entrevista.
   // No pisa la selección del usuario si ya eligió una.
@@ -941,7 +968,28 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
       if (data.error) {
         throw new Error(data.error || "No se pudieron obtener sugerencias.");
       }
-      setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+      const resultSuggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+      setSuggestions(resultSuggestions);
+      
+      // E3-1.2: Log E3 suggest action for traceability
+      try {
+        await logDiscoveryNavigation({
+          project,
+          positivos: [],
+          negativos: [],
+          target_text: null,
+          fragments_count: resultSuggestions.length,
+          codigos_sugeridos: [],
+          action_taken: "e3_suggest",
+          seed_fragmento_id: suggestFragmentId.trim(),
+          scope_archivo: activeInterviewFilter || undefined,
+          top_k: suggestTopK,
+          include_coded: suggestIncludeCoded,
+        });
+      } catch {
+        // Non-blocking: log failure but don't interrupt user flow
+        console.warn("E3 navigation log failed (non-blocking)");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Error desconocido";
       if (message.toLowerCase().includes("no existe en postgresql") || message.includes("Fragmento")) {
@@ -1254,6 +1302,25 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
 
       if (data.error) {
         throw new Error(data.error);
+      }
+
+      // E3-1.2: Log E3 send_candidates action for traceability
+      try {
+        await logDiscoveryNavigation({
+          project,
+          positivos: [actionSuggestionCode.trim()],
+          negativos: [],
+          target_text: null,
+          fragments_count: data.submitted || selectedFragments.length,
+          codigos_sugeridos: [actionSuggestionCode.trim()],
+          ai_synthesis: actionSuggestionMemo.trim() || undefined,
+          action_taken: "e3_send_candidates",
+          seed_fragmento_id: suggestFragmentId.trim() || undefined,
+          scope_archivo: activeInterviewFilter || undefined,
+        });
+      } catch {
+        // Non-blocking
+        console.warn("E3 navigation log failed (non-blocking)");
       }
 
       // Limpiar estado y mostrar éxito
@@ -2570,8 +2637,11 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
       </header>
 
       {/* Filtro global de entrevista - Metodologícamente importante para Etapa 3 */}
+      {/* E3-1.1: Scope persistente + visible con badge de modo */}
       <div style={{
-        background: 'linear-gradient(135deg, #fef3c7, #fde68a)',
+        background: scopeMode === 'case' 
+          ? 'linear-gradient(135deg, #dcfce7, #bbf7d0)' 
+          : 'linear-gradient(135deg, #fef3c7, #fde68a)',
         padding: '0.75rem 1rem',
         borderRadius: '0.5rem',
         marginBottom: '1rem',
@@ -2579,10 +2649,27 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
         alignItems: 'center',
         justifyContent: 'space-between',
         gap: '1rem',
-        flexWrap: 'wrap'
+        flexWrap: 'wrap',
+        border: scopeMode === 'case' ? '2px solid #22c55e' : '2px solid #f59e0b'
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-          <span style={{ fontWeight: 600, color: '#92400e' }}>🎯 Entrevista Activa:</span>
+          {/* Badge de modo scope */}
+          <span style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '0.35rem',
+            padding: '0.25rem 0.6rem',
+            borderRadius: '9999px',
+            fontSize: '0.75rem',
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.05em',
+            background: scopeMode === 'case' ? '#22c55e' : '#f59e0b',
+            color: 'white',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
+          }}>
+            {scopeMode === 'case' ? '📄 Modo Caso' : '📁 Modo Proyecto'}
+          </span>
           <select
             value={activeInterviewFilter}
             onChange={(e) => {
@@ -2610,14 +2697,14 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
             }}
             style={{
               padding: '0.4rem 0.75rem',
-              border: '2px solid #f59e0b',
+              border: scopeMode === 'case' ? '2px solid #22c55e' : '2px solid #f59e0b',
               borderRadius: '0.375rem',
               background: 'white',
               fontWeight: 500,
               minWidth: '280px'
             }}
           >
-            <option value="">Todas las entrevistas (Etapa 4: comparación)</option>
+            <option value="">📁 Todas las entrevistas (Modo Proyecto)</option>
             {interviews.map((int) => (
               <option key={int.archivo} value={int.archivo}>
                 📄 {int.archivo} ({int.fragmentos} fragmentos)
@@ -2625,10 +2712,19 @@ export function CodingPanel({ project, refreshKey, initialArchivo }: CodingPanel
             ))}
           </select>
         </div>
-        <p style={{ margin: 0, fontSize: '0.8rem', color: '#78350f', maxWidth: '400px' }}>
-          ⚠️ En <strong>Etapa 3</strong>, analiza cada entrevista individualmente.
-          La comparación entre entrevistas es para <strong>Etapa 4 - Axial</strong>.
-        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', maxWidth: '400px' }}>
+          {scopeMode === 'case' ? (
+            <p style={{ margin: 0, fontSize: '0.8rem', color: '#166534' }}>
+              ✅ <strong>Etapa 3</strong>: Analizando "{activeInterviewFilter}" de forma aislada.
+              El scope se guarda automáticamente.
+            </p>
+          ) : (
+            <p style={{ margin: 0, fontSize: '0.8rem', color: '#78350f' }}>
+              ⚠️ <strong>Modo Proyecto</strong>: Para comparación transversal (Etapa 4).
+              Selecciona una entrevista para análisis individual.
+            </p>
+          )}
+        </div>
       </div>
       <div className="coding__resources">
         <section className="coding__resource">

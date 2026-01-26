@@ -47,11 +47,13 @@ import { RegisterPage } from "./components/RegisterPage";
 import { ConfirmModal } from "./components/ConfirmModal";
 import { AdminPanel } from "./components/AdminPanel";
 import { AgentPanel } from "./components/AgentPanel";  // Autonomous Agent
+import { EpistemicModeBadge } from "./components/common/EpistemicModeBadge";
+import { EpistemicModeSelector } from "./components/common/EpistemicModeSelector";
 import { useAuth } from "./context/AuthContext";
 import { useProjects } from "./hooks/useProjects";
 import { useStatus } from "./hooks/useStatus";
 import { useResearchOverview } from "./hooks/useResearchOverview";
-import type { StageEntry } from "./types";
+import type { StageEntry, EpistemicMode } from "./types";
 import "./App.css";
 import { apiFetch } from "./services/api";
 
@@ -205,6 +207,7 @@ function AuthenticatedApp({ user, onLogout }: { user: any; onLogout: () => void 
   const [creatingProject, setCreatingProject] = useState(false);
   const [formName, setFormName] = useState("");
   const [formDescription, setFormDescription] = useState("");
+  const [formEpistemicMode, setFormEpistemicMode] = useState<EpistemicMode>("constructivist");
   const [editName, setEditName] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [updatingProject, setUpdatingProject] = useState(false);
@@ -335,10 +338,15 @@ function AuthenticatedApp({ user, onLogout }: { user: any; onLogout: () => void 
     setActionError(null);
     setCreatingProject(true);
     try {
-      const result = await createProject({ name: formName.trim(), description: formDescription });
+      const result = await createProject({ 
+        name: formName.trim(), 
+        description: formDescription,
+        epistemic_mode: formEpistemicMode
+      });
       if (result) {
         setFormName("");
         setFormDescription("");
+        setFormEpistemicMode("constructivist");
         addToast("success", `Proyecto "${result.name || result.id}" creado exitosamente`);
         // Small delay to ensure state is fully updated before switching
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -503,7 +511,10 @@ function AuthenticatedApp({ user, onLogout }: { user: any; onLogout: () => void 
 
       <section className="app__projects">
         <div className="app__project-card">
-          <h2>{activeProject?.name || "Proyecto sin titulo"}</h2>
+          <h2 style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+            {activeProject?.name || "Proyecto sin titulo"}
+            <EpistemicModeBadge mode={activeProject?.epistemic_mode} size="sm" />
+          </h2>
           <p>{activeProject?.description || "Describe el alcance investigativo del proyecto."}</p>
           <dl>
             <div>
@@ -571,6 +582,14 @@ function AuthenticatedApp({ user, onLogout }: { user: any; onLogout: () => void 
                   value={formDescription}
                   onChange={(event) => setFormDescription(event.target.value)}
                   placeholder="Opcional"
+                />
+              </div>
+              <div>
+                <label>Modo epistemologico</label>
+                <EpistemicModeSelector
+                  value={formEpistemicMode}
+                  onChange={setFormEpistemicMode}
+                  compact={false}
                 />
               </div>
               <button type="submit" disabled={projectsState.loading || creatingProject}>

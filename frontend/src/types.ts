@@ -42,11 +42,14 @@ export interface StatusSnapshot {
   updated?: boolean;
 }
 
+export type EpistemicMode = "constructivist" | "post_positivist";
+
 export interface ProjectEntry {
   id: string;
   name?: string;
   description?: string;
   created_at?: string;
+  epistemic_mode?: EpistemicMode;
   [key: string]: unknown;
 }
 

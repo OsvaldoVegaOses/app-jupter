@@ -1,0 +1,46 @@
+ETAPA: CODIFICACIÓN AXIAL (Enfoque Constructivista)
+
+ENTRADA ESPERADA:
+- codes: lista de {code_id: int, label: string, frequency: int, evidence_ids: list[int]}
+- relations_existing: lista de {from_code: string, rel_type: string, to_code: string} (opcional)
+- categories_draft: lista de strings (categorías tentativas, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Organizar códigos en categorías relacionales que capturen la complejidad del fenómeno.
+
+PRINCIPIOS:
+- Las categorías son construcciones tentativas, no descubrimientos de estructuras fijas
+- Las relaciones reflejan cómo los participantes conectan experiencias
+- Evitar imponer paradigmas rígidos; dejar que emerjan del dato
+
+TIPOS DE RELACIÓN (flexibles):
+- "partede": Agrupación conceptual
+- "causa": Genera/origina (desde la perspectiva del participante)
+- "condicion": Contexto que habilita o restringe
+- "consecuencia": Resultado percibido
+- "tension": Contradicción o ambivalencia (característico constructivista)
+
+INSTRUCCIONES:
+1. Agrupa códigos que compartan un proceso o experiencia central
+2. Nombra la categoría como un proceso (gerundio cuando sea posible)
+3. Identifica relaciones desde la perspectiva de los participantes
+4. Registra tensiones o contradicciones como hallazgos, no como errores
+
+MEMO AXIAL (obligatorio):
+- ¿Por qué estos códigos forman una categoría?
+- ¿Qué voces o perspectivas sustentan estas relaciones?
+- ¿Qué queda fuera de esta agrupación y por qué?
+
+EJEMPLO:
+{
+  "etapa4_axial": [
+    {
+      "categoria": "negociando_identidad_comunitaria",
+      "codigos": ["resistiendo_cambio", "añorando_pasado", "adaptandose_nuevos_vecinos"],
+      "tipo_relacion": "tension",
+      "relaciones": ["resistiendo_cambio <-> adaptandose_nuevos_vecinos"],
+      "memo": "Los participantes expresan simultáneamente resistencia y adaptación, sugiriendo un proceso de negociación identitaria más que una posición fija."
+    }
+  ]
+}

@@ -1419,6 +1419,35 @@ export interface CodeHistoryEntry {
   created_at: string | null;
 }
 
+// =============================================================================
+// Link Predictions - Predicciones de Relaciones Axiales
+// =============================================================================
+
+/** Predicción de relación entre códigos */
+export interface LinkPrediction {
+  id: number;
+  project_id: string;
+  source_code: string;
+  target_code: string;
+  relation_type: string;
+  algorithm: string;
+  score: number;
+  rank?: number;
+  estado: "pendiente" | "validado" | "rechazado";
+  validado_por?: string;
+  validado_en?: string;
+  memo?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Estadísticas de link predictions */
+export interface LinkPredictionStats {
+  totals: Record<string, number>;
+  by_algorithm: Record<string, number>;
+  total: number;
+}
+
 /** Obtiene el historial de versiones de un código */
 export async function getCodeHistory(
   project: string,
@@ -1717,6 +1746,8 @@ export async function promoteCandidates(
   eligible_total?: number;
   skipped_total?: number;
   mode?: string;
+  neo4j_merged?: number;
+  neo4j_missing_fragments?: number;
 }> {
   return apiFetchJson("/api/codes/candidates/promote", {
     method: "POST",
@@ -1793,6 +1824,80 @@ export async function getBacklogHealth(
     threshold_count: String(thresholdCount),
   });
   return apiFetchJson(`/api/codes/candidates/health?${params.toString()}`);
+}
+
+// =============================================================================
+// Link Predictions API Functions
+// =============================================================================
+
+/**
+ * Obtiene predicciones de relaciones entre códigos.
+ */
+export async function getLinkPredictions(
+  project: string,
+  options?: {
+    estado?: string;
+    algorithm?: string;
+    limit?: number;
+    offset?: number;
+  }
+): Promise<{
+  items: LinkPrediction[];
+  total: number;
+  limit: number;
+  offset: number;
+  stats: LinkPredictionStats;
+}> {
+  const params = new URLSearchParams({ project });
+  if (options?.estado) params.append("estado", options.estado);
+  if (options?.algorithm) params.append("algorithm", options.algorithm);
+  if (options?.limit) params.append("limit", String(options.limit));
+  if (options?.offset) params.append("offset", String(options.offset));
+  return apiFetchJson(`/api/link-predictions?${params.toString()}`);
+}
+
+/**
+ * Actualiza el estado de una predicción de relación.
+ */
+export async function updateLinkPrediction(
+  predictionId: number,
+  estado: "validado" | "rechazado" | "pendiente",
+  options?: {
+    memo?: string;
+    relation_type?: string;
+  }
+): Promise<{
+  success: boolean;
+  prediction_id: number;
+  estado: string;
+  neo4j_synced?: boolean;
+}> {
+  return apiFetchJson(`/api/link-predictions/${predictionId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      estado,
+      memo: options?.memo,
+      relation_type: options?.relation_type,
+    }),
+  });
+}
+
+/**
+ * Actualiza múltiples predicciones en batch.
+ */
+export async function batchUpdateLinkPredictions(
+  ids: number[],
+  estado: "validado" | "rechazado" | "pendiente",
+  project: string
+): Promise<{
+  success: boolean;
+  updated_count: number;
+  neo4j_synced?: number;
+}> {
+  return apiFetchJson("/api/link-predictions/batch-update", {
+    method: "POST",
+    body: JSON.stringify({ prediction_ids: ids, estado, project }),
+  });
 }
 
 /** Código similar (sinónimo potencial) */
@@ -1941,8 +2046,13 @@ export interface LogNavigationRequest {
   codigos_sugeridos?: string[];
   refinamientos_aplicados?: Record<string, any>;
   ai_synthesis?: string;
-  action_taken: "search" | "refine" | "send_codes";
+  action_taken: "search" | "refine" | "send_codes" | "e3_suggest" | "e3_send_candidates" | "e3_validate" | "e3_reject" | "e3_promote";
   busqueda_origen_id?: string;
+  // E3-1.2: Campos adicionales para trazabilidad E3
+  seed_fragmento_id?: string;
+  scope_archivo?: string;
+  top_k?: number;
+  include_coded?: boolean;
 }
 
 export interface NavigationHistoryEntry {
@@ -2023,4 +2133,3 @@ export async function updateProjectConfig(
     body: JSON.stringify(updates),
   });
 }
-

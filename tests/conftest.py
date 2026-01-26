@@ -85,6 +85,10 @@ if "structlog" not in sys.modules:
     structlog.get_logger = lambda *_args, **_kwargs: _BoundLogger()  # type: ignore
 
     sys.modules["structlog"] = structlog
+    sys.modules["structlog.dev"] = structlog.dev
+    sys.modules["structlog.stdlib"] = structlog.stdlib
+    sys.modules["structlog.processors"] = structlog.processors
+    sys.modules["structlog.contextvars"] = structlog.contextvars
 
 
 # FastAPI mock removed to use installed package
@@ -101,8 +105,16 @@ if "neo4j" not in sys.modules:
         def close(self):
             return None
 
+    class Query:  # type: ignore
+        """Stub for neo4j.Query."""
+        def __init__(self, text: str, timeout: float = None, metadata: dict = None):
+            self.text = text
+            self.timeout = timeout
+            self.metadata = metadata
+
     neo4j.GraphDatabase = types.SimpleNamespace(driver=lambda *args, **kwargs: _StubDriver())
     neo4j.Driver = _StubDriver
+    neo4j.Query = Query  # type: ignore[attr-defined]
 
     exceptions = types.ModuleType("neo4j.exceptions")
 
@@ -145,8 +157,29 @@ if "psycopg2" not in sys.modules:
     extensions.connection = object  # type: ignore[attr-defined]
     psycopg2.extensions = extensions
 
+    # Add pool module stub for connection pooling
+    pool_module = types.ModuleType("psycopg2.pool")
+
+    class ThreadedConnectionPool:  # type: ignore
+        def __init__(self, minconn, maxconn, *args, **kwargs):
+            self.minconn = minconn
+            self.maxconn = maxconn
+
+        def getconn(self):
+            return _StubConnection()
+
+        def putconn(self, conn, close=False):
+            return None
+
+        def closeall(self):
+            return None
+
+    pool_module.ThreadedConnectionPool = ThreadedConnectionPool  # type: ignore[attr-defined]
+    psycopg2.pool = pool_module  # type: ignore[attr-defined]
+
     sys.modules["psycopg2"] = psycopg2
     sys.modules["psycopg2.extensions"] = extensions
+    sys.modules["psycopg2.pool"] = pool_module
 
     extras = types.ModuleType("psycopg2.extras")
 
@@ -251,3 +284,24 @@ if "docx" not in sys.modules:
 
     docx.Document = Document  # type: ignore[attr-defined]
     sys.modules["docx"] = docx
+
+
+if "rapidfuzz" not in sys.modules:
+    rapidfuzz = types.ModuleType("rapidfuzz")
+    distance = types.ModuleType("rapidfuzz.distance")
+
+    class Levenshtein:  # type: ignore
+        @staticmethod
+        def normalized_similarity(s1, s2):
+            # Simple stub that returns 1.0 for equal strings, 0.0 otherwise
+            return 1.0 if s1 == s2 else 0.5
+
+        @staticmethod
+        def distance(s1, s2):
+            return 0 if s1 == s2 else len(s1)
+
+    distance.Levenshtein = Levenshtein  # type: ignore[attr-defined]
+    rapidfuzz.distance = distance  # type: ignore[attr-defined]
+
+    sys.modules["rapidfuzz"] = rapidfuzz
+    sys.modules["rapidfuzz.distance"] = distance

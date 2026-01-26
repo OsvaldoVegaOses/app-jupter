@@ -1,0 +1,47 @@
+ETAPA: CODIFICACIÓN ABIERTA (Enfoque Charmaz)
+
+ENTRADA ESPERADA:
+- fragments: lista de {evidence_id: int, text: string, source: string}
+- existing_codes: lista de strings (códigos ya existentes, opcional)
+- research_question: string (pregunta de investigación, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Generar códigos que capturen los PROCESOS y ACCIONES que los participantes describen.
+
+FORMATO DE CÓDIGOS:
+- Usar GERUNDIOS: "experimentando_presion", "negociando_identidad", "resistiendo_cambio"
+- Privilegiar códigos IN-VIVO (palabras exactas del participante) cuando sean significativas
+- Máximo 3-4 palabras por código (snake_case)
+- Los códigos deben reflejar la perspectiva del participante, no categorías predefinidas
+
+INSTRUCCIONES:
+1. Lee el fragmento buscando qué HACE o EXPERIMENTA el participante
+2. Identifica procesos, acciones, estados emocionales
+3. Formula códigos como gerundios que capturen el proceso
+4. Incluye al menos un código in-vivo si hay expresiones significativas
+
+MEMO REFLEXIVO (obligatorio):
+- ¿Desde qué posición estoy interpretando este fragmento?
+- ¿Qué aspectos del contexto de la entrevista podrían afectar mi lectura?
+- ¿Qué voces o perspectivas podrían estar ausentes?
+
+EJEMPLO DE SALIDA:
+{
+  "etapa3_matriz_abierta": [
+    {
+      "codigo": "experimentando_sobrecarga",
+      "cita": "ya no doy más con todo esto",
+      "fragmento_idx": 5,
+      "fuente": "Entrevistado/a",
+      "in_vivo": false
+    },
+    {
+      "codigo": "no_dar_mas",
+      "cita": "ya no doy más",
+      "fragmento_idx": 5,
+      "fuente": "Entrevistado/a",
+      "in_vivo": true
+    }
+  ]
+}

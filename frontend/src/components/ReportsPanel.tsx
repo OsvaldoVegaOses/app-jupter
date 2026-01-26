@@ -380,7 +380,7 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
         }
 
         if (status.status === "error") {
-          const msg = (status.errors && status.errors.length > 0) ? status.errors.join("\n") : (status.message || "Error generando informe doctoral");
+          const msg = (status.errors && status.errors.length > 0) ? status.errors.join("\n") : (status.message || "Error generando informe de avance");
           setError(msg);
           break;
         }
@@ -388,7 +388,7 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
         await sleep(2000);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Error generando informe doctoral");
+      setError(err instanceof Error ? err.message : "Error generando informe de avance");
     } finally {
       setDoctoralLoading(false);
     }
@@ -454,7 +454,7 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `Informe_Doctoral_${doctoralStage}_${project}_${Date.now()}.md`;
+    a.download = `Informe_Avance_${doctoralStage}_${project}_${Date.now()}.md`;
     document.body.appendChild(a);
     a.click();
     URL.revokeObjectURL(url);
@@ -617,10 +617,10 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
         </button>
       </nav>
 
-      {/* Doctoral Report Generator */}
+      {/* Stage Report Generator */}
       <div className="reports-panel__doctoral">
         <div className="reports-panel__doctoral-header">
-          <span>📄 Generar Informe Doctoral:</span>
+          <span>📄 Generar Informe de Avance:</span>
           <select
             value={doctoralStage}
             onChange={(e) => setDoctoralStage(e.target.value as "stage3" | "stage4")}

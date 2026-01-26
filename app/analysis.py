@@ -60,6 +60,7 @@ from .postgres_block import (
     insert_candidate_codes,
     insert_analysis_memo,
     ensure_analysis_memos_table,
+    get_project_epistemic_mode,
 )
 from .neo4j_block import (
     ensure_category_constraints,
@@ -67,7 +68,8 @@ from .neo4j_block import (
     merge_category_code_relationship,
 )
 from .documents import make_fragment_id, match_citation_to_fragment
-from .settings import AppSettings
+from .settings import AppSettings, EpistemicMode
+from .prompts.loader import get_system_prompt
 
 
 QUAL_SYSTEM_PROMPT = """Eres un asistente AI experto en metodologia cualitativa y analisis de entrevistas.
@@ -450,8 +452,32 @@ def analyze_interview_text(
         fuente: Nombre de la fuente/entrevista
         temperature: Temperatura para LLM (no usado en gpt-5.x)
         project_id: ID del proyecto para aislamiento de contexto
-    """
-    # Estrategia Pre-Hoc: Ingesta virtual en el prompt
+    """    # Obtener modo epistémico del proyecto (EM03)
+    epistemic_mode = EpistemicMode.CONSTRUCTIVIST  # default
+    prompt_version = "qual_system_prompt_v1"  # fallback version
+    system_prompt = QUAL_SYSTEM_PROMPT  # fallback prompt
+    
+    if project_id and clients.pg:
+        try:
+            epistemic_mode = get_project_epistemic_mode(clients.pg, project_id)
+            # Obtener prompt diferenciado
+            system_prompt, prompt_version = get_system_prompt(epistemic_mode, "open_coding")
+        except Exception as e:
+            _logger.warning(
+                "epistemic_mode.load_failed",
+                project_id=project_id,
+                error=str(e),
+                fallback="QUAL_SYSTEM_PROMPT",
+            )
+    
+    _logger.info(
+        "analysis.started",
+        project_id=project_id,
+        epistemic_mode=epistemic_mode.value,
+        prompt_version=prompt_version,
+        fragment_count=len(fragments),
+    )
+        # Estrategia Pre-Hoc: Ingesta virtual en el prompt
     text_construction = []
     for idx, frag in enumerate(fragments):
         text_construction.append(f"[IDX: {idx}] {frag}")
@@ -469,7 +495,7 @@ IMPORTANTE: Para cada cita en 'etapa3_matriz_abierta', debes indicar el campo in
 Devuelve SOLO el JSON.
 
 {joined_text}"""
-    out = call_llm_chat_json(clients, settings, QUAL_SYSTEM_PROMPT, user_prompt, temperature=temperature)
+    out = call_llm_chat_json(clients, settings, system_prompt, user_prompt, temperature=temperature)
     memo_statements = _normalize_memo_sintesis(out.get("memo_sintesis"))
 
     # Fallback: if model didn't provide memo_sintesis, expose labeled statements from Etapa 4 memos.
@@ -493,14 +519,23 @@ Devuelve SOLO el JSON.
 
     out["cognitive_metadata"] = {
         "schema_version": ANALYSIS_MEMO_SCHEMA_VERSION,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": prompt_version,  # EM03: usar versión dinámica
         "prompt_hash": PROMPT_HASH,
+        "epistemic_mode": epistemic_mode.value,  # EM03: modo epistémico
         "llm_provider": "azure_openai",
         "llm_deployment": settings.azure.deployment_chat,
         "llm_api_version": settings.azure.api_version,
         "run_id": run_id,
         "request_id": request_id,
     }
+    
+    # EM03: Agregar _meta para audit trail explícito
+    out["_meta"] = {
+        "epistemic_mode": epistemic_mode.value,
+        "prompt_version": prompt_version,
+        "analysis_schema_version": ANALYSIS_MEMO_SCHEMA_VERSION,
+    }
+    
     return out
 
 

@@ -1,0 +1,73 @@
+ETAPA: MEMO CONCEPTUAL (Enfoque Post-positivista)
+
+ENTRADA ESPERADA:
+- memo_type: "codigo" | "teorico" | "operacional" | "integrativo"
+- focus: string (código o categoría central del memo)
+- codes_related: lista de {code_id: int, label: string, propiedades: list[string]} (opcional)
+- evidence: lista de {evidence_id: int, text: string} (opcional)
+- propositions: lista de strings (proposiciones a desarrollar, opcional)
+
+OBJETIVO:
+Documentar el desarrollo conceptual de códigos y categorías,
+enfatizando propiedades, dimensiones y relaciones teóricas.
+
+TIPOS DE MEMO:
+1. MEMO DE CÓDIGO: Define propiedades y dimensiones
+2. MEMO TEÓRICO: Desarrolla proposiciones y relaciones
+3. MEMO OPERACIONAL: Registra decisiones de muestreo
+4. MEMO INTEGRATIVO: Conecta categorías en teoría
+
+ESTRUCTURA DEL MEMO CONCEPTUAL:
+1. Concepto: Nombre y definición operacional
+2. Propiedades: Características definitorias
+3. Dimensiones: Rangos de variación
+4. Condiciones: Cuándo y dónde ocurre
+5. Relaciones: Conexiones con otros conceptos
+
+INSTRUCCIONES:
+1. Identifica el tipo de memo apropiado
+2. Desarrolla propiedades y dimensiones sistemáticamente
+3. Vincula a evidencia específica (índices de fragmento)
+4. Formula proposiciones verificables
+
+EJEMPLO MEMO DE CÓDIGO:
+{
+  "tipo": "codigo",
+  "codigo": "percepcion_de_invasion",
+  "definicion": "Interpretación subjetiva de que el territorio propio está siendo ocupado por grupos ajenos",
+  "propiedades": [
+    {
+      "nombre": "intensidad",
+      "descripcion": "Grado de amenaza percibida",
+      "dimension": "leve --- moderada --- severa"
+    },
+    {
+      "nombre": "fuente",
+      "descripcion": "Grupo percibido como invasor",
+      "variantes": ["nuevos_residentes", "turistas", "comerciantes"]
+    },
+    {
+      "nombre": "temporalidad",
+      "descripcion": "Percepción del cambio como proceso",
+      "dimension": "gradual --- abrupto"
+    }
+  ],
+  "condiciones_ocurrencia": [
+    "Cambio demográfico visible",
+    "Diferencia socioeconómica o cultural percibida",
+    "Historia de estabilidad previa"
+  ],
+  "evidencia": [3, 7, 12, 18, 23]
+}
+
+EJEMPLO MEMO TEÓRICO:
+{
+  "tipo": "teorico",
+  "titulo": "Relación entre percepción y estrategia",
+  "proposicion": "A mayor intensidad de percepción de invasión, mayor probabilidad de estrategias de evitación versus confrontación.",
+  "logica": "La evitación minimiza conflicto directo pero aumenta segregación; la confrontación puede escalar o resolver tensiones.",
+  "evidencia_apoyo": [7, 12, 23],
+  "evidencia_contraria": [15],
+  "condiciones_frontera": "Esta relación podría no aplicar cuando existen mediadores institucionales.",
+  "implicaciones": "Intervenciones que reduzcan percepción de amenaza podrían modificar estrategias."
+}

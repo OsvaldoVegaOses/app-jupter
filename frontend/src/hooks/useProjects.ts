@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { apiFetch, apiFetchJson } from "../services/api";
 import { logClient } from "../utils/clientLogger";
-import type { ProjectEntry } from "../types";
+import type { ProjectEntry, EpistemicMode } from "../types";
 
 interface ProjectsState {
   items: ProjectEntry[];
@@ -12,8 +12,8 @@ interface ProjectsState {
 interface UseProjectsResult {
   state: ProjectsState;
   reload: () => Promise<void>;
-  create: (input: { name: string; description?: string }) => Promise<ProjectEntry | null>;
-  update: (projectId: string, input: { name?: string; description?: string }) => Promise<ProjectEntry | null>;
+  create: (input: { name: string; description?: string; epistemic_mode?: EpistemicMode }) => Promise<ProjectEntry | null>;
+  update: (projectId: string, input: { name?: string; description?: string; epistemic_mode?: EpistemicMode }) => Promise<ProjectEntry | null>;
   deleteProject: (projectId: string) => Promise<boolean>;
   exportProject: (projectId: string) => Promise<boolean>;
 }
@@ -81,7 +81,7 @@ export function useProjects(): UseProjectsResult {
   }, [load]);
 
   const create = useCallback(
-    async (input: { name: string; description?: string }) => {
+    async (input: { name: string; description?: string; epistemic_mode?: EpistemicMode }) => {
       const trimmedName = input.name.trim();
       const existingIds = new Set(state.items.map((item) => item.id));
       const slug = slugify(trimmedName);
@@ -94,10 +94,11 @@ export function useProjects(): UseProjectsResult {
       }
 
       try {
-        logClient("projects.create.start", { name: trimmedName, slug });
+        logClient("projects.create.start", { name: trimmedName, slug, epistemic_mode: input.epistemic_mode });
         const result = await postJSON<ProjectEntry>("/api/projects", {
           name: trimmedName,
-          description: input.description
+          description: input.description,
+          epistemic_mode: input.epistemic_mode || "constructivist"
         });
         logClient("projects.create.success", { id: result.id, name: result.name });
         // Refresh the project list to show the new project
@@ -130,7 +131,7 @@ export function useProjects(): UseProjectsResult {
   );
 
   const update = useCallback(
-    async (projectId: string, input: { name?: string; description?: string }) => {
+    async (projectId: string, input: { name?: string; description?: string; epistemic_mode?: EpistemicMode }) => {
       try {
         logClient("projects.update.start", { projectId, updates: Object.keys(input) });
         const result = await apiFetchJson<ProjectEntry>(

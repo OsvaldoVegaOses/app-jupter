@@ -1,0 +1,64 @@
+ETAPA: SÍNTESIS DISCOVERY (Enfoque Post-positivista)
+
+ENTRADA ESPERADA:
+- query: string (consulta semántica original)
+- top_fragments: lista de {evidence_id: int, text: string, source: string, score: float}
+- anchors: lista de strings (anclas positivas usadas, opcional)
+- negatives: lista de strings (anclas negativas usadas, opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Sintetizar fragmentos recuperados semánticamente, identificando patrones y regularidades
+que puedan abstraerse conceptualmente.
+
+PRINCIPIOS:
+- Buscar patrones que trasciendan casos particulares
+- Los códigos deben ser conceptos analíticos, no descripciones
+- La síntesis debe avanzar hacia abstracción teórica
+
+INSTRUCCIONES:
+1. Lee los fragmentos recuperados buscando patrones recurrentes
+2. Sintetiza hallazgos como statements epistémicos diferenciados
+3. Sugiere códigos en formato sustantivo abstracto (snake_case)
+4. Propón refinamientos para verificar patrones
+
+FORMATO memo_sintesis (obligatorio):
+- OBSERVATION: Patrón observado en los datos (con evidence_ids)
+- INTERPRETATION: Concepto abstracto que lo captura (con evidence_ids)
+- HYPOTHESIS: Proposición teórica verificable
+- NORMATIVE_INFERENCE: Implicaciones prácticas si aplica
+
+CRITERIOS DE PATRÓN:
+- Frecuencia: ¿Aparece en múltiples fragmentos?
+- Consistencia: ¿Se mantiene en diferentes contextos?
+- Variación: ¿Qué dimensiones tiene?
+
+EJEMPLO:
+{
+  "memo_sintesis": [
+    {
+      "type": "OBSERVATION",
+      "text": "Cuatro fragmentos refieren cambios en el uso del espacio público.",
+      "evidence_ids": [2, 5, 8, 11]
+    },
+    {
+      "type": "INTERPRETATION",
+      "text": "Existe un patrón de reconfiguración territorial asociado al cambio demográfico.",
+      "evidence_ids": [2, 5, 8, 11]
+    },
+    {
+      "type": "HYPOTHESIS",
+      "text": "La reconfiguración territorial funciona como indicador de tensión intergrupal."
+    }
+  ],
+  "codigos_sugeridos": [
+    "reconfiguración_territorial",
+    "tension_intergrupal",
+    "segregacion_espacial_informal"
+  ],
+  "refinamiento_busqueda": {
+    "positivos": ["espacio público", "plaza", "calle"],
+    "negativos": ["transporte", "comercio"],
+    "target": null
+  }
+}

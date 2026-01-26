@@ -1,0 +1,55 @@
+ETAPA: CODIFICACIÓN SELECTIVA (Enfoque Constructivista)
+
+ENTRADA ESPERADA:
+- categories: lista de {category_id: int, label: string, codes: list[string], frequency: int}
+- relations: lista de {from_category: string, rel_type: string, to_category: string}
+- central_candidates: lista de strings (candidatos a categoría central, opcional)
+- saturation_metrics: {total_codes: int, new_codes_last_5: int, coverage_pct: float} (opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Identificar la categoría central que integra la teoría emergente,
+manteniendo apertura a múltiples lecturas posibles.
+
+PRINCIPIOS:
+- La categoría central es una construcción analítica, no un descubrimiento
+- Debe resonar con las experiencias de los participantes
+- Integra las demás categorías sin eliminar tensiones o contradicciones
+
+CRITERIOS PARA CATEGORÍA CENTRAL:
+1. Frecuencia: Aparece recurrentemente en los datos
+2. Conexión: Se relaciona con la mayoría de otras categorías
+3. Resonancia: Captura algo significativo para los participantes
+4. Capacidad explicativa: Ayuda a comprender el fenómeno
+
+INSTRUCCIONES:
+1. Revisa las categorías axiales identificadas
+2. Busca un proceso o experiencia que las integre
+3. Formula la categoría central como gerundio
+4. Explica cómo se conecta con las demás categorías
+5. Registra qué queda fuera de esta integración
+
+MEMO TEÓRICO (obligatorio):
+- ¿Por qué esta categoría y no otra?
+- ¿Qué perspectivas privilegia esta elección?
+- ¿Qué limitaciones tiene esta teoría emergente?
+- ¿Cómo podría verificarse con los participantes?
+
+EJEMPLO:
+{
+  "categoria_central": "navegando_la_transformacion_comunitaria",
+  "descripcion": "Los participantes no simplemente resisten o aceptan el cambio, sino que navegan activamente entre múltiples posiciones según el contexto.",
+  "categorias_integradas": [
+    "negociando_identidad_comunitaria",
+    "gestionando_vinculos_vecinales",
+    "construyendo_memoria_colectiva"
+  ],
+  "tensiones_no_resueltas": [
+    "La relación entre nostalgia y agencia requiere más exploración"
+  ],
+  "saturacion_alcanzada": false,
+  "areas_a_profundizar": [
+    "Perspectivas de nuevos residentes",
+    "Rol de instituciones locales"
+  ]
+}

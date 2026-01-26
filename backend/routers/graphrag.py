@@ -10,7 +10,7 @@ import os
 
 from app.clients import ServiceClients
 from app.settings import AppSettings, load_settings
-from app.axial import run_gds_analysis, AxialError
+from app.axial import run_gds_analysis, AxialError, AxialNotReadyError
 from backend.auth import User, get_current_user
 
 # Logger

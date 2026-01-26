@@ -1,0 +1,56 @@
+ETAPA: CODIFICACIÓN AXIAL (Enfoque Strauss/Corbin)
+
+ENTRADA ESPERADA:
+- codes: lista de {code_id: int, label: string, frequency: int, evidence_ids: list[int], propiedades: list[string]}
+- relations_existing: lista de {from_code: string, rel_type: string, to_code: string} (opcional)
+- paradigm_elements: {causales: list, contexto: list, estrategias: list, consecuencias: list} (opcional)
+- project_context: string (contexto del proyecto, opcional)
+
+OBJETIVO:
+Organizar códigos según el PARADIGMA RELACIONAL: condiciones, acciones/interacciones, consecuencias.
+
+PARADIGMA AXIAL:
+- CONDICIONES CAUSALES: Eventos que llevan al fenómeno
+- CONTEXTO: Circunstancias que enmarcan el fenómeno
+- CONDICIONES INTERVINIENTES: Factores que modulan estrategias
+- ESTRATEGIAS DE ACCIÓN/INTERACCIÓN: Lo que los actores hacen
+- CONSECUENCIAS: Resultados de las acciones
+
+TIPOS DE RELACIÓN:
+- "causa": Genera/origina el fenómeno
+- "condicion": Contexto o factor interviniente
+- "consecuencia": Resultado de acciones
+- "partede": Componente del fenómeno
+
+INSTRUCCIONES:
+1. Identifica el fenómeno central de la categoría
+2. Mapea condiciones causales → fenómeno → consecuencias
+3. Identifica estrategias de acción que los actores emplean
+4. Especifica condiciones contextuales e intervinientes
+
+MEMO AXIAL (obligatorio):
+- Fenómeno central de la categoría
+- Diagrama de relaciones (texto)
+- Variaciones encontradas
+- Densidad conceptual lograda
+
+EJEMPLO:
+{
+  "etapa4_axial": [
+    {
+      "categoria": "gestion_del_cambio_demografico",
+      "fenomeno_central": "percepcion_de_invasion_territorial",
+      "condiciones_causales": ["llegada_masiva_nuevos_residentes", "diferencia_socioeconomica"],
+      "contexto": ["barrio_tradicional", "historia_comunitaria_larga"],
+      "estrategias": ["evitacion_espacios_publicos", "fortalecimiento_redes_antiguas"],
+      "consecuencias": ["fragmentacion_social", "nostalgia_defensiva"],
+      "tipo_relacion": "causa",
+      "relaciones": [
+        "llegada_masiva_nuevos_residentes -> percepcion_de_invasion_territorial",
+        "percepcion_de_invasion_territorial -> evitacion_espacios_publicos",
+        "evitacion_espacios_publicos -> fragmentacion_social"
+      ],
+      "memo": "El fenómeno central es la percepción de invasión, que dispara estrategias de evitación y fortalecimiento interno, resultando en fragmentación del tejido social."
+    }
+  ]
+}
