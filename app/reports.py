@@ -627,6 +627,8 @@ def generate_stage4_final_report(
     aoai_client,
     deployment_chat: str,
     project_id: str,
+    *,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Genera el informe final de Etapa 4 con análisis IA.
@@ -658,7 +660,7 @@ def generate_stage4_final_report(
     ])
 
     recent_memos = get_recent_memos_for_reporting(pg_conn, project_id)
-    recent_artifacts = _get_recent_report_artifacts(pg_conn, project_id, max_items=10)
+    recent_artifacts = _get_recent_report_artifacts(pg_conn, project_id, org_id=org_id, max_items=10)
     
     prompt = f"""Analiza los resultados de la Etapa 4 (Codificación Axial) de un estudio cualitativo.
 

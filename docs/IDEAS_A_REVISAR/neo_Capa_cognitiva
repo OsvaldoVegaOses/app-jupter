@@ -1,0 +1,31 @@
+Neo4j puede usarse como “capa cognitiva”, siempre que definamos “cognitiva” como una capa que representa conocimiento (entidades + relaciones), permite recuperación contextual, exploración y razonamiento por grafos, y alimenta al LLM con contexto trazable.
+
+Lo que Neo4j ya trae hoy para eso:
+
+Knowledge graph nativo (Cypher para patrones/relaciones).
+
+Vector search dentro del grafo (índices HNSW para kNN sobre embeddings).
+
+Tooling GenAI: documentación oficial incluye vector indexes, GraphRAG para Python y un MCP server (para exponer el grafo como herramienta a un agente/LLM).
+
+Embeddings desde Cypher vía funciones/procedimientos (ai.text.embed, ai.text.embedBatch, etc.), introducidos en releases recientes.
+
+Tipo vector nativo (mejor integración/almacenamiento con el tiempo).
+
+Cómo se vería “Neo4j como capa cognitiva” en tu producto
+
+Tres patrones compatibles (pueden coexistir):
+
+Capa cognitiva como “read model” + GraphRAG
+
+Guardas en Neo4j la proyección de: Codigo(code_id), Fragmento, Memo, Candidato, y relaciones.
+
+Recuperación: vector search (p.ej., fragmentos similares) → expansión por vecindario (códigos canónicos, memos, evidencias) → contexto para el LLM.
+
+Esto encaja perfecto con Discovery-first (E3): Neo4j da navegación y señales, sin “cerrar” teoría.
+
+Capa cognitiva como “motor de señales” (no decisiones)
+
+GDS/heurísticas/centralidad/comunidades para sugerir hipótesis o rutas de exploración.
+
+Regla: nunca se convierten en axialidad “oficial” sin memo y acto humano (así evitas el riesgo epistemológico que criticó el revisor).

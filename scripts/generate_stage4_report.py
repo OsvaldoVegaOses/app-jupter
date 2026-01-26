@@ -10,6 +10,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -35,7 +36,12 @@ def main() -> int:
     settings = load_settings(args.env)
     clients = build_service_clients(settings)
     try:
-        result = generate_stage4_report(clients, settings, project=args.project)
+        result = generate_stage4_report(
+            clients,
+            settings,
+            project=args.project,
+            org_id=os.getenv("API_KEY_ORG_ID") or None,
+        )
     finally:
         clients.close()
 

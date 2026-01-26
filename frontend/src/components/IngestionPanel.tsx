@@ -260,6 +260,7 @@ export function IngestionPanel({ project, disabled, onCompleted }: IngestionPane
           disabled={isProcessing || disabled}
           multiple
           className="ingestion-modern__file-input"
+          data-testid="ingestion-file-input"
         />
         <label htmlFor="ingestion-files" className="ingestion-modern__dropzone-label">
           <span className="ingestion-modern__dropzone-icon">📁</span>

@@ -174,9 +174,8 @@ describe("GraphRAGPanel", () => {
         await user.type(textarea, "test");
         await user.click(submitButton);
 
-        // Should show error message
+        // Should show error message (check the specific message)
         await waitFor(() => {
-            expect(screen.getByText(/error/i)).toBeInTheDocument();
             expect(screen.getByText(/network error/i)).toBeInTheDocument();
         });
     });

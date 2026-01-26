@@ -543,6 +543,8 @@ def generate_stage3_report(
     clients: ServiceClients,
     settings: AppSettings,
     project: str,
+    *,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Genera informe de avance analítico para Etapa 3: Codificación Abierta.
@@ -561,7 +563,7 @@ def generate_stage3_report(
     codes_list = _get_codes_list(pg, project)
     saturation_data = _get_saturation_data(pg, project)
     memos = _get_memos(pg, project)
-    recent_artifacts = _get_recent_report_artifacts(pg, project, max_items=10)
+    recent_artifacts = _get_recent_report_artifacts(pg, project, org_id=org_id, max_items=10)
     
     # Construir prompt
     prompt = STAGE3_PROMPT.format(
@@ -658,6 +660,8 @@ def generate_stage4_report(
     clients: ServiceClients,
     settings: AppSettings,
     project: str,
+    *,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Genera informe de avance analítico para Etapa 4: Codificación Axial.
@@ -689,7 +693,7 @@ def generate_stage4_report(
     communities_data, communities_count = _get_communities_data(clients, settings, project)
     graphrag_summaries = _get_graphrag_summaries(pg, project)
     memos = _get_memos(pg, project)
-    recent_artifacts = _get_recent_report_artifacts(pg, project, max_items=10)
+    recent_artifacts = _get_recent_report_artifacts(pg, project, org_id=org_id, max_items=10)
     
     # communities_count is derived from either persisted Neo4j properties or computed fallback.
     

@@ -42,6 +42,13 @@ Additional production migrations
 - `013_codes_catalog_ontology.sql`
 - `014_code_id_columns.sql`
 - `015_ontology_freeze.sql`
+- `017_epistemic_mode.sql`
+- `018_code_id_propagation.sql`
+- `019_axial_ledger_states_code_id.sql`
+- `020_axial_ai_analyses.sql`
+- `021_axial_ai_evidence.sql`
+- `022_link_predictions_neo4j_sync_status.sql`
+- `023_link_predictions_reopen.sql`
 
 Helper script
 - `../scripts/apply_migrations_production.py` — Runs the production SQL migrations in order.

@@ -4,7 +4,54 @@
 
 import { test, expect } from '@playwright/test';
 
+async function authenticate(page: any, request: any) {
+    const email = `e2e_${Date.now()}_${Math.random().toString(16).slice(2)}@example.com`;
+    const password = 'Passw0rd!12345';
+
+    const response = await request.post('/api/auth/register', {
+        data: {
+            email,
+            password,
+            full_name: 'E2E Tester',
+            organization_id: 'default_org',
+        },
+    });
+
+    if (!response.ok()) {
+        const body = await response.text().catch(() => '');
+        throw new Error(`E2E auth failed: ${response.status()} ${body}`);
+    }
+
+    const data = await response.json();
+    const user = {
+        id: data.user?.id,
+        email: data.user?.email,
+        name: data.user?.full_name ?? null,
+        org_id: data.user?.organization_id,
+        role: data.user?.role ?? 'viewer',
+    };
+
+    await page.addInitScript(
+        ({ accessToken, refreshToken, userJson }) => {
+            window.localStorage.setItem('access_token', accessToken);
+            if (refreshToken) {
+                window.localStorage.setItem('refresh_token', refreshToken);
+            }
+            window.localStorage.setItem('qualy-auth-user', userJson);
+        },
+        {
+            accessToken: data.access_token,
+            refreshToken: data.refresh_token,
+            userJson: JSON.stringify(user),
+        }
+    );
+}
+
 test.describe('Error Handling', () => {
+    test.beforeEach(async ({ page, request }) => {
+        await authenticate(page, request);
+    });
+
     test('page loads even with slow backend', async ({ page }) => {
         // Slow down network
         const client = await page.context().newCDPSession(page);
@@ -92,6 +139,10 @@ test.describe('Error Handling', () => {
 });
 
 test.describe('Accessibility', () => {
+    test.beforeEach(async ({ page, request }) => {
+        await authenticate(page, request);
+    });
+
     test('main landmarks are present', async ({ page }) => {
         await page.goto('/');
 

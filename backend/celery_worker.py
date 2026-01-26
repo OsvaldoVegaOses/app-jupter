@@ -44,6 +44,7 @@ Example:
 
 import os
 import structlog
+from typing import Dict
 from celery import Celery
 from app.settings import load_settings
 from app.clients import build_service_clients
@@ -210,15 +211,21 @@ def task_analyze_interview(
 @celery_app.task(bind=True)
 def task_transcribe_audio(
     self,
-    audio_base64: str,
-    filename: str,
+    org_id: str,
     project_id: str,
+    *,
+    # Mode A: raw audio provided inline (base64)
+    audio_base64: str | None = None,
+    # Mode B: existing blob reference (container + blob_name)
+    audio_blob: Dict[str, str] | None = None,
+    filename: str | None = None,
     diarize: bool = True,
     language: str = "es",
     ingest: bool = True,
     min_chars: int = 200,
     max_chars: int = 1200,
-    speaker_refs: list = None,  # Lista de (nombre, audio_base64) para identificación por voz
+    speaker_refs: list | None = None,  # Lista de (nombre, audio_base64) para identificación por voz
+    incremental: bool = False,
 ):
     """
     Tarea asíncrona para transcribir archivos de audio.
@@ -253,43 +260,110 @@ def task_transcribe_audio(
     
     log = logger.bind(
         task_id=self.request.id,
-        filename=filename,
+        filename=filename or "",
         project=project_id,
+        org=org_id,
     )
     
     log.info("task.transcribe.start")
     
     settings = load_settings()
-    suffix = Path(filename).suffix.lower()
-    
-    # Directorios del proyecto
-    project_dir = Path(f"data/projects/{project_id}/audio/transcriptions")
-    project_dir.mkdir(parents=True, exist_ok=True)
-    
-    base_name = Path(filename).stem
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved_filename = f"{base_name}_{timestamp}.docx"
-    saved_path = project_dir / saved_filename
-    
-    total_fragments_ingested = 0
-    
-    # Decodificar audio
-    try:
-        audio_bytes = base64.b64decode(audio_base64)
-    except Exception as e:
-        log.error("task.transcribe.decode_error", error=str(e))
-        return {"status": "error", "error": f"Error decodificando audio: {e}", "filename": filename}
-    
-    # Guardar archivo temporal
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = Path(tmp.name)
+    from hashlib import sha256
+    from app.blob_storage import upload_local_path, upload_file, logical_path_to_blob_name, CONTAINER_INTERVIEWS, CONTAINER_AUDIO, tenant_upload
+
+    # Validate mode: XOR audio_base64 vs audio_blob
+    if (audio_base64 is None) == (audio_blob is None):
+        log.error("task.transcribe.invalid_mode", audio_base64_present=(audio_base64 is not None), audio_blob_present=(audio_blob is not None))
+        raise ValueError("Must provide exactly one of audio_base64 or audio_blob")
+
+    suffix = Path(filename).suffix.lower() if filename else ".wav"
+    tmp_path = None
+    audio_blob_info = None
+    # Obtain audio bytes: from base64 or download existing blob
+    if audio_base64 is not None:
+        try:
+            audio_bytes = base64.b64decode(audio_base64)
+        except Exception as e:
+            log.error("task.transcribe.decode_error", error=str(e))
+            return {"status": "error", "error": f"Error decodificando audio: {e}", "filename": filename}
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = Path(tmp.name)
+
+        # upload raw audio to blob (tenant-aware)
+        logical = f"audio/{project_id}/raw/{Path(filename).name if filename else tmp_path.name}"
+        content_type = f"audio/{suffix.lstrip('.') or 'wav'}"
+        try:
+            audio_blob = tenant_upload(
+                container=CONTAINER_AUDIO,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=logical,
+                file_path=str(tmp_path),
+                content_type=content_type,
+                strict_tenant=False,
+            )
+            audio_url = audio_blob["url"]
+            audio_hash = audio_blob["sha256"]
+            blob_name = audio_blob["name"]
+            audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
+        except Exception:
+            # Try tenant-aware non-strict upload as centralized fallback
+            try:
+                audio_blob = tenant_upload_file(
+                    org_id=org_id or None,
+                    project_id=project_id,
+                    container=CONTAINER_AUDIO,
+                    logical_path=logical,
+                    file_path=str(tmp_path),
+                    content_type=content_type,
+                    strict_tenant=False,
+                )
+                audio_url = audio_blob.get("url")
+                blob_name = audio_blob.get("name")
+                audio_hash = audio_blob.get("sha256")
+                audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
+            except Exception:
+                # fallback to legacy local upload
+                try:
+                    blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical)
+                except Exception:
+                    blob_name = f"{project_id}/{Path(filename).name if filename else tmp_path.name}"
+                audio_url = upload_local_path(container=CONTAINER_AUDIO, blob_name=blob_name, file_path=str(tmp_path), content_type=content_type)
+                h = sha256()
+                with open(tmp_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        h.update(chunk)
+                audio_hash = h.hexdigest()
+                audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
+
+    else:
+        # audio_blob expected to be {"container":..., "name":...}
+        audio_blob_info = audio_blob
+        # If provided as blob ref, we don't download - assume already durable
+        tmp_path = None
     
     try:
         # Actualizar estado: transcribiendo
         self.update_state(state="PROCESSING", meta={"stage": "transcribing", "filename": filename})
-        
+
         # Transcribir usando chunked (síncrono)
+        # If tmp_path is None (audio_blob mode), download to temp for transcription
+        if tmp_path is None and audio_blob_info:
+            # download blob to temp
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmpd:
+                tmpd_path = Path(tmpd.name)
+            try:
+                from app.blob_storage import download_file
+                data = download_file(container=audio_blob_info.get("container"), blob_name=audio_blob_info.get("name"))
+                with open(tmpd_path, "wb") as f:
+                    f.write(data)
+                tmp_path = tmpd_path
+            except Exception as e:
+                log.error("task.transcribe.download_blob_failed", error=str(e))
+                raise
+
         result = transcribe_audio_chunked(
             tmp_path,
             settings,
@@ -304,22 +378,70 @@ def task_transcribe_audio(
             duration=result.duration_seconds,
         )
         
-        # Guardar DOCX final
-        save_transcription_docx(result, saved_path)
-        log.info("task.transcribe.saved", path=str(saved_path))
+        # Guardar DOCX final to temp then upload to interviews container
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpdoc:
+            tmp_doc_path = Path(tmpdoc.name)
+        save_transcription_docx(result, tmp_doc_path)
+
+        # Build logical path relative to project
+        docx_logical = f"interviews/{project_id}/audio/transcriptions/{tmp_doc_path.name}"
+        try:
+            docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=docx_logical)
+        except Exception:
+            docx_blob_name = f"{project_id}/{tmp_doc_path.name}"
+
+        try:
+            docx_blob = tenant_upload(
+                container=CONTAINER_INTERVIEWS,
+                org_id=org_id,
+                project_id=project_id,
+                logical_path=docx_logical,
+                file_path=str(tmp_doc_path),
+                content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                strict_tenant=False,
+            )
+            docx_url = docx_blob["url"]
+            docx_hash = docx_blob["sha256"]
+            docx_blob_name = docx_blob["name"]
+        except Exception:
+            # Try tenant-upload non-strict as fallback first
+            try:
+                docx_blob = tenant_upload_file(
+                    org_id=org_id or None,
+                    project_id=project_id,
+                    container=CONTAINER_INTERVIEWS,
+                    logical_path=docx_logical,
+                    file_path=str(tmp_doc_path),
+                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    strict_tenant=False,
+                )
+                docx_url = docx_blob.get("url")
+                docx_hash = docx_blob.get("sha256")
+                docx_blob_name = docx_blob.get("name")
+            except Exception:
+                docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_doc_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                hdoc = sha256()
+                with open(tmp_doc_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        hdoc.update(chunk)
+                docx_hash = hdoc.hexdigest()
+
+        log.info("task.transcribe.saved_blob", blob=docx_blob_name, url=docx_url)
         
-        # Ingestar al final si corresponde
+        # Ingestar al final si corresponde (ingestará desde el docx temp path uploaded)
+        total_fragments_ingested = 0
         if ingest:
             self.update_state(state="PROCESSING", meta={"stage": "ingesting", "filename": filename})
-            
             from app.ingestion import ingest_documents
-            
+
             clients = build_service_clients(settings)
             try:
+                # Ingest expects filesystem path; download blob to temp and pass path
+                # For efficiency, we can use the tmp_doc_path we just created
                 ingest_result = ingest_documents(
                     clients,
                     settings,
-                    files=[saved_path],
+                    files=[str(tmp_doc_path)],
                     batch_size=20,
                     min_chars=min_chars,
                     max_chars=max_chars,
@@ -332,28 +454,35 @@ def task_transcribe_audio(
             finally:
                 clients.close()
         
-        return {
+        # Build standardized return payload
+        payload = {
+            "artifact_version": 1,
             "status": "completed",
-            "filename": filename,
-            "saved_path": str(saved_path),
+            "docx_logical_path": docx_logical,
+            "docx_blob": {"container": CONTAINER_INTERVIEWS, "name": docx_blob_name, "url": docx_url, "sha256": docx_hash},
+            "audio_blob": audio_blob_info or {},
+            "chunks_completed": len(result.segments),
+            "text_preview": (result.text or "")[:500],
             "text": result.text,
             "segments": [
-                {
-                    "speaker": seg.speaker,
-                    "text": seg.text,
-                    "start": seg.start,
-                    "end": seg.end,
-                }
+                {"speaker": seg.speaker, "text": seg.text, "start": seg.start, "end": seg.end}
                 for seg in result.segments
             ],
             "speaker_count": result.speaker_count,
             "duration_seconds": result.duration_seconds,
             "fragments_ingested": total_fragments_ingested,
-            "incremental": incremental,
+            "warnings": [],
         }
+
+        return payload
         
     except Exception as e:
         log.exception("task.transcribe.error")
-        return {"status": "error", "error": str(e), "filename": filename}
+        return {"artifact_version": 1, "status": "failed", "error": str(e), "filename": filename or "unknown", "warnings": []}
     finally:
-        tmp_path.unlink(missing_ok=True)
+        # Clean up any temporary files we created
+        try:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass

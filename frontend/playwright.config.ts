@@ -30,7 +30,8 @@ export default defineConfig({
     /* Shared settings for all the projects below */
     use: {
         /* Base URL for navigation */
-        baseURL: 'http://localhost:5176',
+        // Use IPv4 loopback to avoid Windows resolving `localhost` to ::1 while Vite listens on 127.0.0.1.
+        baseURL: 'http://127.0.0.1:5176',
 
         /* Collect trace when retrying the failed test */
         trace: 'on-first-retry',
@@ -62,8 +63,9 @@ export default defineConfig({
     /* Run your local dev server before starting the tests */
     webServer: {
         // Force a deterministic port for E2E so `url` and `baseURL` match.
-        command: 'npm run dev -- --port 5176 --strictPort',
-        url: 'http://localhost:5176',
+        // NOTE: Use `node` directly to avoid Windows spawn EPERM issues with `npm`/`.cmd`.
+        command: 'node ./node_modules/vite/bin/vite.js --config vite.config.e2e.mjs --port 5176 --strictPort',
+        url: 'http://127.0.0.1:5176',
         reuseExistingServer: !process.env.CI,
         timeout: 120 * 1000,
     },

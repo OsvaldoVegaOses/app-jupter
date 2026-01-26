@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from psycopg2.extras import Json
 from pydantic import BaseModel, Field
 import structlog
 
@@ -78,6 +79,12 @@ class UserListItem(BaseModel):
     is_active: bool
     created_at: str
     last_login_at: Optional[str]
+
+
+class LinkPredictionReopenRequest(BaseModel):
+    """Reapertura controlada de una predicción cerrada."""
+    reason: str = Field(..., min_length=5, description="Motivo de reapertura (obligatorio)")
+    evidence_link: Optional[str] = Field(None, description="Link opcional a evidencia o ticket")
 
 
 # =============================================================================
@@ -2294,3 +2301,111 @@ async def api_reset_neo4j_sync_flags(
     status["status"] = "reset"
     status["message"] = "Flags neo4j_synced reseteados. Listo para re-sincronizar."
     return status
+
+
+@router.post("/admin/link-predictions/{prediction_id}/reopen")
+async def api_reopen_link_prediction(
+    prediction_id: int,
+    payload: LinkPredictionReopenRequest,
+    clients: ServiceClients = Depends(get_service_clients),
+    user: User = Depends(require_role(["admin"])),
+) -> Dict[str, Any]:
+    """
+    Reabre una predicción cerrada (rechazada/validada) con motivo obligatorio.
+
+    - Solo admin puede reabrir.
+    - No borra historial; deja audit trail y conserva memo/relación previa.
+    """
+    from app.postgres_block import (
+        check_project_permission,
+        ensure_link_predictions_table,
+        ensure_project_members_table,
+    )
+
+    ensure_link_predictions_table(clients.postgres)
+    ensure_project_members_table(clients.postgres)
+
+    with clients.postgres.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, estado, memo
+            FROM link_predictions
+            WHERE id = %s
+            """,
+            (prediction_id,),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Predicción no encontrada")
+
+    project_id = row[1]
+    current_estado = str(row[2] or "pendiente")
+
+    # Requiere rol admin en el proyecto.
+    if not check_project_permission(clients.postgres, project_id, user.user_id, "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Acceso denegado: se requiere rol admin en el proyecto.",
+        )
+
+    if current_estado not in ("validado", "rechazado"):
+        raise HTTPException(
+            status_code=409,
+            detail="Solo se pueden reabrir predicciones cerradas (validado/rechazado).",
+        )
+
+    reason = (payload.reason or "").strip()
+    if len(reason) < 5:
+        raise HTTPException(status_code=400, detail="Motivo insuficiente (min 5 caracteres).")
+
+    try:
+        with clients.postgres.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE link_predictions
+                SET estado = 'pendiente',
+                    reopened_at = NOW(),
+                    reopened_by = %s,
+                    reopen_reason = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, estado, reopened_at
+                """,
+                (user.user_id, reason, prediction_id),
+            )
+            updated = cur.fetchone()
+
+            cur.execute(
+                """
+                INSERT INTO project_audit_log (project_id, user_id, action, entity_type, entity_id, details)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    project_id,
+                    user.user_id,
+                    "link_prediction.reopen",
+                    "link_prediction",
+                    str(prediction_id),
+                    Json(
+                        {
+                            "before_estado": current_estado,
+                            "after_estado": "pendiente",
+                            "reason": reason,
+                            "evidence_link": payload.evidence_link,
+                        }
+                    ),
+                ),
+            )
+        clients.postgres.commit()
+    except Exception:
+        clients.postgres.rollback()
+        raise
+
+    return {
+        "success": True,
+        "prediction_id": prediction_id,
+        "project": project_id,
+        "estado": "pendiente",
+        "reopened_at": updated[2].isoformat() if updated and updated[2] else None,
+    }

@@ -44,38 +44,62 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _write_text(path: Path, text: str) -> GeneratedArtifact:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = text.encode("utf-8")
-    path.write_bytes(data)
-    return GeneratedArtifact(
-        name=path.name,
-        path=str(path.as_posix()),
-        sha256=_sha256_bytes(data),
-        bytes=len(data),
+def _write_text(*, org_id: Optional[str], project_id: str, logical_path: str, text: str) -> GeneratedArtifact:
+    """Write a text artifact to Blob Storage under the strict multi-tenant prefix."""
+    from app.blob_storage import CONTAINER_REPORTS, tenant_upload_text
+
+    data = (text or "").encode("utf-8")
+    strict = bool(org_id)
+    # Use tenant-aware wrapper; allow transition when org_id is missing
+    tenant_upload_text(
+        org_id=org_id or None,
+        project_id=project_id,
+        container=CONTAINER_REPORTS,
+        logical_path=logical_path,
+        text=text,
+        content_type="text/markdown; charset=utf-8",
+        strict_tenant=strict,
     )
+    name = logical_path.replace("\\", "/").split("/")[-1] or "artifact.md"
+    return GeneratedArtifact(name=name, path=logical_path, sha256=_sha256_bytes(data), bytes=len(data))
 
 
-def _write_json(path: Path, payload: Any) -> GeneratedArtifact:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_json(*, org_id: Optional[str], project_id: str, logical_path: str, payload: Any) -> GeneratedArtifact:
+    """Write a JSON artifact to Blob Storage under the strict multi-tenant prefix."""
+    from app.blob_storage import CONTAINER_REPORTS, tenant_upload_bytes
+
     data = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    path.write_bytes(data)
-    return GeneratedArtifact(
-        name=path.name,
-        path=str(path.as_posix()),
-        sha256=_sha256_bytes(data),
-        bytes=len(data),
+    strict = bool(org_id)
+    tenant_upload_bytes(
+        org_id=org_id or None,
+        project_id=project_id,
+        container=CONTAINER_REPORTS,
+        logical_path=logical_path,
+        data=data,
+        content_type="application/json",
+        strict_tenant=strict,
     )
+    name = logical_path.replace("\\", "/").split("/")[-1] or "artifact.json"
+    return GeneratedArtifact(name=name, path=logical_path, sha256=_sha256_bytes(data), bytes=len(data))
 
 
-def _count_note_files(project_id: str) -> int:
+def _count_note_files(*, org_id: Optional[str], project_id: str) -> int:
+    """Best-effort note count for product summaries (Blob Storage)."""
     try:
-        base = Path("notes") / project_id
-        if not base.exists():
-            return 0
-        return len([p for p in base.rglob("*.md") if p.is_file()])
+        from app.blob_storage import CONTAINER_REPORTS, list_files, tenant_prefix
+
+        prefix = tenant_prefix(org_id=org_id, project_id=project_id).rstrip("/") + "/notes/"
+        names = list_files(CONTAINER_REPORTS, prefix=prefix)
+        return len([n for n in names if str(n).lower().endswith(".md")])
     except Exception:
-        return 0
+        # Legacy/local dev fallback
+        try:
+            base = Path("notes") / project_id
+            if not base.exists():
+                return 0
+            return len([p for p in base.rglob("*.md") if p.is_file()])
+        except Exception:
+            return 0
 
 
 def _fetch_insights(
@@ -153,6 +177,7 @@ def _generate_executive_summary_md(
     settings: AppSettings,
     project_id: str,
     *,
+    org_id: Optional[str] = None,
     top_insights: List[Dict[str, Any]],
 ) -> str:
     timestamp = dt.datetime.utcnow().isoformat() + "Z"
@@ -189,7 +214,7 @@ def _generate_executive_summary_md(
         _logger.warning("product.exec.nucleus_error", project=project_id, error=str(e))
         candidates = []
 
-    notes_count = _count_note_files(project_id)
+    notes_count = _count_note_files(org_id=org_id, project_id=project_id)
 
     lines: List[str] = []
     lines.append(f"# Executive Summary — {project_id}")
@@ -318,9 +343,10 @@ def generate_and_write_product_artifacts(
     settings: AppSettings,
     project_id: str,
     *,
+    org_id: Optional[str] = None,
     changed_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Generate and persist product-facing artifacts under reports/<project_id>/."""
+    """Generate and persist product-facing artifacts (Blob Storage, multi-tenant)."""
     logger = _logger.bind(action="product_artifacts.generate", project=project_id)
 
     top_insights = _fetch_insights(clients.postgres, project_id, limit=10)
@@ -330,6 +356,7 @@ def generate_and_write_product_artifacts(
         clients,
         settings,
         project_id,
+        org_id=org_id,
         top_insights=top_insights,
     )
 
@@ -353,12 +380,32 @@ def generate_and_write_product_artifacts(
 
     open_md = _generate_open_questions_md(project_id, pending_insights, max_items=25)
 
-    base = Path("reports") / project_id
     artifacts: List[GeneratedArtifact] = []
 
-    artifacts.append(_write_text(base / "executive_summary.md", exec_md))
-    artifacts.append(_write_json(base / "top_10_insights.json", top_json_payload))
-    artifacts.append(_write_text(base / "open_questions.md", open_md))
+    artifacts.append(
+        _write_text(
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=f"reports/{project_id}/executive_summary.md",
+            text=exec_md,
+        )
+    )
+    artifacts.append(
+        _write_json(
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=f"reports/{project_id}/top_10_insights.json",
+            payload=top_json_payload,
+        )
+    )
+    artifacts.append(
+        _write_text(
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=f"reports/{project_id}/open_questions.md",
+            text=open_md,
+        )
+    )
 
     manifest = {
         "project": project_id,
@@ -366,7 +413,14 @@ def generate_and_write_product_artifacts(
         "changed_by": changed_by,
         "artifacts": [asdict(a) for a in artifacts],
     }
-    artifacts.append(_write_json(base / "product_manifest.json", manifest))
+    artifacts.append(
+        _write_json(
+            org_id=org_id,
+            project_id=project_id,
+            logical_path=f"reports/{project_id}/product_manifest.json",
+            payload=manifest,
+        )
+    )
 
     logger.info("product_artifacts.generated", count=len(artifacts))
 

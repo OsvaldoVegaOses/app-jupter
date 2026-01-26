@@ -134,16 +134,42 @@ export function useProjects(): UseProjectsResult {
     async (projectId: string, input: { name?: string; description?: string; epistemic_mode?: EpistemicMode }) => {
       try {
         logClient("projects.update.start", { projectId, updates: Object.keys(input) });
-        const result = await apiFetchJson<ProjectEntry>(
-          `/api/projects/${encodeURIComponent(projectId)}`,
-          {
-            method: "PATCH",
-            body: JSON.stringify(input)
-          }
-        );
+        const { epistemic_mode, ...details } = input;
+
+        // Dedicated endpoint for epistemic_mode (guarded server-side).
+        if (epistemic_mode) {
+          await apiFetchJson<{ project_id: string; epistemic_mode: string; changed: boolean; message?: string }>(
+            `/api/projects/${encodeURIComponent(projectId)}/epistemic-mode`,
+            {
+              method: "PUT",
+              body: JSON.stringify({ epistemic_mode })
+            }
+          );
+        }
+
+        let patched: ProjectEntry | null = null;
+        const hasDetails = Object.keys(details).some((k) => (details as any)[k] !== undefined);
+        if (hasDetails) {
+          patched = await apiFetchJson<ProjectEntry>(
+            `/api/projects/${encodeURIComponent(projectId)}`,
+            {
+              method: "PATCH",
+              body: JSON.stringify(details)
+            }
+          );
+        }
+
+        // Reload list so UI reflects epistemic_mode changes too.
+        const payload = await apiFetchJson<{ projects?: ProjectEntry[] }>("/api/projects");
+        setState({
+          items: payload.projects ?? [],
+          loading: false,
+          error: null
+        });
+
+        const refreshed = (payload.projects ?? []).find((p) => p.id === projectId) ?? null;
         logClient("projects.update.success", { projectId });
-        await load();
-        return result;
+        return refreshed ?? patched;
       } catch (error) {
         logClient(
           "projects.update.error",
@@ -157,7 +183,7 @@ export function useProjects(): UseProjectsResult {
         return null;
       }
     },
-    [load]
+    []
   );
 
   const deleteProject = useCallback(

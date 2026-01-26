@@ -17,6 +17,8 @@ import {
     logDiscoveryNavigation,
     NavigationHistoryEntry,
     saveAnalysisReport,
+    listAnalysisReports,
+    AnalysisReport,
 } from "../services/api";
 
 function memoBadgeStyle(type: string): React.CSSProperties {
@@ -94,6 +96,9 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
     const [aiError, setAiError] = useState<string | null>(null);
     const [reportSaving, setReportSaving] = useState(false);
     const [reportSaved, setReportSaved] = useState<string | null>(null);
+    const [reportList, setReportList] = useState<AnalysisReport[]>([]);
+    const [reportListLoading, setReportListLoading] = useState(false);
+    const [reportListError, setReportListError] = useState<string | null>(null);
 
     const refreshHistory = useCallback(async () => {
         try {
@@ -104,9 +109,38 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
         }
     }, [project, navLimit]);
 
+    const formatReportDate = useCallback((value?: string | null) => {
+        if (!value) return "-";
+        try {
+            const d = new Date(value);
+            if (Number.isNaN(d.getTime())) return String(value);
+            return d.toLocaleString();
+        } catch {
+            return String(value);
+        }
+    }, []);
+
+    const loadReports = useCallback(async () => {
+        if (!project) return;
+        setReportListLoading(true);
+        setReportListError(null);
+        try {
+            const res = await listAnalysisReports(project, "hidden_relationships", 50);
+            setReportList(Array.isArray(res.reports) ? res.reports : []);
+        } catch (err) {
+            setReportListError(err instanceof Error ? err.message : "Error cargando informes");
+        } finally {
+            setReportListLoading(false);
+        }
+    }, [project]);
+
     useEffect(() => {
         void refreshHistory();
     }, [refreshHistory]);
+
+    useEffect(() => {
+        void loadReports();
+    }, [loadReports]);
 
     const runDiscover = useCallback(async (mode: "parallel" | "replace") => {
         setLoading(true);
@@ -328,19 +362,24 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
             const res = await saveAnalysisReport(project, "hidden_relationships", title, content, meta);
             if (res?.success) {
                 setReportSaved("✅ Informe guardado en analysis_reports");
+                await loadReports();
             }
         } catch (err) {
             setReportSaved(`❌ Error al guardar: ${err instanceof Error ? err.message : "Error desconocido"}`);
         } finally {
             setReportSaving(false);
         }
-    }, [aiAnalysis, aiMemoStatements, comparisonAnalysis, metrics, navHistory, previousResponse, previousRunAt, project, response]);
-
+    }, [aiAnalysis, aiMemoStatements, comparisonAnalysis, metrics, navHistory, previousResponse, previousRunAt, project, response, loadReports]);
     const handleConfirm = useCallback(async (rel: HiddenRelationship, relationType: string) => {
         const key = `${rel.source}-${rel.target}`;
         setConfirming(key);
         try {
-            await apiFetchJson("/api/axial/confirm-relationship", {
+            const res = await apiFetchJson<{
+                prediction_id?: number;
+                estado?: string;
+                source?: string;
+                target?: string;
+            }>("/api/axial/confirm-relationship", {
                 method: "POST",
                 body: JSON.stringify({
                     source: rel.source,
@@ -349,7 +388,11 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
                     project,
                 }),
             });
-            alert(`Relación confirmada: ${rel.source} → ${rel.target} (${relationType})`);
+            const estado = res?.estado || "pendiente";
+            const a = res?.source || rel.source;
+            const b = res?.target || rel.target;
+            const pid = res?.prediction_id ? ` (prediction_id=${res.prediction_id})` : "";
+            alert(`Hipotesis encolada: ${a} <-> ${b} (${relationType}) estado=${estado}${pid}`);
             // Remover de la lista
             if (response) {
                 setResponse({
@@ -372,7 +415,6 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
             setConfirming(null);
         }
     }, [project, response]);
-
     const handleConfirmBatch = useCallback(async (relationType: string) => {
         if (!response?.suggestions?.length) return;
         const selected = response.suggestions.filter((rel) => selectedKeys[`${rel.source}-${rel.target}`]);
@@ -410,9 +452,8 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
         }
         setSelectedKeys({});
         setBatchConfirming(false);
-        alert(`Confirmadas: ${ok}. Fallidas: ${fail}.`);
+        alert(`Encoladas (hipotesis): ${ok}. Fallidas: ${fail}.`);
     }, [project, response, selectedKeys]);
-
     const getConfidenceColor = (confidence: string) => {
         switch (confidence) {
             case "high": return "#16a34a";
@@ -865,6 +906,81 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
                 </div>
             )}
 
+            <div className="hidden-rel-panel__reports">
+                <div className="hidden-rel-panel__reports-header">
+                    <h4>Informes IA guardados (Relaciones Ocultas)</h4>
+                    <button
+                        onClick={() => void loadReports()}
+                        disabled={reportListLoading}
+                        className="hidden-rel-panel__btn"
+                    >
+                        {reportListLoading ? "Cargando..." : "Refrescar"}
+                    </button>
+                </div>
+
+                {reportListError && (
+                    <div className="hidden-rel-panel__error">{reportListError}</div>
+                )}
+
+                {!reportListLoading && reportList.length === 0 && (
+                    <div className="hidden-rel-panel__reports-empty">
+                        No hay informes guardados. Usa "Analizar con IA" y luego "Guardar informe".
+                    </div>
+                )}
+
+                {reportList.map((report) => {
+                    const meta = report?.metadata && typeof report.metadata === "object" ? report.metadata : null;
+                    const suggestionsCount = meta && "suggestions" in meta ? Number((meta as any).suggestions) : null;
+                    return (
+                        <details key={report.id} className="hidden-rel-panel__report">
+                            <summary className="hidden-rel-panel__report-summary">
+                                <span className="hidden-rel-panel__report-title">
+                                    #{report.id} {report.title}
+                                </span>
+                                <span className="hidden-rel-panel__report-meta">
+                                    {formatReportDate(report.created_at)}
+                                    {typeof suggestionsCount === "number" && Number.isFinite(suggestionsCount)
+                                        ? ` · ${suggestionsCount} sugerencias`
+                                        : ""}
+                                </span>
+                            </summary>
+
+                            <div className="hidden-rel-panel__report-body">
+                                <div className="hidden-rel-panel__report-actions">
+                                    <button
+                                        className="hidden-rel-panel__btn"
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            const content = report.content || "";
+                                            const blob = new Blob([content], { type: "text/markdown" });
+                                            const url = URL.createObjectURL(blob);
+                                            const a = document.createElement("a");
+                                            a.href = url;
+                                            a.download = `hidden-relationships-report-${report.id}.md`;
+                                            a.click();
+                                            URL.revokeObjectURL(url);
+                                        }}
+                                    >
+                                        Descargar .md
+                                    </button>
+                                </div>
+
+                                <div className="hidden-rel-panel__report-content">
+                                    {report.content}
+                                </div>
+
+                                {meta && (
+                                    <div className="hidden-rel-panel__report-meta-box">
+                                        <strong>Metadata</strong>
+                                        <pre>{JSON.stringify(meta, null, 2)}</pre>
+                                    </div>
+                                )}
+                            </div>
+                        </details>
+                    );
+                })}
+            </div>
+
             <style>{`
                 .hidden-rel-panel {
                     padding: 1rem;
@@ -1189,6 +1305,82 @@ export function HiddenRelationshipsPanel({ project }: HiddenRelationshipsPanelPr
                 }
                 .hidden-rel-panel__action-btn:disabled {
                     opacity: 0.5;
+                }
+                .hidden-rel-panel__reports {
+                    margin-top: 1.25rem;
+                    padding: 0.75rem;
+                    background: #fff;
+                    border-radius: 0.75rem;
+                    border: 1px solid #f59e0b;
+                }
+                .hidden-rel-panel__reports-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    gap: 0.5rem;
+                    margin-bottom: 0.75rem;
+                }
+                .hidden-rel-panel__reports-header h4 {
+                    margin: 0;
+                    font-size: 0.95rem;
+                    color: #78350f;
+                }
+                .hidden-rel-panel__reports-empty {
+                    font-size: 0.85rem;
+                    color: #92400e;
+                }
+                .hidden-rel-panel__report {
+                    background: #fffaf0;
+                    border: 1px solid #fed7aa;
+                    border-radius: 0.75rem;
+                    padding: 0.5rem 0.75rem;
+                    margin-bottom: 0.75rem;
+                }
+                .hidden-rel-panel__report-summary {
+                    cursor: pointer;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.25rem;
+                }
+                .hidden-rel-panel__report-title {
+                    font-weight: 700;
+                    color: #7c2d12;
+                }
+                .hidden-rel-panel__report-meta {
+                    font-size: 0.8rem;
+                    color: #92400e;
+                }
+                .hidden-rel-panel__report-body {
+                    margin-top: 0.75rem;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 0.75rem;
+                }
+                .hidden-rel-panel__report-actions {
+                    display: flex;
+                    justify-content: flex-end;
+                }
+                .hidden-rel-panel__report-content {
+                    white-space: pre-wrap;
+                    background: #fff7ed;
+                    border: 1px solid #fed7aa;
+                    border-radius: 0.5rem;
+                    padding: 0.75rem;
+                    font-size: 0.85rem;
+                    color: #7c2d12;
+                }
+                .hidden-rel-panel__report-meta-box {
+                    background: #fff;
+                    border: 1px dashed #fdba74;
+                    border-radius: 0.5rem;
+                    padding: 0.5rem 0.75rem;
+                    font-size: 0.8rem;
+                    color: #92400e;
+                }
+                .hidden-rel-panel__report-meta-box pre {
+                    white-space: pre-wrap;
+                    margin: 0.35rem 0 0;
+                    font-size: 0.75rem;
                 }
             `}</style>
         </div>

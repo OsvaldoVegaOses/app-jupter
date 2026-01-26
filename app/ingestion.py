@@ -169,19 +169,30 @@ def ingest_documents(
         blob_url: Optional[str] = None
         blob_path: Optional[str] = None
         try:
-            from .blob_storage import upload_file, CONTAINER_INTERVIEWS
+                from .blob_storage import CONTAINER_INTERVIEWS, tenant_upload_bytes
 
-            conn_str = __import__("os").environ.get("AZURE_STORAGE_CONNECTION_STRING")
-            if conn_str and path.exists() and path.is_file():
-                blob_path = f"{project_id}/{path.name}"
-                blob_url = upload_file(
-                    container=CONTAINER_INTERVIEWS,
-                    blob_name=blob_path,
-                    data=path.read_bytes(),
-                    content_type=(
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    ),
-                )
+                conn_str = __import__("os").environ.get("AZURE_STORAGE_CONNECTION_STRING")
+                if conn_str and path.exists() and path.is_file():
+                    # Use tenant-aware upload for archival; fall back to orgless transition mode
+                    logical_path = f"interviews/{project_id}/{path.name}"
+                    try:
+                        blob_info = tenant_upload_bytes(
+                            org_id=None,
+                            project_id=project_id,
+                            container=CONTAINER_INTERVIEWS,
+                            logical_path=logical_path,
+                            data=path.read_bytes(),
+                            content_type=(
+                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            ),
+                            strict_tenant=False,
+                        )
+                        blob_url = blob_info.get("url")
+                        blob_path = blob_info.get("name")
+                    except Exception:
+                        # Non-blocking: if tenant upload fails, skip archival
+                        blob_url = None
+                        blob_path = None
                 totals["files_archived"] += 1
                 log.info("ingest.file.archived", file=path.name, blob_path=blob_path)
         except Exception as exc:

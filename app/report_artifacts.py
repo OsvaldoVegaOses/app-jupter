@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
@@ -50,24 +51,114 @@ def _safe_read_text_excerpt(path: Path, max_chars: int) -> str:
 		return ""
 	text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
 	if len(text) > max_chars:
-		return text[:max_chars].rstrip() + "…"
+		return text[:max_chars].rstrip() + "..."
 	return text
 
 
-def _iter_recent_files(project_id: str) -> List[ReportArtifact]:
-	"""Collect recent markdown/json artifacts from the filesystem.
+def _iter_recent_files(*, org_id: Optional[str], project_id: str, limit: int) -> List[ReportArtifact]:
+	"""Collect recent markdown/json artifacts.
 
-	We look in:
-	- reports/runner/{project_id}/*.md (runner outputs, legacy)
-	- reports/{project_id}/*.{md,json} (insights, GraphRAG, summaries)
-	- reports/{project_id}/doctoral/*.md (saved doctoral reports)
-	- notes/{project_id}/*.md (Discovery memos and other notes)
-	- notes/{project_id}/runner_semantic/*.md (runner memos)
-	- logs/runner_reports/{project_id}/*.json (runner post-mortem)
-	- logs/runner_checkpoints/{project_id}/*.json (runner checkpoints)
-
-	We avoid scanning the entire repo and we skip very large files.
+	Primary: Azure Blob Storage (strict multi-tenant) under container "reports".
+	Fallback: local filesystem (legacy/dev).
 	"""
+	def _blob_enabled() -> bool:
+		try:
+			from app import blob_storage  # local import to avoid hard dependency at import-time
+
+			conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+			return bool(conn_str) and bool(getattr(blob_storage, "_AZURE_BLOB_AVAILABLE", False))
+		except Exception:
+			return False
+
+	if _blob_enabled():
+		try:
+			from app.blob_storage import (
+				CONTAINER_REPORTS,
+				blob_name_to_logical_path,
+				download_file,
+				list_files_with_meta,
+				tenant_prefix,
+			)
+
+			prefix = tenant_prefix(org_id=org_id, project_id=project_id).rstrip("/") + "/"
+			# Bound the scan for UX. Blob listing doesn't guarantee order, so we sort client-side.
+			items = list_files_with_meta(container=CONTAINER_REPORTS, prefix=prefix, limit=max(60, int(limit) * 8))
+
+			def _sort_key(it: Dict[str, Any]) -> str:
+				return str(it.get("last_modified") or "")
+
+			items.sort(key=_sort_key, reverse=True)
+
+			artifacts: List[ReportArtifact] = []
+			for it in items:
+				name = str(it.get("name") or "")
+				if not name:
+					continue
+
+				size = it.get("size")
+				try:
+					if size is not None and int(size) > 350_000:
+						continue
+				except Exception:
+					pass
+
+				logical = blob_name_to_logical_path(org_id=org_id, project_id=project_id, blob_name=name)
+				if not logical:
+					continue
+
+				suffix = Path(logical).suffix.lower()
+				if suffix not in {".md", ".markdown", ".json"}:
+					continue
+
+				kind = "project"
+				if logical.startswith(f"reports/{project_id}/doctoral/"):
+					kind = "doctoral"
+				elif logical.startswith(f"notes/{project_id}/runner_semantic/"):
+					kind = "runner_memo"
+				elif logical.startswith(f"notes/{project_id}/"):
+					kind = "note"
+				elif logical.startswith(f"logs/runner_reports/{project_id}/"):
+					kind = "runner_report"
+				elif logical.startswith(f"logs/runner_checkpoints/{project_id}/"):
+					kind = "runner_checkpoint"
+				elif logical.startswith(f"reports/runner/{project_id}/"):
+					kind = "runner"
+
+				excerpt = ""
+				try:
+					data = download_file(CONTAINER_REPORTS, name)
+					if suffix == ".json":
+						try:
+							raw = json.loads(data.decode("utf-8", errors="ignore"))
+							excerpt = json.dumps(raw, ensure_ascii=False)[:700].rstrip() + "..."
+						except Exception:
+							excerpt = (data.decode("utf-8", errors="ignore") or "").strip()[:700].rstrip() + "..."
+					else:
+						text = data.decode("utf-8", errors="ignore")
+						text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
+						excerpt = text[:700].rstrip() + ("..." if len(text) > 700 else "")
+				except Exception:
+					excerpt = ""
+
+				artifacts.append(
+					ReportArtifact(
+						kind=kind,
+						source="fs",  # backward-compat: 'fs' == durable artifacts store
+						label=Path(logical).name,
+						path=logical,
+						created_at=it.get("last_modified"),
+						excerpt=excerpt,
+					)
+				)
+
+				if len(artifacts) >= max(1, int(limit)):
+					break
+
+			return artifacts
+		except Exception as e:
+			_logger.warning("report_artifacts.blob_failed", project=project_id, error=str(e)[:200])
+
+	# Fallback to local filesystem (legacy/dev).
 	base_reports = Path("reports")
 	base_notes = Path("notes")
 	base_logs = Path("logs")
@@ -132,7 +223,7 @@ def _iter_recent_files(project_id: str) -> List[ReportArtifact]:
 		elif path.suffix.lower() == ".json":
 			try:
 				raw = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
-				excerpt = json.dumps(raw, ensure_ascii=False)[:700].rstrip() + "…"
+				excerpt = json.dumps(raw, ensure_ascii=False)[:700].rstrip() + "..."
 			except Exception:
 				excerpt = _safe_read_text_excerpt(path, max_chars=700)
 
@@ -146,16 +237,24 @@ def _iter_recent_files(project_id: str) -> List[ReportArtifact]:
 				excerpt=excerpt,
 			)
 		)
+		if len(artifacts) >= max(1, int(limit)):
+			break
 
 	return artifacts
 
 
-def list_recent_report_artifacts(pg_conn, project_id: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+def list_recent_report_artifacts(
+	pg_conn,
+	project_id: str,
+	*,
+	org_id: Optional[str] = None,
+	limit: int = 20,
+) -> List[Dict[str, Any]]:
 	"""Return structured recent artifacts for UI and orchestration.
 
 	Note: this is best-effort and intentionally bounded (small file/row scans).
 	"""
-	fs_items = _iter_recent_files(project_id)
+	fs_items = _iter_recent_files(org_id=org_id, project_id=project_id, limit=int(limit))
 	db_items = _iter_recent_interview_reports(pg_conn, project_id)
 	combined = fs_items + db_items
 
@@ -210,7 +309,7 @@ def _iter_recent_interview_reports(pg_conn, project_id: str, limit: int = 6) -> 
 		relaciones_creadas = data.get("relaciones_creadas")
 		memo = (data.get("memo_investigador") or "").strip()
 		if memo and len(memo) > 260:
-			memo = memo[:260].rstrip() + "…"
+			memo = memo[:260].rstrip() + "..."
 
 		created_at = None
 		try:
@@ -266,7 +365,7 @@ def get_recent_memos_for_reporting(pg_conn, project_id: str, limit: int = 8) -> 
 		for ai_synthesis, positivos, _created_at in rows:
 			synthesis = (ai_synthesis or "").strip()
 			if len(synthesis) > 350:
-				synthesis = synthesis[:350].rstrip() + "…"
+				synthesis = synthesis[:350].rstrip() + "..."
 			conceptos = ", ".join((positivos or [])[:3]) if positivos else "(sin conceptos)"
 			blocks.append(f"- [Discovery: {conceptos}] {synthesis}")
 	except Exception as e:
@@ -291,7 +390,7 @@ def get_recent_memos_for_reporting(pg_conn, project_id: str, limit: int = 8) -> 
 			if not m:
 				continue
 			if len(m) > 280:
-				m = m[:280].rstrip() + "…"
+				m = m[:280].rstrip() + "..."
 			blocks.append(f"- [Código candidato] {m}")
 	except Exception as e:
 		_logger.warning("report_artifacts.candidate_memos_error", project=project_id, error=str(e))
@@ -324,9 +423,15 @@ def _format_artifacts_for_prompt(artifacts: List[ReportArtifact], max_items: int
 	return "\n".join(lines)
 
 
-def _get_recent_report_artifacts(pg_conn, project_id: str, *, max_items: int = 10) -> str:
+def _get_recent_report_artifacts(
+	pg_conn,
+	project_id: str,
+	*,
+	org_id: Optional[str] = None,
+	max_items: int = 10,
+) -> str:
 	"""Epic 6 helper: returns a prompt-ready block with recent artifacts."""
-	combined_struct = list_recent_report_artifacts(pg_conn, project_id, limit=max_items)
+	combined_struct = list_recent_report_artifacts(pg_conn, project_id, org_id=org_id, limit=max_items)
 	artifacts: List[ReportArtifact] = []
 	for item in combined_struct:
 		path = item.get("path")

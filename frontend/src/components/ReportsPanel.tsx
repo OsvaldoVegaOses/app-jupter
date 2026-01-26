@@ -22,6 +22,8 @@ import {
   startDoctoralReportJob,
   getDoctoralReportJobStatus,
   getDoctoralReportJobResult,
+  listAnalysisReports,
+  type AnalysisReport,
   type ReportArtifact,
   type ReportJobHistoryItem,
   type EpistemicStatement,
@@ -78,7 +80,7 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
   const [summary, setSummary] = useState<Stage4Summary | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"list" | "comparison" | "summary" | "jobs" | "artifacts">("list");
+  const [activeTab, setActiveTab] = useState<"list" | "comparison" | "summary" | "jobs" | "artifacts" | "ai">("list");
   const [selectedReport, setSelectedReport] = useState<InterviewReport | null>(null);
 
   // Artifacts (runner reports/memos, GraphRAG reports, etc.)
@@ -86,6 +88,12 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
   const [artifactsLoading, setArtifactsLoading] = useState(false);
   const [productGenLoading, setProductGenLoading] = useState(false);
   const [productGenMessage, setProductGenMessage] = useState<string | null>(null);
+
+  // AI Analysis reports (analysis_reports table)
+  const [analysisReports, setAnalysisReports] = useState<AnalysisReport[]>([]);
+  const [analysisReportsLoading, setAnalysisReportsLoading] = useState(false);
+  const [analysisReportsError, setAnalysisReportsError] = useState<string | null>(null);
+  const [analysisReportType, setAnalysisReportType] = useState<string>("");
 
   // Product insights preview (top_10_insights.json)
   type ProductInsightQuery = {
@@ -212,6 +220,19 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
     }
   }, [project]);
 
+  const loadAnalysisReports = useCallback(async () => {
+    setAnalysisReportsLoading(true);
+    setAnalysisReportsError(null);
+    try {
+      const res = await listAnalysisReports(project, analysisReportType || undefined, 80);
+      setAnalysisReports(res.reports || []);
+    } catch (err) {
+      setAnalysisReportsError(err instanceof Error ? err.message : "Error cargando informes IA");
+    } finally {
+      setAnalysisReportsLoading(false);
+    }
+  }, [project, analysisReportType]);
+
   const handleGenerateProductArtifacts = useCallback(async () => {
     setProductGenLoading(true);
     setProductGenMessage(null);
@@ -268,14 +289,19 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
     loadReports();
     loadSummary();
     loadArtifacts();
+    loadAnalysisReports();
     loadJobs({ reset: true });
-  }, [loadReports, loadSummary, loadArtifacts, loadJobs]);
+  }, [loadReports, loadSummary, loadArtifacts, loadAnalysisReports, loadJobs]);
 
   useEffect(() => {
     // Reset pagination when filters change
     setJobsOffset(0);
     loadJobs({ reset: true });
   }, [jobsStatusFilter, jobsTypeFilter]);
+
+  useEffect(() => {
+    loadAnalysisReports();
+  }, [analysisReportType, loadAnalysisReports]);
 
   const applyJobsSearch = () => {
     setJobsTaskApplied((jobsTaskDraft || "").trim());
@@ -319,6 +345,17 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
       hour: "2-digit",
       minute: "2-digit",
     });
+  };
+
+  const formatReportDate = (value?: string | null) => {
+    if (!value) return "-";
+    try {
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString();
+    } catch {
+      return String(value);
+    }
   };
 
   const exportToMarkdown = async () => {
@@ -614,6 +651,12 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
           onClick={() => setActiveTab("artifacts")}
         >
           🗂️ Artefactos
+        </button>
+        <button
+          className={`reports-panel__tab ${activeTab === "ai" ? "reports-panel__tab--active" : ""}`}
+          onClick={() => setActiveTab("ai")}
+        >
+          🤖 Informes IA
         </button>
       </nav>
 
@@ -1557,6 +1600,94 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
         </div>
       )}
 
+      {/* Informes IA */}
+      {activeTab === "ai" && (
+        <div className="reports-panel__ai">
+          <div className="reports-panel__ai-header">
+            <h3>🤖 Informes IA guardados</h3>
+            <div className="reports-panel__ai-controls">
+              <select
+                value={analysisReportType}
+                onChange={(e) => setAnalysisReportType(e.target.value)}
+                className="reports-panel__ai-select"
+              >
+                <option value="">Todos</option>
+                <option value="link_prediction">Link Prediction</option>
+                <option value="hidden_relationships">Relaciones Ocultas</option>
+              </select>
+              <button
+                className="reports-panel__export"
+                onClick={loadAnalysisReports}
+                disabled={analysisReportsLoading}
+              >
+                {analysisReportsLoading ? "Actualizando..." : "↻ Refrescar"}
+              </button>
+            </div>
+          </div>
+
+          {analysisReportsError && (
+            <div className="reports-panel__error">{analysisReportsError}</div>
+          )}
+
+          {analysisReportsLoading ? (
+            <div className="reports-panel__loading">Cargando informes IA...</div>
+          ) : analysisReports.length === 0 ? (
+            <div className="reports-panel__empty">No hay informes IA guardados para este proyecto.</div>
+          ) : (
+            <div className="reports-panel__ai-list">
+              {analysisReports.map((report) => {
+                const meta = report?.metadata && typeof report.metadata === "object" ? report.metadata : null;
+                return (
+                  <details key={report.id} className="reports-panel__ai-item">
+                    <summary className="reports-panel__ai-summary">
+                      <span className="reports-panel__ai-title">
+                        #{report.id} {report.title}
+                      </span>
+                      <span className="reports-panel__ai-meta">
+                        {formatReportDate(report.created_at)}
+                        {report.report_type ? ` · ${report.report_type}` : ""}
+                      </span>
+                    </summary>
+
+                    <div className="reports-panel__ai-body">
+                      <div className="reports-panel__ai-actions">
+                        <button
+                          className="reports-panel__export"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            const content = report.content || "";
+                            const blob = new Blob([content], { type: "text/markdown" });
+                            const url = URL.createObjectURL(blob);
+                            const a = document.createElement("a");
+                            a.href = url;
+                            a.download = `analysis-report-${report.id}.md`;
+                            a.click();
+                            URL.revokeObjectURL(url);
+                          }}
+                        >
+                          Descargar .md
+                        </button>
+                      </div>
+
+                      <div className="reports-panel__ai-content">
+                        {report.content}
+                      </div>
+
+                      {meta && (
+                        <div className="reports-panel__ai-meta-box">
+                          <strong>Metadata</strong>
+                          <pre>{JSON.stringify(meta, null, 2)}</pre>
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       <style>{`
         .reports-panel {
           padding: 1.5rem;
@@ -1958,6 +2089,94 @@ export function ReportsPanel({ project }: ReportsPanelProps) {
           font-size: 0.8rem;
           line-height: 1.5;
           margin: 0;
+        }
+        .reports-panel__ai {
+          padding: 1rem;
+          background: #f8fafc;
+          border-radius: 0.75rem;
+          border: 1px solid #e2e8f0;
+        }
+        .reports-panel__ai-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 0.75rem;
+          flex-wrap: wrap;
+          margin-bottom: 0.75rem;
+        }
+        .reports-panel__ai-header h3 {
+          margin: 0;
+          color: #0f172a;
+        }
+        .reports-panel__ai-controls {
+          display: flex;
+          gap: 0.5rem;
+          align-items: center;
+          flex-wrap: wrap;
+        }
+        .reports-panel__ai-select {
+          padding: 0.45rem 0.6rem;
+          border-radius: 0.5rem;
+          border: 1px solid #e2e8f0;
+          background: white;
+          font-size: 0.85rem;
+        }
+        .reports-panel__ai-list {
+          display: grid;
+          gap: 0.75rem;
+        }
+        .reports-panel__ai-item {
+          background: white;
+          border: 1px solid #e2e8f0;
+          border-radius: 0.75rem;
+          padding: 0.6rem 0.75rem;
+        }
+        .reports-panel__ai-summary {
+          cursor: pointer;
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+        }
+        .reports-panel__ai-title {
+          font-weight: 700;
+          color: #0f172a;
+        }
+        .reports-panel__ai-meta {
+          font-size: 0.8rem;
+          color: #64748b;
+        }
+        .reports-panel__ai-body {
+          margin-top: 0.75rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+        .reports-panel__ai-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 0.5rem;
+        }
+        .reports-panel__ai-content {
+          white-space: pre-wrap;
+          background: #f8fafc;
+          border: 1px solid #e2e8f0;
+          border-radius: 0.5rem;
+          padding: 0.75rem;
+          font-size: 0.85rem;
+          color: #1f2937;
+        }
+        .reports-panel__ai-meta-box {
+          background: #fff;
+          border: 1px dashed #cbd5f5;
+          border-radius: 0.5rem;
+          padding: 0.5rem 0.75rem;
+          font-size: 0.8rem;
+          color: #475569;
+        }
+        .reports-panel__ai-meta-box pre {
+          white-space: pre-wrap;
+          margin: 0.35rem 0 0;
+          font-size: 0.75rem;
         }
       `}</style>
     </div>

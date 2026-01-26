@@ -13,9 +13,29 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class BlobRef:
+    artifact_version: int
+    container: str
+    blob_name: str
+    logical_path: str
+    url: Optional[str]
+    sha256: str
+    content_type: Optional[str]
+    size_bytes: int
+    metadata: Dict[str, Any]
+
+
+class TenantRequiredError(ValueError):
+    """Raised when org_id is required but missing/empty."""
+    pass
 
 # Optional dependency: allow local/dev startup without Azure SDK installed.
 try:
@@ -36,6 +56,135 @@ CONTAINER_INTERVIEWS = "interviews"
 CONTAINER_AUDIO = "audio-raw"
 CONTAINER_REPORTS = "reports"
 
+_SAFE_COMPONENT_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _safe_blob_component(value: Optional[str], *, default: str) -> str:
+    """Normalize a user/org/project identifier into a safe blob path component."""
+    raw = (value or "").strip()
+    if not raw:
+        return default
+    safe = _SAFE_COMPONENT_RE.sub("-", raw).strip("-")
+    return safe or default
+
+
+def tenant_prefix(*, org_id: Optional[str], project_id: str) -> str:
+    """Tenant-scoped prefix for strict multi-tenant storage paths."""
+    org = _safe_blob_component(org_id, default="unknown_org")
+    proj = _safe_blob_component(project_id, default="unknown_project")
+    return f"org/{org}/projects/{proj}"
+
+
+def logical_path_to_blob_name(*, org_id: Optional[str], project_id: str, logical_path: str) -> str:
+    """Map a logical artifact path to a tenant-scoped blob name.
+
+    Logical paths are stable product paths used by the UI/API, e.g.:
+    - reports/<project_id>/foo.md
+    - notes/<project_id>/runner_semantic/bar.md
+    - logs/runner_reports/<project_id>/<task_id>.json
+
+    The resulting blob name is always under tenant_prefix(org_id, project_id).
+    """
+    norm = (logical_path or "").replace("\\", "/").lstrip("/")
+    if not norm:
+        raise ValueError("logical_path is empty")
+
+    # Enforce tenant scoping by default. In development you can opt-out
+    # by setting ALLOW_ORGLESS_TASKS=true in the environment.
+    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
+    if not org_id and not allow_orgless:
+        raise ValueError(
+            "org_id is required for tenant-scoped blob mapping. "
+            "Set ALLOW_ORGLESS_TASKS=true for development only."
+        )
+
+    prefix = tenant_prefix(org_id=org_id, project_id=project_id)
+
+    def _strip(expected: str) -> str:
+        if not norm.startswith(expected):
+            raise ValueError("logical_path does not match expected prefix")
+        return norm[len(expected) :]
+
+    # reports/<project_id>/...
+    if norm.startswith(f"reports/{project_id}/"):
+        rest = _strip(f"reports/{project_id}/")
+        return f"{prefix}/reports/{rest}"
+
+    # notes/<project_id>/...
+    if norm.startswith(f"notes/{project_id}/"):
+        rest = _strip(f"notes/{project_id}/")
+        return f"{prefix}/notes/{rest}"
+
+    # logs/runner_reports/<project_id>/...
+    if norm.startswith(f"logs/runner_reports/{project_id}/"):
+        rest = _strip(f"logs/runner_reports/{project_id}/")
+        return f"{prefix}/logs/runner_reports/{rest}"
+
+    # logs/runner_checkpoints/<project_id>/...
+    if norm.startswith(f"logs/runner_checkpoints/{project_id}/"):
+        rest = _strip(f"logs/runner_checkpoints/{project_id}/")
+        return f"{prefix}/logs/runner_checkpoints/{rest}"
+
+    # Legacy: reports/runner/<project_id>/...
+    if norm.startswith(f"reports/runner/{project_id}/"):
+        rest = _strip(f"reports/runner/{project_id}/")
+        return f"{prefix}/reports/runner/{rest}"
+
+    # Interviews: interviews/<project_id>/...
+    if norm.startswith(f"interviews/{project_id}/"):
+        rest = _strip(f"interviews/{project_id}/")
+        return f"{prefix}/interviews/{rest}"
+
+    # Audio raw: audio/<project_id>/raw/<file>
+    if norm.startswith(f"audio/{project_id}/"):
+        rest = _strip(f"audio/{project_id}/")
+        return f"{prefix}/audio/{rest}"
+
+    raise ValueError(f"Unsupported logical_path for blob mapping: {norm}")
+
+
+def blob_name_to_logical_path(*, org_id: Optional[str], project_id: str, blob_name: str) -> Optional[str]:
+    """Best-effort reverse mapping for artifact listing."""
+    name = (blob_name or "").replace("\\", "/").lstrip("/")
+    if not name:
+        return None
+
+    prefix = tenant_prefix(org_id=org_id, project_id=project_id).rstrip("/")
+    if not name.startswith(prefix + "/"):
+        # Fallback to legacy-style blobs without tenant prefix if enabled by env
+        allow_legacy = os.getenv("ALLOW_BLOB_LEGACY_READ", "false").lower() in ("1", "true", "yes")
+        if not allow_legacy:
+            return None
+        # Legacy blobs often start with "<project_id>/..." - map back when allowed
+        if name.startswith(f"{project_id}/"):
+            rel = name[len(f"{project_id}/") :]
+            # Determine common logical prefixes
+            if rel.startswith("interviews/"):
+                rest = rel[len("interviews/"):]
+                _logger.info("blob.legacy_read_used", extra={"blob": blob_name, "project": project_id})
+                return f"interviews/{project_id}/{rest}"
+            if rel.startswith("audio/"):
+                rest = rel[len("audio/"):]
+                _logger.info("blob.legacy_read_used", extra={"blob": blob_name, "project": project_id})
+                return f"audio/{project_id}/{rest}"
+        return None
+    rel = name[len(prefix) + 1 :]
+
+    if rel.startswith("reports/"):
+        rest = rel[len("reports/") :]
+        return f"reports/{project_id}/{rest}"
+    if rel.startswith("notes/"):
+        rest = rel[len("notes/") :]
+        return f"notes/{project_id}/{rest}"
+    if rel.startswith("logs/runner_reports/"):
+        rest = rel[len("logs/runner_reports/") :]
+        return f"logs/runner_reports/{project_id}/{rest}"
+    if rel.startswith("logs/runner_checkpoints/"):
+        rest = rel[len("logs/runner_checkpoints/") :]
+        return f"logs/runner_checkpoints/{project_id}/{rest}"
+
+    return None
+
 
 def get_blob_service_client() -> BlobServiceClient:
     """
@@ -54,6 +203,15 @@ def get_blob_service_client() -> BlobServiceClient:
         )
 
     conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        # Best-effort: load .env into os.environ for scripts that call blob helpers directly.
+        try:
+            from app.settings import load_settings
+
+            load_settings(os.getenv("APP_ENV_FILE"))
+            conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        except Exception:
+            conn_str = None
     if not conn_str:
         raise ValueError("AZURE_STORAGE_CONNECTION_STRING not set in environment")
     return BlobServiceClient.from_connection_string(conn_str)
@@ -134,6 +292,123 @@ def upload_local_path(
     return upload_file(container=container, blob_name=blob_name, data=data, content_type=content_type)
 
 
+def tenant_upload_file(
+    *,
+    org_id: str,
+    project_id: str,
+    container: str,
+    logical_path: str,
+    file_path: str,
+    content_type: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    strict_tenant: bool = True,
+) -> Dict[str, Any]:
+    """Upload from file path, returns artifact dict (compatible with BlobRef fields)."""
+    artifact = tenant_upload(
+        container=container,
+        org_id=org_id,
+        project_id=project_id,
+        logical_path=logical_path,
+        file_path=file_path,
+        content_type=content_type,
+        strict_tenant=strict_tenant,
+    )
+    if metadata:
+        artifact_meta = artifact.get("metadata") or {}
+        artifact_meta.update(metadata)
+        artifact["metadata"] = artifact_meta
+    return artifact
+
+
+def tenant_upload_bytes(
+    *,
+    org_id: str,
+    project_id: str,
+    container: str,
+    logical_path: str,
+    data: bytes,
+    content_type: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    strict_tenant: bool = True,
+) -> Dict[str, Any]:
+    artifact = tenant_upload(
+        container=container,
+        org_id=org_id,
+        project_id=project_id,
+        logical_path=logical_path,
+        data=data,
+        content_type=content_type,
+        strict_tenant=strict_tenant,
+    )
+    if metadata:
+        artifact_meta = artifact.get("metadata") or {}
+        artifact_meta.update(metadata)
+        artifact["metadata"] = artifact_meta
+    return artifact
+
+
+def tenant_upload_text(
+    *,
+    org_id: str,
+    project_id: str,
+    container: str,
+    logical_path: str,
+    text: str,
+    content_type: str = "text/plain; charset=utf-8",
+    metadata: Optional[Dict[str, Any]] = None,
+    strict_tenant: bool = True,
+) -> Dict[str, Any]:
+    data = (text or "").encode("utf-8")
+    return tenant_upload_bytes(
+        org_id=org_id,
+        project_id=project_id,
+        container=container,
+        logical_path=logical_path,
+        data=data,
+        content_type=content_type,
+        metadata=metadata,
+        strict_tenant=strict_tenant,
+    )
+
+
+def build_artifact_contract(
+    *,
+    audio: Optional[Dict[str, Any]] = None,
+    docx: Optional[Dict[str, Any]] = None,
+    chunks_completed: Optional[int] = None,
+    text_preview: Optional[str] = None,
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"artifact_version": 1}
+    if docx:
+        out["docx_logical_path"] = docx.get("logical_path")
+        out["docx_blob"] = {
+            "container": docx.get("container"),
+            "name": docx.get("name"),
+            "url": docx.get("url"),
+            "sha256": docx.get("sha256"),
+            "size_bytes": docx.get("size_bytes"),
+            "content_type": docx.get("content_type"),
+        }
+    if audio:
+        out["audio_logical_path"] = audio.get("logical_path")
+        out["audio_blob"] = {
+            "container": audio.get("container"),
+            "name": audio.get("name"),
+            "url": audio.get("url"),
+            "sha256": audio.get("sha256"),
+            "size_bytes": audio.get("size_bytes"),
+            "content_type": audio.get("content_type"),
+        }
+    if chunks_completed is not None:
+        out["chunks_completed"] = int(chunks_completed)
+    if text_preview is not None:
+        out["text_preview"] = text_preview
+    if warnings:
+        out["warnings"] = list(warnings)
+    return out
+
+
 def download_file(container: str, blob_name: str) -> bytes:
     """
     Download a file from Azure Blob Storage.
@@ -173,6 +448,37 @@ def delete_file(container: str, blob_name: str) -> bool:
     return True
 
 
+def delete_prefix(*, container: str, prefix: str, limit: int = 5000) -> Dict[str, Any]:
+    """Delete blobs under a prefix (best-effort).
+
+    Note: Azure Blob Storage has no "folder" delete; we delete blobs individually.
+    """
+    client = get_blob_service_client()
+    container_client = client.get_container_client(container)
+    deleted = 0
+    errors = 0
+    try:
+        for b in container_client.list_blobs(name_starts_with=prefix):
+            name = getattr(b, "name", None)
+            if not name:
+                continue
+            try:
+                container_client.delete_blob(name)
+                deleted += 1
+            except Exception:
+                errors += 1
+            if deleted + errors >= max(1, int(limit)):
+                break
+    except Exception as exc:
+        _logger.warning(
+            "blob.delete_prefix_failed",
+            extra={"container": container, "prefix": prefix, "error": str(exc)[:200]},
+        )
+        return {"deleted": deleted, "errors": errors, "status": "error"}
+
+    return {"deleted": deleted, "errors": errors, "status": "ok"}
+
+
 def list_files(container: str, prefix: Optional[str] = None) -> List[str]:
     """
     List files in a container.
@@ -188,6 +494,40 @@ def list_files(container: str, prefix: Optional[str] = None) -> List[str]:
     container_client = client.get_container_client(container)
     blobs = container_client.list_blobs(name_starts_with=prefix)
     return [b.name for b in blobs]
+
+
+def list_files_with_meta(
+    *,
+    container: str,
+    prefix: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """List blob names with lightweight metadata (best-effort)."""
+    client = get_blob_service_client()
+    container_client = client.get_container_client(container)
+    out: List[Dict[str, Any]] = []
+    try:
+        for b in container_client.list_blobs(name_starts_with=prefix):
+            item = {
+                "name": getattr(b, "name", None),
+                "size": getattr(b, "size", None),
+                "last_modified": None,
+            }
+            lm = getattr(b, "last_modified", None)
+            try:
+                item["last_modified"] = lm.isoformat().replace("+00:00", "Z") if lm else None
+            except Exception:
+                item["last_modified"] = None
+            out.append(item)
+            if len(out) >= max(1, int(limit)):
+                break
+    except Exception as exc:
+        _logger.warning(
+            "blob.list_failed",
+            extra={"container": container, "prefix": prefix, "error": str(exc)[:200]},
+        )
+        return []
+    return out
 
 
 def file_exists(container: str, blob_name: str) -> bool:
@@ -220,6 +560,76 @@ def get_file_url(container: str, blob_name: str) -> str:
     client = get_blob_service_client()
     blob = client.get_blob_client(container=container, blob=blob_name)
     return blob.url
+
+
+def tenant_upload(
+    *,
+    container: str,
+    org_id: Optional[str],
+    project_id: str,
+    logical_path: str,
+    data: Optional[bytes] = None,
+    file_path: Optional[str] = None,
+    content_type: Optional[str] = None,
+    strict_tenant: bool = True,
+) -> Dict[str, Any]:
+    """
+    Tenant-aware upload helper that centralizes mapping, upload and sha256 calculation.
+
+    Returns a dict: {"container","name","url","sha256"}.
+    """
+    from pathlib import Path
+    import hashlib
+
+    if data is None and file_path is None:
+        raise ValueError("Either data or file_path must be provided to tenant_upload")
+
+    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
+    if strict_tenant and not org_id and not allow_orgless:
+        raise TenantRequiredError("org_id is required for tenant-scoped uploads")
+
+    # Resolve blob name (may raise ValueError if logical_path invalid)
+    blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical_path)
+
+    # Compute sha256 and size
+    if data is not None:
+        h = hashlib.sha256()
+        h.update(data)
+        sha = h.hexdigest()
+        size = len(data)
+        url = upload_file(container=container, blob_name=blob_name, data=data, content_type=content_type)
+    else:
+        p = Path(file_path)
+        if not p.exists():
+            raise FileNotFoundError(str(file_path))
+        h = hashlib.sha256()
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        sha = h.hexdigest()
+        size = int(p.stat().st_size or 0)
+        url = upload_local_path(container=container, blob_name=blob_name, file_path=file_path, content_type=content_type)
+
+    # Build metadata
+    base_metadata: Dict[str, Any] = {
+        "org_id": org_id or "",
+        "project_id": project_id,
+        "logical_path": logical_path,
+        "artifact_version": 1,
+    }
+
+    out = {
+        "artifact_version": 1,
+        "container": container,
+        "name": blob_name,
+        "logical_path": logical_path,
+        "url": url,
+        "sha256": sha,
+        "content_type": content_type,
+        "size_bytes": size,
+        "metadata": base_metadata,
+    }
+    return out
 
 
 def download_by_url(blob_url: str) -> bytes:

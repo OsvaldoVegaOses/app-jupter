@@ -473,19 +473,28 @@ def graphrag_query(
     confidence, confidence_reason = calculate_confidence(fragments)
     
     # 4. Construir prompt con contrato de respuesta (Sprint 15 - E3)
-    system_prompt = """Eres un asistente de investigación cualitativa riguroso.
+        system_prompt = """Eres un asistente de investigación cualitativa riguroso.
+
+INSTRUCCIONES IMPORTANTES (RESPUESTA EN JSON):
+- Devuelve UN ÚNICO objeto JSON válido (no texto adicional) con exactamente estas claves:
+    - `graph_summary` (string): resumen breve del subgrafo en 1-2 frases.
+    - `central_nodes` (array): lista de objetos {"id":str, "score":float, "role":str} con los nodos centrales.
+    - `bridges` (array): lista de objetos {"from":str, "to":str, "explanation":str} describiendo puentes entre comunidades.
+    - `communities` (array): lista de objetos {"community_id":int, "top_nodes": [str]}.
+    - `paths` (array): lista de caminos relevantes como arrays de nodos (ej: [["A","B","C"]]).
+    - `evidence` (array): lista de objetos {"rank":int, "archivo":str, "fragmento_id":str, "texto":str, "score":float, "citation":str} (citation debe mapear a [1],[2],...)
+    - `filters_applied` (object): los filtros recogidos desde la UI (puede ser {}).
+    - `epistemic_labels` (object): etiquetas como {"is_inference":bool, "unsupported_claims": []}.
+    - `confidence` (string): "alta"|"media"|"baja".
+    - `confidence_reason` (string): breve justificación del nivel de confianza.
 
 REGLAS ESTRICTAS:
-1. Responde ÚNICAMENTE basándote en los fragmentos proporcionados.
-2. Cita las fuentes usando [1], [2], etc. para cada afirmación importante.
-3. Si no hay evidencia suficiente para una afirmación, NO LA HAGAS.
-4. Sé conciso: 3-6 oraciones máximo.
-5. Si los fragmentos no contienen información relevante, di "No encontré información específica sobre esto en los fragmentos disponibles."
+1) Usa SOLO la información presente en los fragmentos listados en `evidence` y en el subgrafo.
+2) No inventes hechos, números, ni citas. Si algo no puede probarse, deja `epistemic_labels.is_inference=true` y explica breve en `epistemic_labels.unsupported_claims`.
+3) No incluyas texto fuera del objeto JSON. Si no puedes cumplir el esquema, devuelve un objeto JSON con `epistemic_labels.is_inference=true` y `evidence: []`.
 
-FORMATO DE RESPUESTA:
-- Primera parte: Respuesta directa con citas [1], [2]
-- Si hay contradicciones entre fuentes, mencionarlas
-- Termina con grado de certeza: "Confianza: alta/media/baja" basado en evidencia"""
+NOTA: Las citas en `evidence[].citation` deben ser del tipo "[1]" correlacionadas con el orden de `evidence`.
+"""
     
     user_content_parts = [f"PREGUNTA: {query}", ""]
     
@@ -507,6 +516,9 @@ FORMATO DE RESPUESTA:
     user_content = "\n".join(user_content_parts)
     
     # 5. Llamar al LLM
+    import json
+    parse_error = None
+    llm_raw = ""
     try:
         kwargs = {
             "model": model,
@@ -515,15 +527,29 @@ FORMATO DE RESPUESTA:
                 {"role": "user", "content": user_content},
             ],
         }
-        
+
         # gpt-5.x models no soportan temperature != 1, no enviar el parámetro
         kwargs["max_completion_tokens"] = 1000
 
         response = clients.aoai.chat.completions.create(**kwargs)
-        answer = response.choices[0].message.content or ""
+        llm_raw = response.choices[0].message.content or ""
+
+        # Intentar extraer JSON puro de la respuesta
+        json_text = None
+        # Buscar primer '{' y último '}' para extraer posible JSON
+        start = llm_raw.find('{')
+        end = llm_raw.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            json_text = llm_raw[start:end+1]
+
+        if not json_text:
+            raise ValueError("No JSON encontrado en la respuesta del modelo.")
+
+        parsed = json.loads(json_text)
     except Exception as e:
-        _logger.error("graphrag.llm_error", error=str(e))
-        answer = f"Error al procesar la consulta: {str(e)}"
+        _logger.error("graphrag.llm_error_or_parse", error=str(e))
+        parse_error = str(e)
+        parsed = None
     
     # 6. Formatear evidencia estructurada (Sprint 15 - E3)
     evidence = format_evidence_block(fragments)
@@ -538,19 +564,47 @@ FORMATO DE RESPUESTA:
     )
     
     # CONTRATO DE RESPUESTA (Sprint 15 - E3)
-    result = {
-        "query": query,
-        "answer": answer,
-        "is_grounded": True,
-        "evidence": evidence,
-        "confidence": confidence,
-        "confidence_reason": confidence_reason,
-        "context": subgraph["context"],
-        "nodes": subgraph["nodes"],
-        "relationships": subgraph["relationships"],
-        "fragments": fragments,  # Backward compatible
-        "model": model,
-    }
+    # Construir resultado final basado en JSON parseado del LLM si está disponible
+    if parsed and isinstance(parsed, dict):
+        # Merge: asegurar campos obligatorios y fallback
+        parsed_result = {
+            "query": query,
+            "graph_summary": parsed.get("graph_summary", ""),
+            "central_nodes": parsed.get("central_nodes", []),
+            "bridges": parsed.get("bridges", []),
+            "communities": parsed.get("communities", []),
+            "paths": parsed.get("paths", []),
+            "evidence": parsed.get("evidence", evidence),
+            "filters_applied": parsed.get("filters_applied", {}),
+            "epistemic_labels": parsed.get("epistemic_labels", {"is_inference": False, "unsupported_claims": []}),
+            "confidence": parsed.get("confidence", confidence),
+            "confidence_reason": parsed.get("confidence_reason", confidence_reason),
+            "context": subgraph.get("context"),
+            "nodes": subgraph.get("nodes"),
+            "relationships": subgraph.get("relationships"),
+            "fragments": fragments,
+            "model": model,
+        }
+        result = parsed_result
+    else:
+        # Parseo fallido -> rechazo seguro
+        rejection_message = (
+            "⚠️ No se pudo obtener una respuesta JSON válida del modelo."
+            f" Detalle: {parse_error or 'respuesta vacía'}."
+        )
+        result = {
+            "query": query,
+            "answer": rejection_message,
+            "is_grounded": False,
+            "evidence": [],
+            "confidence": "baja",
+            "confidence_reason": parse_error or "no_parse",
+            "context": subgraph.get("context"),
+            "nodes": subgraph.get("nodes"),
+            "relationships": subgraph.get("relationships"),
+            "fragments": fragments,
+            "model": model,
+        }
     
     # PERSISTIR MÉTRICAS (Sprint 16 - E6) - Async para no bloquear
     try:

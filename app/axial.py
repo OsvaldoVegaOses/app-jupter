@@ -240,8 +240,10 @@ def _run_native_graph_analysis(
     # 1. Fetch Graph - FILTRADO POR PROJECT_ID
     # Solo obtenemos nodos/relaciones del proyecto activo
     q = """
-    MATCH (s)-[:REL]->(t)
+    MATCH (s)-[r:REL]->(t)
     WHERE s.project_id = $project_id AND t.project_id = $project_id
+      AND coalesce(r.origen, '') <> 'descubierta'
+      AND coalesce(r.source, '') <> 'descubierta'
       AND (NOT 'Codigo' IN labels(s) OR coalesce(s.status,'active') <> 'merged')
       AND (NOT 'Codigo' IN labels(t) OR coalesce(t.status,'active') <> 'merged')
     RETURN elementId(s) as sid, s.nombre as sname, labels(s) as slabels,
@@ -252,8 +254,10 @@ def _run_native_graph_analysis(
     except Exception:
         # Fallback for older Neo4j vs elementId
         q = """
-        MATCH (s)-[:REL]->(t)
+        MATCH (s)-[r:REL]->(t)
         WHERE s.project_id = $project_id AND t.project_id = $project_id
+          AND coalesce(r.origen, '') <> 'descubierta'
+          AND coalesce(r.source, '') <> 'descubierta'
           AND (NOT 'Codigo' IN labels(s) OR coalesce(s.status,'active') <> 'merged')
           AND (NOT 'Codigo' IN labels(t) OR coalesce(t.status,'active') <> 'merged')
         RETURN id(s) as sid, s.nombre as sname, labels(s) as slabels,

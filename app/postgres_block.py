@@ -2569,11 +2569,16 @@ def ensure_axial_table(pg: PGConnection) -> None:
         project_id TEXT NOT NULL,
         categoria TEXT NOT NULL,
         codigo TEXT NOT NULL,
+        code_id BIGINT,
         relacion TEXT NOT NULL,
         archivo TEXT NOT NULL,
         memo TEXT,
         evidencia TEXT[] NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'validado',
+        validado_por TEXT,
+        validado_en TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (project_id, categoria, codigo, relacion)
     );
     """
@@ -2581,7 +2586,34 @@ def ensure_axial_table(pg: PGConnection) -> None:
         cur.execute(create_sql)
         # Ensure `project_id` exists even on legacy schemas.
         cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS project_id TEXT DEFAULT 'default';")
+        cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS code_id BIGINT;")
+        cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'validado';")
+        cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS validado_por TEXT;")
+        cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS validado_en TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE analisis_axial ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
     pg.commit()
+
+    # Best-effort: enforce allowed states (ledger). Do NOT fail the API if a legacy DB contains
+    # invalid values; migrations are the authoritative way to clean those up.
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'ck_analisis_axial_estado'
+                  ) THEN
+                    ALTER TABLE analisis_axial
+                      ADD CONSTRAINT ck_analisis_axial_estado
+                      CHECK (estado IN ('pendiente','validado','rechazado'));
+                  END IF;
+                END $$;
+                """
+            )
+        pg.commit()
+    except Exception:
+        pg.rollback()
 
     index_statements = [
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_axial_project_cat_cod_rel ON analisis_axial(project_id, categoria, codigo, relacion);",
@@ -2589,6 +2621,9 @@ def ensure_axial_table(pg: PGConnection) -> None:
         "CREATE INDEX IF NOT EXISTS ix_axial_categoria ON analisis_axial(categoria);",
         "CREATE INDEX IF NOT EXISTS ix_axial_project_categoria ON analisis_axial(project_id, categoria);",
         "CREATE INDEX IF NOT EXISTS ix_axial_project_codigo ON analisis_axial(project_id, codigo);",
+        "CREATE INDEX IF NOT EXISTS ix_axial_project_estado ON analisis_axial(project_id, estado);",
+        "CREATE INDEX IF NOT EXISTS ix_axial_project_code_id ON analisis_axial(project_id, code_id) WHERE code_id IS NOT NULL;",
+        "CREATE INDEX IF NOT EXISTS ix_axial_project_updated_at ON analisis_axial(project_id, updated_at);",
     ]
 
     for stmt in index_statements:
@@ -2659,27 +2694,52 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
 
     # Preferred/new schema path.
     if {"archivo", "memo", "evidencia"}.issubset(cols):
-        sql = """
-        INSERT INTO analisis_axial (
-            project_id,
-            categoria,
-            codigo,
-            relacion,
-            archivo,
-            memo,
-            evidencia
-        )
+        insert_cols = [
+            "project_id",
+            "categoria",
+            "codigo",
+            "relacion",
+            "archivo",
+            "memo",
+            "evidencia",
+        ]
+        has_code_id = "code_id" in cols
+        has_estado = "estado" in cols
+        has_updated_at = "updated_at" in cols
+
+        if has_code_id:
+            # Keep stable ID for code identity (optional).
+            insert_cols.insert(3, "code_id")
+        if has_estado:
+            insert_cols.append("estado")
+
+        sql = f"""
+        INSERT INTO analisis_axial ({', '.join(insert_cols)})
         VALUES %s
         ON CONFLICT (project_id, categoria, codigo, relacion) DO UPDATE SET
             archivo = EXCLUDED.archivo,
             memo = EXCLUDED.memo,
-            evidencia = EXCLUDED.evidencia,
-            created_at = analisis_axial.created_at;
+            evidencia = EXCLUDED.evidencia
+            {', code_id = COALESCE(analisis_axial.code_id, EXCLUDED.code_id)' if has_code_id else ''}
+            {', estado = COALESCE(analisis_axial.estado, EXCLUDED.estado)' if has_estado else ''}
+            {', updated_at = NOW()' if has_updated_at else ''}
+            , created_at = analisis_axial.created_at;
         """
-        formatted = [
-            (project_id, cat, code, relacion, archivo, memo, list(evidencia))
-            for project_id, cat, code, relacion, archivo, memo, evidencia in data
-        ]
+
+        formatted = []
+        for project_id, cat, code, relacion, archivo, memo, evidencia in data:
+            row_values: List[Any] = [
+                project_id,
+                cat,
+                code,
+            ]
+            if has_code_id:
+                code_id = get_code_id_for_codigo(pg, project_id, str(code))
+                row_values.append(code_id)
+            row_values.extend([relacion, archivo, memo, list(evidencia)])
+            if has_estado:
+                row_values.append("validado")
+            formatted.append(tuple(row_values))
         with pg.cursor() as cur:
             execute_values(cur, sql, formatted, page_size=100)
         pg.commit()
@@ -2699,9 +2759,11 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
         "fragmento_id": lambda r: (list(r[6])[0] if r[6] else None),
         "tipo_relacion": lambda r: "categoria_codigo",
         "confidence": lambda r: 1.0,
+        "estado": lambda r: "validado",
+        "code_id": lambda r: get_code_id_for_codigo(pg, r[0], str(r[2])),
     }
 
-    for optional in ["evidencia", "fragmento_id", "tipo_relacion", "confidence"]:
+    for optional in ["evidencia", "fragmento_id", "tipo_relacion", "confidence", "estado", "code_id"]:
         if optional in cols:
             insert_cols.append(optional)
 
@@ -4780,11 +4842,24 @@ def ensure_link_predictions_table(pg: PGConnection) -> None:
                 validado_por TEXT,
                 validado_en TIMESTAMPTZ,
                 memo TEXT,
+                neo4j_sync_status TEXT,
+                neo4j_sync_error TEXT,
+                neo4j_synced_at TIMESTAMPTZ,
+                reopened_at TIMESTAMPTZ,
+                reopened_by TEXT,
+                reopen_reason TEXT,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW(),
                 
                 CONSTRAINT uq_lp_project_codes UNIQUE (project_id, source_code, target_code, algorithm)
             );
+
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS neo4j_sync_status TEXT;
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS neo4j_sync_error TEXT;
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS neo4j_synced_at TIMESTAMPTZ;
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ;
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS reopened_by TEXT;
+            ALTER TABLE link_predictions ADD COLUMN IF NOT EXISTS reopen_reason TEXT;
             
             CREATE INDEX IF NOT EXISTS ix_lp_project_estado 
                 ON link_predictions(project_id, estado);
@@ -4792,6 +4867,8 @@ def ensure_link_predictions_table(pg: PGConnection) -> None:
                 ON link_predictions(project_id, source_code);
             CREATE INDEX IF NOT EXISTS ix_lp_project_target 
                 ON link_predictions(project_id, target_code);
+            CREATE INDEX IF NOT EXISTS ix_lp_project_sync_status
+                ON link_predictions(project_id, neo4j_sync_status);
             """
         )
     pg.commit()
@@ -4837,16 +4914,23 @@ def insert_link_predictions(
     count = 0
     with pg.cursor() as cur:
         for p in predictions:
-            if not p.get("source_code") or not p.get("target_code"):
+            source = str(p.get("source_code") or "").strip()
+            target = str(p.get("target_code") or "").strip()
+            if not source or not target or source == target:
                 continue
+            # Canonicalize as undirected pair to avoid A→B vs B→A duplicates.
+            if source > target:
+                source, target = target, source
             cur.execute(
                 sql,
                 (
-                    p.get("project_id", "default"),
-                    p["source_code"],
-                    p["target_code"],
-                    p.get("relation_type", "asociado_con"),
-                    p.get("algorithm", "common_neighbors"),
+                    str(p.get("project_id", "default") or "default").strip() or "default",
+                    source,
+                    target,
+                    str(p.get("relation_type", "asociado_con") or "asociado_con").strip()
+                    or "asociado_con",
+                    str(p.get("algorithm", "common_neighbors") or "common_neighbors").strip()
+                    or "common_neighbors",
                     p.get("score", 0.0),
                     p.get("rank"),
                     p.get("memo"),
@@ -4990,6 +5074,44 @@ def get_link_predictions_stats(
         "by_algorithm": by_algorithm,
         "total": sum(totals.values()),
     }
+
+
+def get_closed_link_prediction_pairs(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    estados: Sequence[str] = ("validado", "rechazado"),
+) -> set[tuple[str, str]]:
+    """Devuelve pares (Codigo↔Codigo) cerrados para filtrar sugerencias repetidas.
+
+    Nota: se normaliza como par no dirigido (A,B) ordenado lexicográficamente.
+    """
+    ensure_link_predictions_table(pg)
+    estados_clean = [str(s).strip() for s in (estados or []) if str(s).strip()]
+    if not estados_clean:
+        return set()
+
+    sql = """
+    SELECT source_code, target_code
+      FROM link_predictions
+     WHERE project_id = %s
+       AND estado = ANY(%s)
+    """
+    with pg.cursor() as cur:
+        cur.execute(sql, (project_id, estados_clean))
+        rows = cur.fetchall() or []
+
+    out: set[tuple[str, str]] = set()
+    for a, b in rows:
+        sa = str(a or "").strip()
+        sb = str(b or "").strip()
+        if not sa or not sb:
+            continue
+        if sa <= sb:
+            out.add((sa, sb))
+        else:
+            out.add((sb, sa))
+    return out
 
 
 def update_link_prediction_estado(
@@ -5152,6 +5274,498 @@ def get_link_prediction_by_id(
         "memo": r[11],
         "created_at": r[12].isoformat() if r[12] else None,
         "updated_at": r[13].isoformat() if r[13] else None,
+    }
+
+
+def get_link_prediction_id_by_key(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    source_code: str,
+    target_code: str,
+    algorithm: str,
+) -> Optional[int]:
+    """Obtiene prediction_id por clave única (project_id, source_code, target_code, algorithm).
+
+    Nota: se normaliza el par (Codigo↔Codigo) como no dirigido (A,B) ordenado lexicográficamente.
+    """
+    ensure_link_predictions_table(pg)
+    a = str(source_code or "").strip()
+    b = str(target_code or "").strip()
+    if not a or not b:
+        return None
+    if a > b:
+        a, b = b, a
+    algo = str(algorithm or "common_neighbors").strip() or "common_neighbors"
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id
+            FROM link_predictions
+            WHERE project_id = %s AND source_code = %s AND target_code = %s AND algorithm = %s
+            """,
+            (project_id, a, b, algo),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+# =============================================================================
+# AXIAL AI ANALYSES TABLE (Auditable artifacts)
+# =============================================================================
+
+_axial_ai_analyses_table_created = False
+
+
+def ensure_axial_ai_analyses_table(pg: PGConnection) -> None:
+    """Crea tabla `axial_ai_analyses` para persistir análisis IA (axial) como artefactos auditables.
+
+    Nota: esto NO crea relaciones en Neo4j; solo persiste el memo/artefacto y su provenance.
+    El flujo humano de validación/promoción ocurre en endpoints separados.
+    """
+    global _axial_ai_analyses_table_created
+    if _axial_ai_analyses_table_created:
+        return
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS axial_ai_analyses (
+                id BIGSERIAL PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'analyze_predictions',
+                algorithm TEXT,
+                algorithm_description TEXT,
+                suggestions_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                analysis_text TEXT,
+                memo_statements JSONB,
+                structured BOOLEAN NOT NULL DEFAULT FALSE,
+                estado TEXT NOT NULL DEFAULT 'pendiente',
+                created_by TEXT,
+                reviewed_by TEXT,
+                reviewed_en TIMESTAMPTZ,
+                review_memo TEXT,
+                epistemic_mode TEXT,
+                prompt_version TEXT,
+                llm_deployment TEXT,
+                llm_api_version TEXT,
+                evidence_schema_version INT NOT NULL DEFAULT 1,
+                evidence_json JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            ALTER TABLE axial_ai_analyses ADD COLUMN IF NOT EXISTS evidence_schema_version INT NOT NULL DEFAULT 1;
+            ALTER TABLE axial_ai_analyses ADD COLUMN IF NOT EXISTS evidence_json JSONB;
+
+            CREATE INDEX IF NOT EXISTS ix_axial_ai_project_created
+                ON axial_ai_analyses(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS ix_axial_ai_project_estado
+                ON axial_ai_analyses(project_id, estado);
+            """
+        )
+    pg.commit()
+
+    # Best-effort: enforce allowed states without breaking legacy DBs.
+    try:
+        with pg.cursor() as cur:
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'ck_axial_ai_analyses_estado'
+                  ) THEN
+                    ALTER TABLE axial_ai_analyses
+                      ADD CONSTRAINT ck_axial_ai_analyses_estado
+                      CHECK (estado IN ('pendiente','validado','rechazado'));
+                  END IF;
+                END $$;
+                """
+            )
+        pg.commit()
+    except Exception:
+        pg.rollback()
+
+    _axial_ai_analyses_table_created = True
+
+
+def insert_axial_ai_analysis(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    source_type: str,
+    algorithm: Optional[str],
+    algorithm_description: Optional[str],
+    suggestions_json: Any,
+    analysis_text: Optional[str],
+    memo_statements: Any,
+    structured: bool,
+    estado: str = "pendiente",
+    created_by: Optional[str] = None,
+    reviewed_by: Optional[str] = None,
+    review_memo: Optional[str] = None,
+    epistemic_mode: Optional[str] = None,
+    prompt_version: Optional[str] = None,
+    llm_deployment: Optional[str] = None,
+    llm_api_version: Optional[str] = None,
+    evidence_schema_version: int = 1,
+    evidence_json: Any = None,
+) -> int:
+    """Inserta un artefacto de análisis IA axial y retorna su ID."""
+    ensure_axial_ai_analyses_table(pg)
+
+    sql = """
+    INSERT INTO axial_ai_analyses (
+        project_id,
+        source_type,
+        algorithm,
+        algorithm_description,
+        suggestions_json,
+        analysis_text,
+        memo_statements,
+        structured,
+        estado,
+        created_by,
+        reviewed_by,
+        review_memo,
+        epistemic_mode,
+        prompt_version,
+        llm_deployment,
+        llm_api_version,
+        evidence_schema_version,
+        evidence_json
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    RETURNING id
+    """
+    with pg.cursor() as cur:
+        cur.execute(
+            sql,
+            (
+                project_id,
+                source_type,
+                algorithm,
+                algorithm_description,
+                Json(suggestions_json) if suggestions_json is not None else Json([]),
+                analysis_text,
+                Json(memo_statements) if memo_statements is not None else None,
+                bool(structured),
+                estado,
+                created_by,
+                reviewed_by,
+                review_memo,
+                epistemic_mode,
+                prompt_version,
+                llm_deployment,
+                llm_api_version,
+                int(evidence_schema_version),
+                Json(evidence_json) if evidence_json is not None else None,
+            ),
+        )
+        row = cur.fetchone()
+    pg.commit()
+    return int(row[0]) if row else 0
+
+
+def get_axial_ai_analysis_by_id(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    analysis_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Obtiene un artefacto por ID (scoped por proyecto)."""
+    ensure_axial_ai_analyses_table(pg)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, project_id, source_type, algorithm, algorithm_description,
+                   suggestions_json, analysis_text, memo_statements, structured,
+                   estado, created_by, reviewed_by, reviewed_en, review_memo,
+                   epistemic_mode, prompt_version, llm_deployment, llm_api_version,
+                   evidence_schema_version, evidence_json,
+                   created_at, updated_at
+            FROM axial_ai_analyses
+            WHERE project_id = %s AND id = %s
+            """,
+            (project_id, analysis_id),
+        )
+        r = cur.fetchone()
+
+    if not r:
+        return None
+
+    return {
+        "id": r[0],
+        "project_id": r[1],
+        "source_type": r[2],
+        "algorithm": r[3],
+        "algorithm_description": r[4],
+        "suggestions_json": r[5],
+        "analysis_text": r[6],
+        "memo_statements": r[7],
+        "structured": bool(r[8]),
+        "estado": r[9],
+        "created_by": r[10],
+        "reviewed_by": r[11],
+        "reviewed_en": r[12].isoformat() if r[12] else None,
+        "review_memo": r[13],
+        "epistemic_mode": r[14],
+        "prompt_version": r[15],
+        "llm_deployment": r[16],
+        "llm_api_version": r[17],
+        "evidence_schema_version": int(r[18]) if r[18] is not None else 1,
+        "evidence_json": r[19],
+        "created_at": r[20].isoformat() if r[20] else None,
+        "updated_at": r[21].isoformat() if r[21] else None,
+    }
+
+
+def list_axial_ai_analyses(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    estado: Optional[str] = None,
+    source_type: Optional[str] = None,
+    algorithm: Optional[str] = None,
+    epistemic_mode: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
+    min_score: Optional[float] = None,
+    has_evidence: Optional[bool] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Lista artefactos IA (scoped por proyecto)."""
+    ensure_axial_ai_analyses_table(pg)
+
+    where = ["project_id = %s"]
+    params: List[Any] = [project_id]
+    if estado:
+        where.append("estado = %s")
+        params.append(estado)
+    if source_type:
+        where.append("source_type = %s")
+        params.append(source_type)
+    if algorithm:
+        where.append("algorithm = %s")
+        params.append(algorithm)
+    if epistemic_mode:
+        where.append("epistemic_mode = %s")
+        params.append(epistemic_mode)
+    if created_from:
+        where.append("created_at >= %s")
+        params.append(created_from)
+    if created_to:
+        where.append("created_at <= %s")
+        params.append(created_to)
+    if has_evidence is True:
+        where.append("evidence_json IS NOT NULL")
+    if has_evidence is False:
+        where.append("evidence_json IS NULL")
+    if min_score is not None:
+        where.append(
+            """
+            COALESCE((
+              SELECT MAX((x->>'score')::double precision)
+              FROM jsonb_array_elements(suggestions_json) AS x
+            ), 0) >= %s
+            """.strip()
+        )
+        params.append(float(min_score))
+
+    sql = f"""
+    SELECT id, project_id, source_type, algorithm, algorithm_description,
+           structured, estado, created_by, reviewed_by, reviewed_en,
+           created_at, updated_at,
+           epistemic_mode, prompt_version,
+           evidence_schema_version,
+           (evidence_json IS NOT NULL) AS has_evidence,
+           COALESCE((evidence_json->'totals'->>'positive')::int, 0) AS evidence_positive,
+           COALESCE((evidence_json->'totals'->>'negative')::int, 0) AS evidence_negative,
+           COALESCE((
+             SELECT MAX((x->>'score')::double precision)
+             FROM jsonb_array_elements(suggestions_json) AS x
+           ), 0) AS max_score
+    FROM axial_ai_analyses
+    WHERE {' AND '.join(where)}
+    ORDER BY created_at DESC
+    LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    with pg.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall() or []
+
+    return [
+        {
+            "id": r[0],
+            "project_id": r[1],
+            "source_type": r[2],
+            "algorithm": r[3],
+            "algorithm_description": r[4],
+            "structured": bool(r[5]),
+            "estado": r[6],
+            "created_by": r[7],
+            "reviewed_by": r[8],
+            "reviewed_en": r[9].isoformat() if r[9] else None,
+            "created_at": r[10].isoformat() if r[10] else None,
+            "updated_at": r[11].isoformat() if r[11] else None,
+            "epistemic_mode": r[12],
+            "prompt_version": r[13],
+            "evidence_schema_version": int(r[14]) if r[14] is not None else 1,
+            "has_evidence": bool(r[15]),
+            "evidence_positive": int(r[16] or 0),
+            "evidence_negative": int(r[17] or 0),
+            "max_score": float(r[18] or 0.0),
+        }
+        for r in rows
+    ]
+
+
+def count_axial_ai_analyses(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    estado: Optional[str] = None,
+    source_type: Optional[str] = None,
+    algorithm: Optional[str] = None,
+    epistemic_mode: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
+    min_score: Optional[float] = None,
+    has_evidence: Optional[bool] = None,
+) -> int:
+    """Cuenta artefactos IA por proyecto/estado."""
+    ensure_axial_ai_analyses_table(pg)
+
+    where = ["project_id = %s"]
+    params: List[Any] = [project_id]
+    if estado:
+        where.append("estado = %s")
+        params.append(estado)
+    if source_type:
+        where.append("source_type = %s")
+        params.append(source_type)
+    if algorithm:
+        where.append("algorithm = %s")
+        params.append(algorithm)
+    if epistemic_mode:
+        where.append("epistemic_mode = %s")
+        params.append(epistemic_mode)
+    if created_from:
+        where.append("created_at >= %s")
+        params.append(created_from)
+    if created_to:
+        where.append("created_at <= %s")
+        params.append(created_to)
+    if has_evidence is True:
+        where.append("evidence_json IS NOT NULL")
+    if has_evidence is False:
+        where.append("evidence_json IS NULL")
+    if min_score is not None:
+        where.append(
+            """
+            COALESCE((
+              SELECT MAX((x->>'score')::double precision)
+              FROM jsonb_array_elements(suggestions_json) AS x
+            ), 0) >= %s
+            """.strip()
+        )
+        params.append(float(min_score))
+
+    with pg.cursor() as cur:
+        cur.execute(
+            f"SELECT COUNT(*) FROM axial_ai_analyses WHERE {' AND '.join(where)}",
+            tuple(params),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def update_axial_ai_analysis_estado(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    analysis_id: int,
+    estado: str,
+    reviewed_by: Optional[str] = None,
+    review_memo: Optional[str] = None,
+) -> bool:
+    """Actualiza estado del artefacto IA (scoped por proyecto)."""
+    ensure_axial_ai_analyses_table(pg)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE axial_ai_analyses
+            SET estado = %s,
+                reviewed_by = COALESCE(%s, reviewed_by),
+                reviewed_en = CASE WHEN %s IS NULL THEN reviewed_en ELSE NOW() END,
+                review_memo = COALESCE(%s, review_memo),
+                updated_at = NOW()
+            WHERE project_id = %s AND id = %s
+            """,
+            (estado, reviewed_by, reviewed_by, review_memo, project_id, analysis_id),
+        )
+        updated = cur.rowcount > 0
+    pg.commit()
+    return updated
+
+
+def cleanup_axial_ai_analyses(
+    pg: PGConnection,
+    *,
+    project_id: str,
+    older_than_days: int,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Limpia artefactos IA axiales antiguos (retención).
+
+    AX-AI-05: la tabla `axial_ai_analyses` puede crecer rápido; esta función
+    permite aplicar retención por proyecto, por fecha de creación.
+    """
+    ensure_axial_ai_analyses_table(pg)
+
+    from datetime import datetime, timedelta, timezone
+
+    days = int(older_than_days)
+    if days <= 0:
+        raise ValueError("older_than_days debe ser > 0")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    with pg.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM axial_ai_analyses WHERE project_id = %s AND created_at < %s",
+            (project_id, cutoff),
+        )
+        row = cur.fetchone()
+        would_delete = int(row[0] or 0) if row else 0
+
+        if dry_run:
+            return {
+                "project_id": project_id,
+                "dry_run": True,
+                "older_than_days": days,
+                "cutoff": cutoff.isoformat(),
+                "would_delete": would_delete,
+            }
+
+        cur.execute(
+            "DELETE FROM axial_ai_analyses WHERE project_id = %s AND created_at < %s",
+            (project_id, cutoff),
+        )
+        deleted = int(cur.rowcount or 0)
+    pg.commit()
+
+    return {
+        "project_id": project_id,
+        "dry_run": False,
+        "older_than_days": days,
+        "cutoff": cutoff.isoformat(),
+        "deleted": deleted,
     }
 
 
@@ -7570,7 +8184,9 @@ def set_project_epistemic_mode(
 ) -> Tuple[bool, str]:
     """Set epistemic mode for a project.
     
-    Fails if project already has axial relations (mode lock enforcement).
+    Guardrails (mode lock enforcement):
+    - Do not allow changing epistemic_mode once open coding has started.
+    - Do not allow changing epistemic_mode once there are validated axial relations.
     
     Args:
         pg: PostgreSQL connection
@@ -7582,24 +8198,107 @@ def set_project_epistemic_mode(
     """
     from app.settings import EpistemicMode
     
-    # Check for existing axial relations (lock de modo)
-    check_axial = """
-        SELECT COUNT(*) FROM axial_relationships 
-        WHERE project_id = %s
-    """
     with pg.cursor() as cur:
-        cur.execute(check_axial, (project_id,))
-        result = cur.fetchone()
-        axial_count = result[0] if result else 0
-        
-        if axial_count > 0:
+        # Normalize/validate input.
+        normalized = EpistemicMode.from_string(getattr(mode, "value", None))
+
+        # Project must exist.
+        cur.execute("SELECT 1 FROM proyectos WHERE id = %s", (project_id,))
+        if cur.fetchone() is None:
+            return False, f"Project {project_id} not found"
+
+        # Open coding has started? (lock)
+        open_started = False
+        open_sources: List[str] = []
+        try:
+            if _pg_get_table_columns(pg, "analisis_codigos_abiertos"):
+                cur.execute(
+                    "SELECT 1 FROM analisis_codigos_abiertos WHERE project_id = %s LIMIT 1",
+                    (project_id,),
+                )
+                if cur.fetchone() is not None:
+                    open_started = True
+                    open_sources.append("analisis_codigos_abiertos")
+        except Exception:
+            # best-effort guard; do not crash mode update
+            open_started = open_started
+
+        try:
+            if _pg_get_table_columns(pg, "codigos_candidatos"):
+                cur.execute(
+                    "SELECT 1 FROM codigos_candidatos WHERE project_id = %s LIMIT 1",
+                    (project_id,),
+                )
+                if cur.fetchone() is not None:
+                    open_started = True
+                    open_sources.append("codigos_candidatos")
+        except Exception:
+            open_started = open_started
+
+        if open_started:
             _logger.warning(
                 "epistemic_mode.change_blocked",
                 project_id=project_id,
-                axial_count=axial_count,
-                reason="project_has_axial_relations",
+                reason="open_coding_started",
+                sources=open_sources,
             )
-            return False, f"Cannot change epistemic_mode: project has {axial_count} axial relations"
+            return False, "Cannot change epistemic_mode: open coding already started"
+
+        # Any validated axial relations? (lock)
+        axial_sources: List[str] = []
+        axial_validated = False
+
+        try:
+            axial_cols = _pg_get_table_columns(pg, "analisis_axial")
+            if axial_cols:
+                if "estado" in axial_cols:
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM analisis_axial
+                        WHERE project_id = %s
+                          AND COALESCE(NULLIF(estado, ''), 'validado') = 'validado'
+                        LIMIT 1
+                        """,
+                        (project_id,),
+                    )
+                else:
+                    # Legacy deployments: without `estado`, assume existing rows are validated.
+                    cur.execute(
+                        "SELECT 1 FROM analisis_axial WHERE project_id = %s LIMIT 1",
+                        (project_id,),
+                    )
+                if cur.fetchone() is not None:
+                    axial_validated = True
+                    axial_sources.append("analisis_axial")
+        except Exception:
+            axial_validated = axial_validated
+
+        try:
+            if _pg_get_table_columns(pg, "link_predictions"):
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM link_predictions
+                    WHERE project_id = %s AND estado = 'validado'
+                    LIMIT 1
+                    """,
+                    (project_id,),
+                )
+                if cur.fetchone() is not None:
+                    axial_validated = True
+                    axial_sources.append("link_predictions")
+        except Exception:
+            axial_validated = axial_validated
+
+        if axial_validated:
+            _logger.warning(
+                "epistemic_mode.change_blocked",
+                project_id=project_id,
+                reason="axial_validated",
+                sources=axial_sources,
+            )
+            return False, "Cannot change epistemic_mode: project has validated axial relations"
         
         # Safe to update
         update = """
@@ -7608,7 +8307,7 @@ def set_project_epistemic_mode(
             WHERE id = %s
             RETURNING epistemic_mode
         """
-        cur.execute(update, (mode.value, project_id))
+        cur.execute(update, (normalized.value, project_id))
         updated = cur.fetchone()
         
         if updated is None:
@@ -7619,26 +8318,51 @@ def set_project_epistemic_mode(
         _logger.info(
             "epistemic_mode.updated",
             project_id=project_id,
-            mode=mode.value,
+            mode=normalized.value,
         )
-        return True, f"epistemic_mode set to {mode.value}"
+        return True, f"epistemic_mode set to {normalized.value}"
 
 
 def has_axial_relations(pg: PGConnection, project_id: str) -> bool:
-    """Check if a project has any axial relations (for mode lock check).
+    """Check if a project has any validated axial relations (for mode lock check).
     
     Args:
         pg: PostgreSQL connection
         project_id: Project identifier
         
     Returns:
-        True if project has at least one axial relation
+        True if project has at least one validated axial relation
     """
-    query = "SELECT COUNT(*) > 0 FROM axial_relationships WHERE project_id = %s"
-    with pg.cursor() as cur:
-        cur.execute(query, (project_id,))
-        row = cur.fetchone()
-        return bool(row and row[0])
+    cols = _pg_get_table_columns(pg, "analisis_axial")
+    if cols:
+        with pg.cursor() as cur:
+            if "estado" in cols:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM analisis_axial
+                    WHERE project_id = %s
+                      AND COALESCE(NULLIF(estado, ''), 'validado') = 'validado'
+                    LIMIT 1
+                    """,
+                    (project_id,),
+                )
+            else:
+                cur.execute("SELECT 1 FROM analisis_axial WHERE project_id = %s LIMIT 1", (project_id,))
+            if cur.fetchone() is not None:
+                return True
+
+    cols = _pg_get_table_columns(pg, "link_predictions")
+    if cols:
+        with pg.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM link_predictions WHERE project_id = %s AND estado = 'validado' LIMIT 1",
+                (project_id,),
+            )
+            if cur.fetchone() is not None:
+                return True
+
+    return False
 
 
 # =============================================================================

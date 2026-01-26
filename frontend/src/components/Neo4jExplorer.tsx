@@ -381,12 +381,59 @@ function GraphView({ graph, project }: GraphViewProps) {
     setViewRagError(null);
     setViewRagResponse(null);
     try {
+      // Build UI context to send to the backend (no inventos)
+      const view_nodes = (graph.nodes || []).map((n) => ({
+        id: n.id,
+        label: n.properties?.nombre ?? (Array.isArray(n.labels) ? n.labels[0] : String(n.id)),
+        community: n.properties?.community_id,
+        properties: n.properties || {},
+      }));
+
+      const graph_metrics: Record<string, Record<string, number>> = {
+        pagerank: {},
+        degree: {},
+      };
+      (graph.nodes || []).forEach((n) => {
+        const nid = n.id != null ? String(n.id) : "";
+        graph_metrics.pagerank[nid] = typeof n.properties?.score_centralidad === 'number' ? n.properties.score_centralidad : 0;
+        graph_metrics.degree[nid] = typeof n.properties?.degree === 'number' ? n.properties.degree : 0;
+      });
+
+      const graph_edges = (graph.relationships || []).map((r) => ({
+        from: r.start,
+        to: r.end,
+        type: r.type || "REL",
+      }));
+
+      // Communities detected: group by community_id and pick top nodes by pagerank
+      const commMap: Record<string, Array<{ id: string | number; score: number }>> = {};
+      (graph.nodes || []).forEach((n) => {
+        const comm = n.properties?.community_id ?? "-";
+        const nid = n.id != null ? String(n.id) : String(Math.random());
+        const score = typeof n.properties?.score_centralidad === 'number' ? n.properties.score_centralidad : 0;
+        if (!commMap[String(comm)]) commMap[String(comm)] = [];
+        commMap[String(comm)].push({ id: nid, score });
+      });
+      const communities_detected = Object.keys(commMap).map((k) => ({
+        community_id: k,
+        top_nodes: commMap[k].sort((a, b) => b.score - a.score).slice(0, 5).map((x) => x.id),
+      }));
+
+      const evidence_candidates: Array<{ fragmento_id: string; archivo?: string; fragmento?: string; score?: number }> = [];
+
       const res = await graphragQuery({
         query: q,
         project,
         include_fragments: true,
         chain_of_thought: false,
         node_ids: visibleCodigoNodeIds,
+        view_nodes,
+        graph_metrics,
+        graph_edges,
+        communities_detected,
+        evidence_candidates,
+        filters: {},
+        max_central: Math.min(10, visibleCodigoNodeIds.length || 10),
       });
       setViewRagResponse(res);
     } catch (err) {

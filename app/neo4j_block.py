@@ -133,9 +133,11 @@ def merge_fragments(driver: Driver, database: str, rows: Iterable[Mapping[str, o
         f.interviewee_tokens = coalesce(r.interviewee_tokens, f.interviewee_tokens)
     MERGE (e)-[rel:TIENE_FRAGMENTO]->(f)
       ON CREATE SET
+        rel.project_id = r.project_id,
         rel.char_len = r.char_len,
         rel.speaker = r.speaker
       ON MATCH SET
+        rel.project_id = coalesce(r.project_id, rel.project_id),
         rel.char_len = coalesce(r.char_len, rel.char_len),
         rel.speaker = coalesce(rel.speaker, r.speaker)
     """
@@ -157,6 +159,7 @@ def merge_fragment_code(driver: Driver, database: str, fragment_id: str, codigo:
     MATCH (f:Fragmento {id: $fragment_id, project_id: $project_id})
     MERGE (c:Codigo {nombre: $codigo, project_id: $project_id})
     MERGE (f)-[rel:TIENE_CODIGO]->(c)
+    SET rel.project_id = $project_id
     """
     with driver.session(database=database) as session:
         session.run(cypher, fragment_id=fragment_id, codigo=codigo, project_id=project_id)
@@ -223,6 +226,7 @@ def merge_fragment_codes_bulk(
     MATCH (f:Fragmento {id: row.fragment_id, project_id: $project_id})
     MERGE (c:Codigo {nombre: row.codigo, project_id: $project_id})
     MERGE (f)-[rel:TIENE_CODIGO]->(c)
+    SET rel.project_id = $project_id
     RETURN count(rel) AS merged
     """
     
@@ -315,7 +319,8 @@ def merge_category_code_relationship(
         SET cod.nombre = $codigo,
             cod.status = coalesce(cod.status, 'active')
         MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
-        SET rel.evidencia = $evidencia,
+        SET rel.project_id = $project_id,
+            rel.evidencia = $evidencia,
             rel.memo = $memo,
             rel.actualizado_en = datetime()
         """
@@ -326,7 +331,8 @@ def merge_category_code_relationship(
         MERGE (cod:Codigo {nombre: $codigo, project_id: $project_id})
         SET cod.status = coalesce(cod.status, 'active')
         MERGE (cat)-[rel:REL {tipo: $relacion}]->(cod)
-        SET rel.evidencia = $evidencia,
+        SET rel.project_id = $project_id,
+            rel.evidencia = $evidencia,
             rel.memo = $memo,
             rel.actualizado_en = datetime()
         """
@@ -371,7 +377,8 @@ def merge_category_code_relationships(
             SET cod.nombre = r.codigo,
                 cod.status = coalesce(cod.status, 'active')
             MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
-            SET rel.evidencia = r.evidencia,
+            SET rel.project_id = r.project_id,
+                rel.evidencia = r.evidencia,
                 rel.memo = r.memo,
                 rel.actualizado_en = datetime()
         )
@@ -379,7 +386,8 @@ def merge_category_code_relationships(
             MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
             SET cod.status = coalesce(cod.status, 'active')
             MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
-            SET rel.evidencia = r.evidencia,
+            SET rel.project_id = r.project_id,
+                rel.evidencia = r.evidencia,
                 rel.memo = r.memo,
                 rel.actualizado_en = datetime()
         )
@@ -392,7 +400,8 @@ def merge_category_code_relationships(
         MERGE (cod:Codigo {nombre: r.codigo, project_id: r.project_id})
         SET cod.status = coalesce(cod.status, 'active')
         MERGE (cat)-[rel:REL {tipo: r.relacion}]->(cod)
-        SET rel.evidencia = r.evidencia,
+        SET rel.project_id = r.project_id,
+            rel.evidencia = r.evidencia,
             rel.memo = r.memo,
             rel.actualizado_en = datetime()
         """
@@ -434,7 +443,8 @@ def merge_axial_relationship(
     MERGE (c2:Codigo {nombre: $target_code, project_id: $project_id})
     SET c2.status = coalesce(c2.status, 'active')
     MERGE (c1)-[rel:REL {tipo: $relation_type}]->(c2)
-    SET rel.source = 'link_prediction',
+    SET rel.project_id = $project_id,
+        rel.source = 'link_prediction',
         rel.actualizado_en = datetime()
     RETURN rel IS NOT NULL AS success
     """
@@ -478,7 +488,8 @@ def merge_axial_relationships_bulk(
     MERGE (c2:Codigo {nombre: row.target_code, project_id: $project_id})
     SET c2.status = coalesce(c2.status, 'active')
     MERGE (c1)-[rel:REL {tipo: row.relation_type}]->(c2)
-    SET rel.source = 'link_prediction',
+    SET rel.project_id = $project_id,
+        rel.source = 'link_prediction',
         rel.actualizado_en = datetime()
     RETURN count(rel) AS merged
     """
