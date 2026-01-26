@@ -20,11 +20,15 @@ from pydantic import BaseModel, Field
 
 from app.clients import ServiceClients, build_service_clients
 from app.coding_runner_core import normalize_resume_state
+from app.project_state import resolve_project
 from app.settings import AppSettings, load_settings
 from backend.auth import User, get_current_user
 
 # Logger
 api_logger = structlog.get_logger("app.api.coding")
+
+def _allow_local_artifacts_fallback() -> bool:
+    return os.getenv("ARTIFACTS_ALLOW_LOCAL_FALLBACK", "false").strip().lower() in {"1", "true", "yes"}
 
 
 @lru_cache(maxsize=1)
@@ -201,34 +205,87 @@ def _assert_checkpoint_access(*, checkpoint: Dict[str, Any], user: User) -> None
 
 
 def _save_runner_checkpoint(*, project: str, task_id: str, state: Dict[str, Any]) -> None:
+    """Persist runner state for resume/post-mortem (Blob-first, strict multi-tenant)."""
+    logical_path = f"logs/runner_checkpoints/{project}/{task_id}.json"
+    data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+    org_id = str((state.get("auth") or {}).get("org") or os.getenv("API_KEY_ORG_ID") or "")
+
     try:
-        base_dir = Path("logs") / "runner_checkpoints" / project
-        base_dir.mkdir(parents=True, exist_ok=True)
-        path = base_dir / f"{task_id}.json"
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        from app.blob_storage import CONTAINER_REPORTS, tenant_upload
+
+        tenant_upload(
+            container=CONTAINER_REPORTS,
+            org_id=org_id or "",
+            project_id=project,
+            logical_path=logical_path,
+            data=data,
+            content_type="application/json",
+        )
+        return
+    except Exception as exc:
+        api_logger.warning("coding.runner.checkpoint_blob_write_failed", error=str(exc)[:200], task_id=task_id)
+
+    # Legacy/local fallback (dev).
+    if not _allow_local_artifacts_fallback():
+        return
+    try:
+        local = Path("logs") / "runner_checkpoints" / project
+        local.mkdir(parents=True, exist_ok=True)
+        (local / f"{task_id}.json").write_bytes(data)
     except Exception as exc:
         api_logger.warning("coding.runner.checkpoint_write_failed", error=str(exc), task_id=task_id)
 
 
-def _load_runner_checkpoint(*, project: str, task_id: str) -> Optional[Dict[str, Any]]:
+def _load_runner_checkpoint(*, project: str, task_id: str, org_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    logical_path = f"logs/runner_checkpoints/{project}/{task_id}.json"
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, download_file, logical_path_to_blob_name
+
+        blob_name = logical_path_to_blob_name(org_id=org_id or "", project_id=project, logical_path=logical_path)
+        data = download_file(CONTAINER_REPORTS, blob_name)
+        return json.loads(data.decode("utf-8", errors="ignore") or "{}")
+    except Exception:
+        pass
+
+    # Legacy/local fallback
     path = Path("logs") / "runner_checkpoints" / project / f"{task_id}.json"
     if not path.exists():
         return None
-
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore") or "{}")
     except Exception as exc:
         api_logger.warning("coding.runner.checkpoint_read_failed", error=str(exc), task_id=task_id)
         return None
 
 
 def _save_runner_report(*, project: str, task_id: str, report: Dict[str, Any]) -> Optional[str]:
+    logical_path = f"logs/runner_reports/{project}/{task_id}.json"
+    data = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+    org_id = str((report.get("auth") or {}).get("org") or os.getenv("API_KEY_ORG_ID") or "")
+
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, tenant_upload
+
+        tenant_upload(
+            container=CONTAINER_REPORTS,
+            org_id=org_id or "",
+            project_id=project,
+            logical_path=logical_path,
+            data=data,
+            content_type="application/json",
+        )
+        return logical_path
+    except Exception as exc:
+        api_logger.warning("coding.runner.report_blob_write_failed", error=str(exc)[:200], task_id=task_id)
+
+    # Legacy/local fallback (dev).
+    if not _allow_local_artifacts_fallback():
+        return None
     try:
         base_dir = Path("logs") / "runner_reports" / project
         base_dir.mkdir(parents=True, exist_ok=True)
-        path = base_dir / f"{task_id}.json"
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(path).replace("\\", "/")
+        (base_dir / f"{task_id}.json").write_bytes(data)
+        return logical_path
     except Exception as exc:
         api_logger.warning("coding.runner.report_write_failed", error=str(exc), task_id=task_id)
         return None
@@ -383,6 +440,7 @@ def _sleep_backoff(attempt: int) -> None:
 def _save_runner_memo(
     *,
     project: str,
+    org_id: Optional[str] = None,
     archivo: str,
     step_global: int,
     step_in_interview: int,
@@ -392,14 +450,11 @@ def _save_runner_memo(
     ai_memo: Optional[str],
     fragments: List[Dict[str, Any]],
 ) -> Dict[str, str]:
-    base_dir = Path("notes") / project / "runner_semantic"
-    base_dir.mkdir(parents=True, exist_ok=True)
-
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
     safe_archivo = _safe_slug(archivo, max_len=40)
     safe_code = _safe_slug(suggested_code or "sin_codigo", max_len=30)
     filename = f"{ts}_semantic_runner_{safe_archivo}_s{step_global:03d}_i{step_in_interview:02d}_{safe_code}.md"
-    file_path = base_dir / filename
+    logical_path = f"notes/{project}/runner_semantic/{filename}"
 
     lines: List[str] = []
     lines.append(f"# Memo Runner Semántico: {suggested_code or '(sin código)'}")
@@ -423,7 +478,8 @@ def _save_runner_memo(
         lines.append(f"### [{idx}] {src} ({float(score):.1%})")
         lines.append(f"**ID:** {fid}")
         if text:
-            lines.append(f"> {(text[:800]).replace('\n', ' ')}")
+            text_chunk = text[:800].replace('\n', ' ')
+            lines.append(f"> {text_chunk}")
 
     if ai_memo:
         lines.append("")
@@ -434,10 +490,39 @@ def _save_runner_memo(
     lines.append("\n---")
     lines.append("*Generado automáticamente por el Runner Semántico*")
 
-    file_path.write_text("\n".join(lines), encoding="utf-8")
-    # Return POSIX-style paths for frontend-friendly URLs.
-    rel_path = file_path.relative_to(Path("notes") / project).as_posix()
-    return {"path": file_path.as_posix(), "rel": rel_path, "filename": filename}
+    content = "\n".join(lines)
+
+    blob_url: Optional[str] = None
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, tenant_upload
+
+        artifact = tenant_upload(
+            container=CONTAINER_REPORTS,
+            org_id=org_id or "",
+            project_id=project,
+            logical_path=logical_path,
+            data=content.encode("utf-8"),
+            content_type="text/markdown; charset=utf-8",
+        )
+        blob_url = artifact.get("url") if isinstance(artifact, dict) else None
+    except Exception as exc:
+        api_logger.warning("coding.runner.memo_blob_write_failed", error=str(exc)[:200], project=project)
+        # Legacy/local fallback (dev).
+        if not _allow_local_artifacts_fallback():
+            pass
+        else:
+            try:
+                base_dir = Path("notes") / project / "runner_semantic"
+                base_dir.mkdir(parents=True, exist_ok=True)
+                (base_dir / filename).write_text(content, encoding="utf-8")
+            except Exception:
+                pass
+
+    rel_path = f"runner_semantic/{filename}"
+    out: Dict[str, str] = {"path": logical_path, "rel": rel_path, "filename": filename}
+    if blob_url:
+        out["blob_url"] = blob_url
+    return out
 
 
 def _choose_next_seed(strategy: str, suggestions: List[Dict[str, Any]], visited: set[str]) -> Optional[str]:
@@ -453,16 +538,52 @@ def _choose_next_seed(strategy: str, suggestions: List[Dict[str, Any]], visited:
     return str(candidates[0]["fragmento_id"])
 
 
-def _list_runner_semantic_memos(*, project: str, archivo: Optional[str], limit: int) -> Dict[str, Any]:
+def _list_runner_semantic_memos(
+    *,
+    org_id: Optional[str],
+    project: str,
+    archivo: Optional[str],
+    limit: int,
+) -> Dict[str, Any]:
     project_id = str(project or "default")
+    slug = _safe_slug(archivo or "", max_len=40) if (archivo and archivo.strip()) else None
+    token = f"_semantic_runner_{slug}_" if slug else None
+
+    # Blob-first (cloud mode)
+    try:
+        from app.blob_storage import CONTAINER_REPORTS, blob_name_to_logical_path, list_files_with_meta, tenant_prefix
+
+        blob_prefix = tenant_prefix(org_id=org_id, project_id=project_id).rstrip("/") + "/notes/runner_semantic/"
+        blobs = list_files_with_meta(container=CONTAINER_REPORTS, prefix=blob_prefix, limit=max(60, int(limit) * 6))
+        items: List[Dict[str, Any]] = []
+        for b in blobs:
+            name = str(b.get("name") or "")
+            if not name:
+                continue
+            logical = blob_name_to_logical_path(org_id=org_id, project_id=project_id, blob_name=name) or ""
+            filename = logical.replace("\\", "/").split("/")[-1] if logical else name.split("/")[-1]
+            if token and token not in filename:
+                continue
+            rel = ""
+            if logical.startswith(f"notes/{project_id}/"):
+                rel = logical[len(f"notes/{project_id}/") :]
+            else:
+                rel = filename
+            items.append({"filename": filename, "rel": rel, "mtime": b.get("last_modified") or ""})
+
+        items.sort(key=lambda x: str(x.get("mtime") or ""), reverse=True)
+        if limit > 0:
+            items = items[:limit]
+        return {"project": project_id, "archivo": archivo, "archivo_slug": slug, "memos": items, "count": len(items)}
+    except Exception:
+        pass
+
+    # Legacy/local fallback (dev)
     base_dir = Path("notes") / project_id / "runner_semantic"
     if not base_dir.exists() or not base_dir.is_dir():
         return {"project": project_id, "archivo": archivo, "archivo_slug": None, "memos": [], "count": 0}
 
-    slug = _safe_slug(archivo or "", max_len=40) if (archivo and archivo.strip()) else None
-    token = f"_semantic_runner_{slug}_" if slug else None
-
-    items: List[Dict[str, Any]] = []
+    items_local: List[Dict[str, Any]] = []
     try:
         for file_path in base_dir.glob("*.md"):
             if not file_path.is_file():
@@ -478,15 +599,15 @@ def _list_runner_semantic_memos(*, project: str, archivo: Optional[str], limit: 
                 mtime = file_path.stat().st_mtime
             except Exception:
                 mtime = 0.0
-            items.append({"filename": name, "rel": rel, "mtime": mtime})
+            items_local.append({"filename": name, "rel": rel, "mtime": mtime})
     except Exception as exc:
         api_logger.warning("coding.runner.memos_list_failed", error=str(exc), project=project_id, archivo=archivo)
         return {"project": project_id, "archivo": archivo, "archivo_slug": slug, "memos": [], "count": 0}
 
-    items.sort(key=lambda x: float(x.get("mtime") or 0.0), reverse=True)
+    items_local.sort(key=lambda x: float(x.get("mtime") or 0.0), reverse=True)
     if limit > 0:
-        items = items[:limit]
-    return {"project": project_id, "archivo": archivo, "archivo_slug": slug, "memos": items, "count": len(items)}
+        items_local = items_local[:limit]
+    return {"project": project_id, "archivo": archivo, "archivo_slug": slug, "memos": items_local, "count": len(items_local)}
 
 
 def _existing_fragment_ids(
@@ -929,6 +1050,7 @@ def _run_coding_suggest_runner_task(
                     try:
                         memo_info = _save_runner_memo(
                             project=project_id,
+                            org_id=str((task_auth or {}).get("org") or ""),
                             archivo=archivo,
                             step_global=global_step,
                             step_in_interview=step_in_interview,
@@ -1200,7 +1322,7 @@ def _run_coding_suggest_runner_task(
                 "qdrant_retries": int(task.get("qdrant_retries", 0)),
                 "saturated": bool(task.get("saturated", False)),
                 "errors": task.get("errors") or None,
-                "checkpoint_path": str(Path("logs") / "runner_checkpoints" / project_id / f"{task_id}.json").replace("\\", "/"),
+                "checkpoint_path": f"logs/runner_checkpoints/{project_id}/{task_id}.json",
                 "memos_count": len(memos),
             }
             report_path = _save_runner_report(project=project_id, task_id=task_id, report=report)
@@ -1280,7 +1402,7 @@ def _run_coding_suggest_runner_task(
                 "qdrant_retries": int(task.get("qdrant_retries", 0)),
                 "fatal_error": str(exc),
                 "errors": task.get("errors") or None,
-                "checkpoint_path": str(Path("logs") / "runner_checkpoints" / project_id / f"{task_id}.json").replace("\\", "/"),
+                "checkpoint_path": f"logs/runner_checkpoints/{project_id}/{task_id}.json",
             }
             report_path = _save_runner_report(project=project_id, task_id=task_id, report=report)
             if report_path:
@@ -1298,7 +1420,18 @@ async def execute_coding_suggest_runner(
     settings: AppSettings = Depends(get_settings),
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
-    task_id = f"coding_suggest_{request.project}_{datetime.now().strftime('%H%M%S')}"
+    # Multi-tenant: resolve canonical project_id and validate access.
+    try:
+        clients = build_clients_or_error(settings)
+        try:
+            project_id = resolve_project(request.project, allow_create=False, pg=clients.postgres)
+        finally:
+            clients.close()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Proyecto inválido: {exc}") from exc
+
+    request.project = project_id
+    task_id = f"coding_suggest_{project_id}_{datetime.now().strftime('%H%M%S')}"
 
     task_auth = {
         "user_id": str(user.user_id),
@@ -1308,7 +1441,7 @@ async def execute_coding_suggest_runner(
 
     _coding_suggest_runner_tasks[task_id] = {
         "status": "pending",
-        "project": request.project,
+        "project": project_id,
         "auth": task_auth,
         "seed_fragment_id": request.seed_fragment_id,
         "current_step": 0,
@@ -1339,7 +1472,7 @@ async def execute_coding_suggest_runner(
     api_logger.info(
         "api.coding.suggest_runner.started",
         task_id=task_id,
-        project=request.project,
+        project=project_id,
         seed_fragment_id=request.seed_fragment_id,
         steps=request.steps,
         top_k=request.top_k,
@@ -1363,7 +1496,17 @@ async def resume_coding_suggest_runner(
     settings: AppSettings = Depends(get_settings),
     user: User = Depends(require_auth),
 ) -> Dict[str, Any]:
-    checkpoint = _load_runner_checkpoint(project=request.project, task_id=request.task_id)
+    # Multi-tenant: resolve canonical project_id and validate access.
+    try:
+        clients = build_clients_or_error(settings)
+        try:
+            project_id = resolve_project(request.project, allow_create=False, pg=clients.postgres)
+        finally:
+            clients.close()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Proyecto inválido: {exc}") from exc
+
+    checkpoint = _load_runner_checkpoint(project=project_id, task_id=request.task_id, org_id=str(user.organization_id))
     if not checkpoint:
         raise HTTPException(status_code=404, detail="Checkpoint not found for task")
 
@@ -1374,9 +1517,10 @@ async def resume_coding_suggest_runner(
         resumed_req = CodingSuggestRunnerExecuteRequest(**req_payload)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid checkpoint req payload: {exc}") from exc
+    resumed_req.project = project_id
 
     # Start a new task id for the resumed run
-    new_task_id = f"coding_suggest_{request.project}_resume_{datetime.now().strftime('%H%M%S')}"
+    new_task_id = f"coding_suggest_{project_id}_resume_{datetime.now().strftime('%H%M%S')}"
     checkpoint_auth = checkpoint.get("auth") or {
         "user_id": str(user.user_id),
         "org": str(user.organization_id),
@@ -1494,7 +1638,17 @@ async def list_coding_suggest_runner_memos(
     limit: int = Query(default=25, ge=1, le=200, description="Máximo de memos a retornar"),
     user: User = Depends(require_auth),
 ) -> CodingSuggestRunnerMemosResponse:
-    data = _list_runner_semantic_memos(project=project, archivo=archivo, limit=int(limit))
+    try:
+        project_id = resolve_project(project, allow_create=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Proyecto inválido: {exc}") from exc
+
+    data = _list_runner_semantic_memos(
+        org_id=str(getattr(user, "organization_id", None) or ""),
+        project=project_id,
+        archivo=archivo,
+        limit=int(limit),
+    )
     return CodingSuggestRunnerMemosResponse(**data)
 
 # Note: This is a minimal implementation for the refactoring.
