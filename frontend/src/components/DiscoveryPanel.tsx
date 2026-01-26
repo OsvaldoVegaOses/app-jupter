@@ -556,8 +556,9 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
         className={`discovery-panel__form ${highlightForm ? 'discovery-panel__form--highlight' : ''}`}
       >
         <div className="discovery-panel__field">
-          <label>Conceptos Positivos (uno por linea) *</label>
+          <label htmlFor="discovery-positive">Conceptos Positivos (uno por linea) *</label>
           <textarea
+            id="discovery-positive"
             value={positiveText}
             onChange={(e) => setPositiveText(e.target.value)}
             placeholder="participacion ciudadana\norganizacion comunitaria"
@@ -567,8 +568,9 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
         </div>
 
         <div className="discovery-panel__field">
-          <label>Conceptos Negativos (opcional)</label>
+          <label htmlFor="discovery-negative">Conceptos Negativos (opcional)</label>
           <textarea
+            id="discovery-negative"
             value={negativeText}
             onChange={(e) => setNegativeText(e.target.value)}
             placeholder="conflicto violento\nprotesta"
@@ -578,8 +580,9 @@ export function DiscoveryPanel({ project, onSelectFragment }: DiscoveryPanelProp
         </div>
 
         <div className="discovery-panel__field">
-          <label>Texto Objetivo (opcional)</label>
+          <label htmlFor="discovery-target">Texto Objetivo (opcional)</label>
           <input
+            id="discovery-target"
             type="text"
             value={targetText}
             onChange={(e) => setTargetText(e.target.value)}
