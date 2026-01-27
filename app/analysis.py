@@ -457,9 +457,9 @@ def analyze_interview_text(
     prompt_version = "qual_system_prompt_v1"  # fallback version
     system_prompt = QUAL_SYSTEM_PROMPT  # fallback prompt
     
-    if project_id and clients.pg:
+    if project_id and clients.postgres:
         try:
-            epistemic_mode = get_project_epistemic_mode(clients.pg, project_id)
+            epistemic_mode = get_project_epistemic_mode(clients.postgres, project_id)
             # Obtener prompt diferenciado
             system_prompt, prompt_version = get_system_prompt(epistemic_mode, "open_coding")
         except Exception as e:
