@@ -381,10 +381,9 @@ function GraphView({ graph, project }: GraphViewProps) {
     setViewRagError(null);
     setViewRagResponse(null);
     try {
-      // Build UI context to send to the backend (no inventos)
       const view_nodes = (graph?.nodes || []).map((n) => ({
         id: n.id as string | number,
-        label: n.properties?.nombre ?? (Array.isArray(n.labels) ? n.labels[0] : String(n.id)),
+        label: n.properties?.nombre ?? (Array.isArray(n.labels) && n.labels.length > 0 ? n.labels[0] : String(n.id)),
         community: n.properties?.community_id,
         properties: n.properties || {},
       }));
