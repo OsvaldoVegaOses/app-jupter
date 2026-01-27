@@ -382,8 +382,8 @@ function GraphView({ graph, project }: GraphViewProps) {
     setViewRagResponse(null);
     try {
       // Build UI context to send to the backend (no inventos)
-      const view_nodes = (graph.nodes || []).map((n) => ({
-        id: n.id,
+      const view_nodes = (graph?.nodes || []).map((n) => ({
+        id: n.id as string | number,
         label: n.properties?.nombre ?? (Array.isArray(n.labels) ? n.labels[0] : String(n.id)),
         community: n.properties?.community_id,
         properties: n.properties || {},
@@ -393,21 +393,21 @@ function GraphView({ graph, project }: GraphViewProps) {
         pagerank: {},
         degree: {},
       };
-      (graph.nodes || []).forEach((n) => {
+      (graph?.nodes || []).forEach((n) => {
         const nid = n.id != null ? String(n.id) : "";
         graph_metrics.pagerank[nid] = typeof n.properties?.score_centralidad === 'number' ? n.properties.score_centralidad : 0;
         graph_metrics.degree[nid] = typeof n.properties?.degree === 'number' ? n.properties.degree : 0;
       });
 
-      const graph_edges = (graph.relationships || []).map((r) => ({
-        from: r.start,
-        to: r.end,
+      const graph_edges = (graph?.relationships || []).map((r) => ({
+        from: r.start as string | number,
+        to: r.end as string | number,
         type: r.type || "REL",
       }));
 
       // Communities detected: group by community_id and pick top nodes by pagerank
       const commMap: Record<string, Array<{ id: string | number; score: number }>> = {};
-      (graph.nodes || []).forEach((n) => {
+      (graph?.nodes || []).forEach((n) => {
         const comm = n.properties?.community_id ?? "-";
         const nid = n.id != null ? String(n.id) : String(Math.random());
         const score = typeof n.properties?.score_centralidad === 'number' ? n.properties.score_centralidad : 0;
@@ -727,9 +727,9 @@ function GraphView({ graph, project }: GraphViewProps) {
             </div>
 
             <div>
-              <h4>Nodos ({graph.nodes.length})</h4>
+              <h4>Nodos ({graph?.nodes?.length || 0})</h4>
               <ul>
-                {graph.nodes.map((node, index) => (
+                {(graph?.nodes || []).map((node, index) => (
                   <li key={`${String(node.id)}-${index}`}>
                     <strong>{String(node.id ?? index)}</strong>
                     {node.labels?.length ? (
@@ -740,13 +740,13 @@ function GraphView({ graph, project }: GraphViewProps) {
                     )}
                   </li>
                 ))}
-                {!graph.nodes.length && <li>Sin nodos.</li>}
+                {!(graph?.nodes?.length) && <li>Sin nodos.</li>}
               </ul>
             </div>
             <div>
-              <h4>Relaciones ({graph.relationships.length})</h4>
+              <h4>Relaciones ({graph?.relationships?.length || 0})</h4>
               <ul>
-                {graph.relationships.map((rel, index) => (
+                {(graph?.relationships || []).map((rel, index) => (
                   <li key={`${String(rel.id)}-${index}`}>
                     <strong>{rel.type || "(sin tipo)"}</strong> ({String(rel.start)} → {String(rel.end)})
                     {rel.properties && Object.keys(rel.properties).length > 0 && (
@@ -754,7 +754,7 @@ function GraphView({ graph, project }: GraphViewProps) {
                     )}
                   </li>
                 ))}
-                {!graph.relationships.length && <li>Sin relaciones.</li>}
+                {!(graph?.relationships?.length) && <li>Sin relaciones.</li>}
               </ul>
             </div>
           </>

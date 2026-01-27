@@ -74,11 +74,11 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
     try {
       const res = await saveGraphRAGReport({
         query: response.query,
-        answer: response.answer,
+        answer: response.answer || '',
         context: response.context,
-        nodes: response.nodes,
-        relationships: response.relationships,
-        fragments: response.fragments,
+        nodes: response.nodes || [],
+        relationships: response.relationships || [],
+        fragments: response.fragments || [],
         project,
       });
       alert(`Reporte guardado en: ${res.path}`);
@@ -124,7 +124,7 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
         await submitCandidate({
           project,
           codigo: codigo.trim(),
-          cita: firstFrag?.fragmento?.substring(0, 300) || response.answer.substring(0, 300),
+          cita: firstFrag?.fragmento?.substring(0, 300) || response.answer?.substring(0, 300) || '',
           fragmento_id: firstFrag?.fragmento_id || "",
           archivo: firstFrag?.archivo || "graphrag_query",
           fuente_origen: "discovery_ai",  // Same source type for consistency
@@ -231,7 +231,7 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
 
           {response.context && (
             <details className="graphrag-panel__context">
-              <summary>Contexto del Grafo ({response.nodes.length} nodos)</summary>
+              <summary>Contexto del Grafo ({response.nodes?.length || 0} nodos)</summary>
               <pre className="graphrag-panel__context-pre">{response.context}</pre>
             </details>
           )}
