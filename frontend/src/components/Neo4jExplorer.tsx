@@ -384,7 +384,7 @@ function GraphView({ graph, project }: GraphViewProps) {
       const view_nodes = (graph?.nodes || []).map((n) => ({
         id: n.id as string | number,
         label: String(n.properties?.nombre ?? (Array.isArray(n.labels) && n.labels.length > 0 ? n.labels[0] : n.id)),
-        community: n.properties?.community_id,
+        community: n.properties?.community_id as string | number | undefined,
         properties: n.properties || {},
       }));
 
