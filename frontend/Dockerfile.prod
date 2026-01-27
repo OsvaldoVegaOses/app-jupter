@@ -25,7 +25,7 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/templates/nginx.conf.template
 
 # Set default backend URL (can be overridden at runtime)
-ENV BACKEND_URL=http://backend:8000
+ENV BACKEND_URL=https://axial-api.blackplant-ffb9e37f.eastus2.azurecontainerapps.io
 
 # Expose port
 EXPOSE 80
