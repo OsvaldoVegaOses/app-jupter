@@ -1,0 +1,1 @@
+{"llm_summary":"","storyline":{"answer":"","is_grounded":false,"mode":"unavailable","note":"QDRANT_URI not set - required for cloud deployment (no localhost fallback)"},"audit_summary":{"metrics":{},"checks":[],"note":"QDRANT_URI not set - required for cloud deployment (no localhost fallback)"}}

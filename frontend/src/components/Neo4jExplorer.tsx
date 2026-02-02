@@ -420,6 +420,14 @@ function GraphView({ graph, project }: GraphViewProps) {
 
       const evidence_candidates: Array<{ fragmento_id: string; archivo?: string; fragmento?: string; score?: number }> = [];
 
+      const filters_applied = {
+        project_id: project,
+        scope: "view",
+        visible_codes_count: visibleCodigoNodeIds.length,
+        k_qdrant: 5,
+        max_central: Math.min(10, visibleCodigoNodeIds.length || 10),
+      };
+
       const res = await graphragQuery({
         query: q,
         project,
@@ -431,7 +439,7 @@ function GraphView({ graph, project }: GraphViewProps) {
         graph_edges,
         communities_detected,
         evidence_candidates,
-        filters: {},
+        filters: filters_applied,
         max_central: Math.min(10, visibleCodigoNodeIds.length || 10),
       });
       setViewRagResponse(res);
@@ -723,6 +731,26 @@ function GraphView({ graph, project }: GraphViewProps) {
                   <div style={{ fontSize: "0.9rem", color: "#0f172a", whiteSpace: "pre-wrap" }}>{viewRagResponse.answer}</div>
                 </div>
               )}
+              {viewRagResponse?.evidence && viewRagResponse.evidence.length > 0 && (
+                <div style={{ marginTop: '0.75rem', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '0.5rem', padding: '0.75rem' }}>
+                  <h5 style={{ marginTop: 0 }}>Evidencia (muestra)</h5>
+                  <ol>
+                    {viewRagResponse.evidence.slice(0, 3).map((ev, idx) => (
+                      <li key={idx} style={{ marginBottom: '0.5rem' }}>
+                        <div style={{ fontSize: '0.8rem', color: '#374151' }}>
+                          <strong>{ev.fragmento_id || ev.fragment_id || `#${ev.rank || idx + 1}`}</strong>
+                          {ev.doc_ref ? ` — ${ev.doc_ref}` : ev.archivo ? ` — ${ev.archivo}` : ''}
+                          {ev.evidence_source ? ` • ${ev.evidence_source}` : ''}
+                        </div>
+                        <div style={{ marginTop: '0.25rem', fontStyle: 'italic' }}>{ev.snippet || ev.texto || ev.preview || ''}</div>
+                        <div style={{ marginTop: '0.25rem', fontSize: '0.8rem', color: '#6b7280' }}>
+                          Soporta: {ev.supports || 'OBSERVATION/INTERPRETATION'} • Score: {typeof ev.score === 'number' ? ev.score.toFixed(3) : '-'}
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
             </div>
 
             <div>
@@ -983,3 +1011,5 @@ export function Neo4jExplorer({ project, defaultDatabase }: Neo4jExplorerProps) 
 
 // NOTA: GDSControls fue eliminado. La funcionalidad de Louvain/PageRank
 // ahora está disponible en LinkPredictionPanel con mejor integración.
+
+export default Neo4jExplorer;

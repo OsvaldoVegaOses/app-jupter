@@ -577,6 +577,8 @@ def identify_nucleus_candidates(
         # Query: Categorías con más códigos conectados y mayor centralidad
         result = session.run("""
             MATCH (c:Categoria {project_id: $project_id})-[r:REL]->(k:Codigo {project_id: $project_id})
+            WHERE coalesce(r.origen, '') <> 'descubierta'
+              AND coalesce(r.source, '') <> 'descubierta'
             WITH c, 
                  count(DISTINCT k) as num_codigos,
                  count(r) as num_relaciones,

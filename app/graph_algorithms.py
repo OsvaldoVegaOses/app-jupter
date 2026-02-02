@@ -956,6 +956,8 @@ class GraphAlgorithms:
             rel_query = f"""
                 MATCH (s)-[r:REL]->(t)
                 WHERE s.project_id = '{project_id}' AND t.project_id = '{project_id}'
+                  AND coalesce(r.origen, '') <> 'descubierta'
+                  AND coalesce(r.source, '') <> 'descubierta'
                   AND (NOT s:Codigo OR coalesce(s.status,'active') <> 'merged')
                   AND (NOT t:Codigo OR coalesce(t.status,'active') <> 'merged')
                 RETURN id(s) AS source, id(t) AS target, type(r) AS type

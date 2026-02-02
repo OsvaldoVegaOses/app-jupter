@@ -101,6 +101,7 @@ class GraphRAGRequest(BaseModel):
     )
     filters: Optional[Dict[str, Any]] = Field(default=None, description="Filtros aplicados desde la UI")
     max_central: Optional[int] = Field(default=10, description="Máximo de nodos centrales a devolver (<=10)")
+    force_mode: Optional[str] = Field(default=None, description="Forzar modo 'deep' o 'exploratory'")
 
 # Create routers
 graphrag_router = APIRouter(prefix="/api/graphrag", tags=["GraphRAG"])
@@ -184,6 +185,7 @@ async def api_graphrag_query(
                 project=payload.project,
                 include_fragments=payload.include_fragments,
                 context_node_ids=payload.node_ids,
+                force_mode=payload.force_mode,
             )
         
         api_logger.info("api.graphrag.complete")

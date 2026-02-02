@@ -24,7 +24,7 @@
  * @module App
  */
 
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { ManifestSummary } from "./components/ManifestSummary";
 import { WorkflowPanel } from "./components/WorkflowPanel";
 import { CodingPanel } from "./components/CodingPanel";
@@ -35,6 +35,7 @@ import { DiscoveryPanel } from "./components/DiscoveryPanel";
 import { LinkPredictionPanel } from "./components/LinkPredictionPanel";
 import { ReportsPanel } from "./components/ReportsPanel";
 import { InsightsPanel } from "./components/InsightsPanel";
+import { SelectiveCodingPanel } from "./components/SelectiveCodingPanel";
 import { CodeValidationPanel } from "./components/CodeValidationPanel";
 import { HiddenRelationshipsPanel } from "./components/HiddenRelationshipsPanel";
 import { Toast, type ToastMessage } from "./components/Toast";
@@ -57,9 +58,16 @@ import type { StageEntry, EpistemicMode } from "./types";
 import "./App.css";
 import { apiFetch } from "./services/api";
 
-const Neo4jExplorer = lazy(() =>
-  import("./components/Neo4jExplorer").then((module) => ({ default: module.Neo4jExplorer }))
-);
+const Neo4jExplorer = lazy(async () => {
+  const module = await import("./components/Neo4jExplorer");
+  const comp = (module as any)?.Neo4jExplorer ?? (module as any)?.default;
+  if (!comp) {
+    return {
+      default: () => <div className="app__loader">Error cargando Neo4j Explorer</div>
+    } as any;
+  }
+  return { default: comp } as any;
+});
 
 const stageTitles: Array<[string, string]> = [
   ["preparacion", "Preparacion y reflexividad"],
@@ -91,20 +99,72 @@ function BloomOrExplorer({ project }: { project: string }) {
   const bloomUrl = import.meta.env.VITE_NEO4J_BLOOM_URL as string | undefined;
   const [bloomAvailable, setBloomAvailable] = useState<boolean | null>(null);
   const [forceFallback, setForceFallback] = useState(false);
+    const openedTabRef = useRef<Window | null>(null);
 
   useEffect(() => {
     if (!bloomUrl) {
       setBloomAvailable(false);
       return;
     }
+    // Iniciar intento de carga: null = "cargando".
     setBloomAvailable(null);
+
+    // Dev helper: si el iframe no confirma carga en X ms, asumimos fallo y usamos fallback.
+    const FALLBACK_TIMEOUT_MS = 5000; // 5s
+    const t = window.setTimeout(() => {
+      // Sólo forzamos fallback si el estado sigue en 'cargando'
+      setBloomAvailable((prev) => {
+        if (prev === null) {
+          // Intentar abrir Bloom en nueva pestaña como fallback primario.
+          try {
+            const tab = window.open(bloomUrl, "_blank");
+            if (tab) {
+              try { tab.opener = null; } catch {}
+              openedTabRef.current = tab;
+            }
+          } catch (e) {
+            // ignore
+          }
+          return false;
+        }
+        return prev;
+      });
+    }, FALLBACK_TIMEOUT_MS);
+
+    return () => {
+      window.clearTimeout(t);
+    };
   }, [bloomUrl]);
 
   if (!bloomUrl || forceFallback || bloomAvailable === false) {
     return (
-      <Suspense fallback={<div className="app__loader">Cargando Neo4j Explorer...</div>}>
-        <Neo4jExplorer project={project} />
-      </Suspense>
+      <div className="app__bloom">
+        <div className="app__bloom-header">
+          <h3 style={{ margin: 0 }}>Neo4j Explorer (fallback)</h3>
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            {bloomUrl && (
+              <a href={bloomUrl} target="_blank" rel="noreferrer" className="app__bloom-link">
+                Abrir Bloom en nueva pestaña
+              </a>
+            )}
+            <button
+              type="button"
+              className="app__bloom-fallback"
+              onClick={() => {
+                // If already in fallback, try toggling back to bloom if available
+                setForceFallback(true);
+              }}
+            >
+              Usar Neo4j Explorer
+            </button>
+          </div>
+        </div>
+        <div className="app__bloom-frame">
+          <Suspense fallback={<div className="app__bloom-loading">Cargando Neo4j Explorer…</div>}>
+            <Neo4jExplorer project={project} />
+          </Suspense>
+        </div>
+      </div>
     );
   }
 
@@ -135,7 +195,16 @@ function BloomOrExplorer({ project }: { project: string }) {
           src={bloomUrl}
           title="Neo4j Bloom"
           onLoad={() => setBloomAvailable(true)}
-          onError={() => setBloomAvailable(false)}
+          onError={() => {
+            setBloomAvailable(false);
+            // También abrir en nueva pestaña si el iframe falla
+            try {
+              const tab = window.open(bloomUrl, "_blank");
+              if (tab) { try { tab.opener = null; } catch {} openedTabRef.current = tab; }
+            } catch (e) {
+              // ignore
+            }
+          }}
         />
         {bloomAvailable === null && (
           <div className="app__bloom-loading">Cargando Bloom…</div>
@@ -899,6 +968,7 @@ function AuthenticatedApp({ user, onLogout }: { user: any; onLogout: () => void 
               {investigationView === "selectiva" && (
                 <>
                   {/* Codificación selectiva: síntesis, núcleo, muestreo teórico y narrativa */}
+                  <SelectiveCodingPanel project={selectedProject} />
                   <AnalysisPanel project={selectedProject} refreshKey={codingRefreshKey} />
                   <GraphRAGPanel project={selectedProject} />
                   <InsightsPanel project={selectedProject} />

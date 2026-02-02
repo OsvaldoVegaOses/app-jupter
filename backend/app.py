@@ -197,6 +197,7 @@ from backend.routers.interviews import router as interviews_router
 from backend.routers.familiarization import router as familiarization_router
 from backend.routers.agent import router as agent_router  # Autonomous Agent
 from backend.routers.stage0 import router as stage0_router
+from backend.routers.nucleus import router as nucleus_router
 
 
 # Initialize Logging (honor env override for verbosity)
@@ -320,7 +321,7 @@ app = FastAPI(title="Neo4j Query API", version="1.0.0")
 # Configure via `CORS_ALLOW_ORIGINS` (comma-separated). Default targets local dev frontends.
 _cors_allow_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
 if _cors_allow_origins_raw:
-    _cors_allow_origins = [o.strip() for o in _cors_allow_origins_raw.split(",") if o.strip()]
+    _cors_allow_origins = [o.strip().rstrip("/") for o in _cors_allow_origins_raw.split(",") if o.strip()]
     _cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
 else:
     _cors_allow_origins = [
@@ -371,6 +372,7 @@ app.include_router(interviews_router)   # /api/interviews/* (decoupled pipeline)
 app.include_router(familiarization_router)  # /api/familiarization/reviews
 app.include_router(agent_router)        # /api/agent/* (autonomous agent)
 app.include_router(stage0_router)       # /api/stage0/* (Etapa 0: Preparación)
+app.include_router(nucleus_router)      # /api/nucleus/* (lightweight nucleus endpoints)
 
 
 # =============================================================================
@@ -7042,6 +7044,10 @@ class GraphRAGRequest(BaseModel):
     project: str = Field(default="default", description="ID del proyecto")
     include_fragments: bool = Field(default=True, description="Incluir fragmentos en contexto")
     chain_of_thought: bool = Field(default=False, description="Usar razonamiento paso a paso")
+    filters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Filtros aplicados desde la UI (project_id, scope, date_range, relation_types, k_qdrant, include_discovery, etc.)",
+    )
 
 
 class DiscoverRequest(BaseModel):
@@ -7093,13 +7099,21 @@ async def api_graphrag_query(
                 query=payload.query,
                 project=payload.project,
                 include_fragments=payload.include_fragments,
+                filters_applied=payload.filters,
             )
         
+        # safe answer length calculation: some responses use structured fields (graph_summary) instead of 'answer'
+        answer_text = (
+            result.get("answer")
+            or result.get("graph_summary")
+            or result.get("analysis")
+            or ""
+        )
         api_logger.info(
             "api.graphrag.complete",
             query=payload.query[:50],
             nodes=len(result.get("nodes") or []),
-            answer_len=len(result.get("answer") or ""),
+            answer_len=len(str(answer_text)),
         )
         
         return result
@@ -8995,6 +9009,9 @@ class ConfirmRelationshipRequest(BaseModel):
     target: str
     relation_type: str = "partede"
     project: str = "default"
+    algorithm: Optional[str] = "hidden_relationships"
+    score: Optional[float] = 0.0
+    memo: Optional[str] = None
 
 
 @app.get("/api/axial/hidden-relationships")
@@ -9083,6 +9100,9 @@ async def api_confirm_relationship(
             target=payload.target,
             relation_type=payload.relation_type,
             project=project_id,
+            algorithm=payload.algorithm,
+            score=payload.score,
+            memo=payload.memo,
         )
         
         if result.get("status") == "error":

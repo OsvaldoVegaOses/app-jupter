@@ -26,6 +26,7 @@ MIGRATIONS = [
     "migrations/021_axial_ai_evidence.sql",
     "migrations/022_link_predictions_neo4j_sync_status.sql",
     "migrations/023_link_predictions_reopen.sql",
+    "migrations/024_axial_evidencia_text_array.sql",
 ]
 
 

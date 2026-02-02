@@ -2573,7 +2573,7 @@ def ensure_axial_table(pg: PGConnection) -> None:
         relacion TEXT NOT NULL,
         archivo TEXT NOT NULL,
         memo TEXT,
-        evidencia TEXT[] NOT NULL,
+        evidencia TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
         estado TEXT NOT NULL DEFAULT 'validado',
         validado_por TEXT,
         validado_en TIMESTAMPTZ,
@@ -2657,7 +2657,7 @@ def _pg_get_table_columns(pg: PGConnection, table_name: str, schema: str = "publ
         return {r[0] for r in cur.fetchall()}
 
 
-def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> None:
+def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow], status: str = "validado") -> None:
     data = list(rows)
     if not data:
         return
@@ -2719,9 +2719,9 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
         ON CONFLICT (project_id, categoria, codigo, relacion) DO UPDATE SET
             archivo = EXCLUDED.archivo,
             memo = EXCLUDED.memo,
-            evidencia = EXCLUDED.evidencia
+            evidencia = EXCLUDED.evidencia,
+            estado = EXCLUDED.estado
             {', code_id = COALESCE(analisis_axial.code_id, EXCLUDED.code_id)' if has_code_id else ''}
-            {', estado = COALESCE(analisis_axial.estado, EXCLUDED.estado)' if has_estado else ''}
             {', updated_at = NOW()' if has_updated_at else ''}
             , created_at = analisis_axial.created_at;
         """
@@ -2736,9 +2736,9 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
             if has_code_id:
                 code_id = get_code_id_for_codigo(pg, project_id, str(code))
                 row_values.append(code_id)
-            row_values.extend([relacion, archivo, memo, list(evidencia)])
+            row_values.extend([relacion, archivo, memo, list(evidencia or [])])
             if has_estado:
-                row_values.append("validado")
+                row_values.append(status)
             formatted.append(tuple(row_values))
         with pg.cursor() as cur:
             execute_values(cur, sql, formatted, page_size=100)
@@ -2759,7 +2759,7 @@ def upsert_axial_relationships(pg: PGConnection, rows: Iterable[AxialRow]) -> No
         "fragmento_id": lambda r: (list(r[6])[0] if r[6] else None),
         "tipo_relacion": lambda r: "categoria_codigo",
         "confidence": lambda r: 1.0,
-        "estado": lambda r: "validado",
+        "estado": lambda r: status,
         "code_id": lambda r: get_code_id_for_codigo(pg, r[0], str(r[2])),
     }
 
@@ -3569,16 +3569,76 @@ def coverage_for_category(pg: PGConnection, categoria: str, project: Optional[st
                     ef.area_tematica,
                     ef.requiere_protocolo_lluvia
       FROM analisis_axial aa
-      CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+      CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
       JOIN entrevista_fragmentos ef ON ef.id = evid.fragmento_id
-     WHERE aa.categoria = %s
-       AND aa.project_id = %s
-       AND ef.project_id = aa.project_id
+      WHERE aa.categoria = %s
+        AND aa.project_id = %s
+        AND aa.estado = 'validado'
+        AND ef.project_id = aa.project_id
     """
 
     with pg.cursor() as cur:
-        cur.execute(sql_evidence, (categoria, project or "default"))
-        evidence_rows = cur.fetchall()
+        try:
+            cur.execute(sql_evidence, (categoria, project or "default"))
+            evidence_rows = cur.fetchall()
+        except Exception as exc:  # pragma: no cover - fallback for DBs without UNNEST
+            # Log the failing SQL and error for diagnostics, then try a JSONB fallback.
+            try:
+                import structlog
+
+                _pg_logger = structlog.get_logger("app.postgres_block.coverage")
+                _pg_logger.warning(
+                    "coverage_for_category.unest_failed",
+                    error=str(exc),
+                    sql=sql_evidence,
+                    params=(categoria, project or "default"),
+                )
+            except Exception:
+                pass
+
+            # After an error on a statement the PG connection may be left in
+            # an aborted transaction state. Rollback to reset before retrying.
+            try:
+                pg.rollback()
+            except Exception:
+                pass
+
+            # Some Postgres installations may store `evidencia` as JSONB instead of text[].
+            # Try a JSONB-aware lateral join as a fallback.
+            try:
+                jsonb_sql = (
+                    """
+    SELECT DISTINCT (elem->> 'fragmento_id') AS fragmento_id,
+                    ef.archivo,
+                    ef.actor_principal,
+                    ef.area_tematica,
+                    ef.requiere_protocolo_lluvia
+      FROM analisis_axial aa
+      CROSS JOIN LATERAL jsonb_array_elements(aa.evidencia::jsonb) AS elem
+      JOIN entrevista_fragmentos ef ON ef.id = (elem->> 'fragmento_id')::text
+      WHERE aa.categoria = %s
+        AND aa.project_id = %s
+        AND aa.estado = 'validado'
+        AND ef.project_id = aa.project_id
+                """
+                )
+                try:
+                    cur.execute(jsonb_sql, (categoria, project or "default"))
+                    evidence_rows = cur.fetchall()
+                except Exception as exc2:
+                    try:
+                        _pg_logger.warning(
+                            "coverage_for_category.jsonb_fallback_failed",
+                            error=str(exc2),
+                            sql=jsonb_sql,
+                            params=(categoria, project or "default"),
+                        )
+                    except Exception:
+                        pass
+                    # As a last resort, return empty evidence set to avoid crashing the endpoint
+                    evidence_rows = []
+            except Exception:
+                evidence_rows = []
 
     evidencia_ids: List[str] = []
     entrevistas_map: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"fragmentos": 0, "lluvia": 0})
@@ -3674,12 +3734,13 @@ def quotes_for_category(pg: PGConnection, categoria: str, project: Optional[str]
                    aca.fuente,
                    aca.created_at
               FROM analisis_axial aa
-              CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+              CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
               JOIN analisis_codigos_abiertos aca
                 ON aca.fragmento_id = evid.fragmento_id
                AND aca.codigo = aa.codigo
              WHERE aa.categoria = %s
                AND aa.project_id = %s
+               AND aa.estado = 'validado'
                AND aca.project_id = aa.project_id
              ORDER BY aca.fragmento_id, aca.codigo, aca.created_at DESC
           ) AS ordered
@@ -3707,12 +3768,13 @@ def quote_count_for_category(pg: PGConnection, categoria: str, project: Optional
     sql = """
     SELECT COUNT(DISTINCT aca.fragmento_id)
       FROM analisis_axial aa
-      CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+      CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
       JOIN analisis_codigos_abiertos aca
         ON aca.fragmento_id = evid.fragmento_id
        AND aca.codigo = aa.codigo
      WHERE aa.categoria = %s
        AND aa.project_id = %s
+       AND aa.estado = 'validado'
        AND aca.project_id = aa.project_id
     """
     with pg.cursor() as cur:
@@ -3904,7 +3966,7 @@ _TRANSVERSAL_VIEW_DEFINITIONS = {
             COUNT(DISTINCT aa.codigo) AS codigos,
             COUNT(*) AS relaciones
         FROM analisis_axial aa
-        CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+        CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
         JOIN entrevista_fragmentos ef ON ef.id = evid.fragmento_id AND ef.project_id = aa.project_id
         GROUP BY aa.project_id, aa.categoria, grupo
     """,
@@ -3918,7 +3980,7 @@ _TRANSVERSAL_VIEW_DEFINITIONS = {
             COUNT(DISTINCT aa.codigo) AS codigos,
             COUNT(*) AS relaciones
         FROM analisis_axial aa
-        CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+        CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
         JOIN entrevista_fragmentos ef ON ef.id = evid.fragmento_id AND ef.project_id = aa.project_id
         GROUP BY aa.project_id, aa.categoria, grupo
     """,
@@ -3932,7 +3994,7 @@ _TRANSVERSAL_VIEW_DEFINITIONS = {
             COUNT(DISTINCT aa.codigo) AS codigos,
             COUNT(*) AS relaciones
         FROM analisis_axial aa
-        CROSS JOIN UNNEST(aa.evidencia) AS evid(fragmento_id)
+        CROSS JOIN LATERAL unnest(COALESCE(aa.evidencia, ARRAY[]::text[])) AS evid(fragmento_id)
         JOIN entrevista_fragmentos ef ON ef.id = evid.fragmento_id AND ef.project_id = aa.project_id
         GROUP BY aa.project_id, aa.categoria, grupo
     """,

@@ -237,6 +237,48 @@ function Start-Neo4jRetryLoop {
   return $null
 }
 
+function Free-DiskSpace {
+  param(
+    [switch]$Perform
+  )
+  Write-Host "Attempting to free disk space (safe cleanup)..." -ForegroundColor Cyan
+
+  # npm cache + frontend caches
+  if (Get-Command npm -ErrorAction SilentlyContinue) {
+    try {
+      Write-Host "Cleaning npm cache (if available)..." -ForegroundColor DarkGray
+      npm cache clean --force | Out-Null
+    } catch {
+      Write-Host "npm cache clean failed: $($_)" -ForegroundColor Yellow
+    }
+
+    $viteCache = Join-Path $repoRoot "frontend\node_modules\.vite"
+    $npmCacheFolder = Join-Path $repoRoot "frontend\node_modules\.cache"
+    if (Test-Path $viteCache) { Remove-Item -Recurse -Force $viteCache -ErrorAction SilentlyContinue }
+    if (Test-Path $npmCacheFolder) { Remove-Item -Recurse -Force $npmCacheFolder -ErrorAction SilentlyContinue }
+  }
+
+  # pip cache purge (if pip available)
+  if (Get-Command pip -ErrorAction SilentlyContinue) {
+    try {
+      pip cache purge | Out-Null
+    } catch {
+      # ignore
+    }
+  }
+
+  # Remove pytest cache and large log files
+  $pytestCache = Join-Path $repoRoot ".pytest_cache"
+  if (Test-Path $pytestCache) { Remove-Item -Recurse -Force $pytestCache -ErrorAction SilentlyContinue }
+
+  $logDir = Join-Path $repoRoot "logs"
+  if (Test-Path $logDir) {
+    Get-ChildItem $logDir -File | Where-Object { $_.Length -gt 10MB } | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+  }
+
+  Write-Host "Safe cleanup finished." -ForegroundColor Green
+}
+
 $repoRoot = Resolve-RepoRoot
 Set-Location $repoRoot
 
@@ -248,6 +290,9 @@ $env:APP_ENV_FILE = $EnvFile
 $python = Get-VenvPython -RepoRoot $repoRoot
 
 if ($Action -in @('tests','all')) {
+  Write-Host "Preparing test environment: freeing disk space and caches..." -ForegroundColor Cyan
+  Free-DiskSpace
+
   Write-Host "Running backend tests (pytest)..." -ForegroundColor Cyan
   try {
     & $python -m pytest -q

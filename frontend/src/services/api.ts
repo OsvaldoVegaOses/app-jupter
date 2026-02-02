@@ -112,7 +112,7 @@ if (import.meta.env.DEV && API_BASE && BACKEND_PROXY && API_BASE !== BACKEND_PRO
   // Avoid silent misconfiguration when mixing proxy and direct URLs.
   console.warn(
     "[api] VITE_API_BASE y VITE_BACKEND_URL apuntan a hosts distintos. " +
-      "Usa proxy (VITE_API_BASE vacío) o unifica ambos valores."
+    "Usa proxy (VITE_API_BASE vacío) o unifica ambos valores."
   );
 }
 
@@ -806,6 +806,7 @@ export interface GraphRAGRequest {
   evidence_candidates?: Array<{ fragmento_id: string; archivo?: string; fragmento?: string; score?: number }>;
   filters?: Record<string, any>;
   max_central?: number;
+  force_mode?: "deep" | "exploratory";
 }
 
 /** GraphRAG response */
@@ -815,19 +816,172 @@ export interface GraphRAGResponse {
   answer?: string;
   // New structured fields (optional)
   graph_summary?: string;
-  central_nodes?: Array<{ id: string; score?: number; role?: string }>;
-  bridges?: Array<{ from: string; to: string; explanation?: string }>;
-  communities?: Array<{ community_id: number | string; top_nodes: string[] }>;
-  paths?: Array<string[]>;
-  evidence?: Array<{ rank: number; archivo: string; fragmento_id: string; texto: string; score: number; citation?: string }>;
+  // central_nodes: role = metric_name (pagerank, degree, betweenness)
+  central_nodes?: Array<{
+    id: string;
+    code_id?: string;
+    label?: string;
+    score?: number;
+    role?: string;  // Alias for metric_name: 'pagerank' | 'degree' | 'betweenness'
+    metric?: string;
+    metric_name?: string;
+  }>;
+  bridges?: Array<{
+    from: string;
+    to: string;
+    code_id?: string;
+    label?: string;
+    metric?: string;
+    metric_name?: string;
+    score?: number;
+    connects?: string[];
+    explanation?: string;
+  }>;
+  communities?: Array<{
+    community_id: number | string;
+    label_hint?: string;
+    top_nodes: string[];
+  }>;
+  paths?: Array<{
+    from?: string;
+    to?: string;
+    path_nodes?: string[];
+    rationale?: string;
+  } | string[]>;
+  evidence?: Array<{
+    rank: number;
+    // Spanish canonical fields (backend may return these)
+    archivo?: string;
+    fragmento_id?: string;
+    texto?: string;
+
+    // English-friendly aliases (UI code may access these)
+    fragment_id?: string;
+    snippet?: string; // short excerpt
+    preview?: string; // alternative excerpt field
+
+    // Additional metadata
+    doc_ref?: string; // document reference / filename
+    doc_id?: string;
+    citation?: string;
+    score: number;
+    evidence_source?: string; // e.g. 'qdrant_topk', 'cooccurrence', 'path_explanation'
+    supports?: "OBSERVATION" | "INTERPRETATION" | "HYPOTHESIS" | string;
+  }>;
   filters_applied?: Record<string, any>;
-  epistemic_labels?: { is_inference?: boolean; unsupported_claims?: string[] };
-  confidence?: string;
+  epistemic_labels?: {
+    observation?: string;
+    interpretation?: string;
+    hypothesis?: string;
+    is_inference?: boolean;
+    unsupported_claims?: string[];
+  };
+  confidence?: {
+    level?: string;
+    reason?: string;
+    evidence_counts?: number;
+  } | string;
   confidence_reason?: string;
   context?: string;
-  nodes?: Array<{ id: string; type: string; centralidad?: number }>;
+  nodes?: Array<{ id: string; type: string; centralidad?: number; comunidad?: string | number }>;
   relationships?: Array<{ from: string; to: string; type: string }>;
   fragments?: Array<{ fragmento_id: string; fragmento: string; archivo: string }>;
+  // Grounding status
+  is_grounded?: boolean;
+  rejection?: {
+    reason: string;
+    suggestion?: string;
+    fragments_found?: number;
+    top_score?: number;
+  };
+  model?: string;
+  // Scan Mode & Exploratory fields
+  mode?: "deep" | "exploratory" | "insufficient";
+  relevance_score?: number;
+  fallback_reason?: string;
+  questions?: string[];
+  recommendations?: string[];
+  // Research Coach AI Feedback
+  research_feedback?: {
+    diagnosis?: string;
+    actionable_suggestions?: string[];
+    suggested_questions?: string[];
+  };
+
+
+}
+
+// =============================================================================
+// Nucleus (Codificacion Selectiva)
+// =============================================================================
+
+export interface NucleusStoryline {
+  is_grounded?: boolean;
+  mode?: string;
+  answer?: string | null;
+  nodes?: Array<{ id?: string; label?: string; score?: number; role?: string }>;
+  evidence?: Array<{
+    fragment_id?: string;
+    source_doc?: string;
+    quote?: string;
+    relevance?: number;
+    support_type?: string;
+  }>;
+  confidence?: any;
+  rejection?: any;
+  computed_at?: string;
+}
+
+export interface NucleusAuditSummary {
+  text_summary?: string | null;
+  summary_md?: string | null;
+  pagerank_top?: Array<any>;
+  coverage?: {
+    interviews?: number;
+    roles?: number;
+    fragments?: number;
+  } & Record<string, any>;
+  thresholds?: Record<string, any>;
+  checks?: Record<string, boolean>;
+  probe?: Record<string, any>;
+  computed_at?: string;
+}
+
+export interface NucleusExploratoryScan {
+  mode?: string;
+  relevance_score?: number;
+  fallback_reason?: string;
+  graph_summary?: string;
+  central_nodes?: Array<any>;
+  evidence?: Array<{
+    fragment_id?: string;
+    source_doc?: string;
+    quote?: string;
+    relevance?: number;
+    support_type?: string;
+  }>;
+  questions?: string[];
+  recommendations?: string[];
+  research_feedback?: {
+    diagnosis?: string;
+    actionable_suggestions?: string[];
+    suggested_questions?: string[];
+  };
+  confidence?: any;
+  computed_at?: string;
+}
+
+export interface NucleusLightResponse {
+  llm_summary?: string;
+  storyline?: NucleusStoryline;
+  audit_summary?: NucleusAuditSummary;
+  exploratory_scan?: NucleusExploratoryScan | null;
+  abstention?: {
+    reason?: string;
+    suggestion?: string;
+    fragments_found?: number;
+    top_score?: number;
+  } | null;
 }
 
 /** Discovery search request */
@@ -903,6 +1057,12 @@ export async function graphragQuery(request: GraphRAGRequest): Promise<GraphRAGR
       max_central: request.max_central ?? null,
     }),
   });
+}
+
+export async function getNucleusLight(project: string, categoria: string): Promise<NucleusLightResponse> {
+  const safeProject = encodeURIComponent(project || "default");
+  const safeCategoria = encodeURIComponent(categoria || "");
+  return apiFetchJson<NucleusLightResponse>(`/nucleus/light/${safeProject}/${safeCategoria}`);
 }
 
 export async function discoverSearch(request: DiscoverRequest): Promise<DiscoverResponse> {

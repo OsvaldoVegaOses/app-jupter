@@ -136,12 +136,23 @@ def format_evidence_block(fragments: List[Dict[str, Any]], max_items: int = 5) -
     """
     evidence = []
     for i, frag in enumerate(fragments[:max_items], 1):
+        text = (frag.get("fragmento", "") or "").strip()
+        # snippet: 1-2 short sentences (approx first 150 chars)
+        snippet = (text[:150] + "...") if len(text) > 150 else text
         evidence.append({
             "rank": i,
-            "archivo": frag.get("archivo", "desconocido"),
             "fragmento_id": frag.get("fragmento_id", frag.get("id", "")),
-            "texto": (frag.get("fragmento", "") or "")[:200],
+            "archivo": frag.get("archivo", "desconocido"),
+            "doc_ref": frag.get("archivo", "desconocido"),
+            "snippet": snippet,
+            "texto": text[:400],
             "score": round(frag.get("score", 0), 3),
+            # origen de la evidencia cuando esté presente en el fragmento
+            "evidence_source": frag.get("source", frag.get("evidence_source", "qdrant_topk")),
+            # soporte esperado: OBSERVATION/INTERPRETATION (rellenado por LLM si es necesario)
+            "supports": frag.get("supports", None),
+            # citation for human-readable cross-reference (e.g. [1])
+            "citation": f"[{i}]",
         })
     return evidence
 
@@ -391,6 +402,8 @@ def graphrag_query(
     llm_model: Optional[str] = None,
     enforce_grounding: bool = True,
     context_node_ids: Optional[List[int]] = None,
+    filters_applied: Optional[Dict[str, Any]] = None,
+    force_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Ejecuta una consulta GraphRAG con gates anti-alucinaciones.
@@ -406,6 +419,7 @@ def graphrag_query(
         include_fragments: Incluir fragmentos en contexto
         llm_model: Modelo LLM a usar (default: gpt-4)
         enforce_grounding: Si True, aplica gates de evidencia (default: True)
+        force_mode: Forzar modo 'deep' o 'exploratory' (bypass thresholds)
         
     Returns:
         Dict con answer, evidence, confidence, is_grounded, y metadata
@@ -470,48 +484,262 @@ def graphrag_query(
             }
     
     # 3. Calcular confianza
+    # 3. Calcular confianza y determinar MODO DE ESCANEO
     confidence, confidence_reason = calculate_confidence(fragments)
     
-    # 4. Construir prompt con contrato de respuesta (Sprint 15 - E3)
-        system_prompt = """Eres un asistente de investigación cualitativa riguroso.
-
-INSTRUCCIONES IMPORTANTES (RESPUESTA EN JSON):
-- Devuelve UN ÚNICO objeto JSON válido (no texto adicional) con exactamente estas claves:
-    - `graph_summary` (string): resumen breve del subgrafo en 1-2 frases.
-    - `central_nodes` (array): lista de objetos {"id":str, "score":float, "role":str} con los nodos centrales.
-    - `bridges` (array): lista de objetos {"from":str, "to":str, "explanation":str} describiendo puentes entre comunidades.
-    - `communities` (array): lista de objetos {"community_id":int, "top_nodes": [str]}.
-    - `paths` (array): lista de caminos relevantes como arrays de nodos (ej: [["A","B","C"]]).
-    - `evidence` (array): lista de objetos {"rank":int, "archivo":str, "fragmento_id":str, "texto":str, "score":float, "citation":str} (citation debe mapear a [1],[2],...)
-    - `filters_applied` (object): los filtros recogidos desde la UI (puede ser {}).
-    - `epistemic_labels` (object): etiquetas como {"is_inference":bool, "unsupported_claims": []}.
-    - `confidence` (string): "alta"|"media"|"baja".
-    - `confidence_reason` (string): breve justificación del nivel de confianza.
-
-REGLAS ESTRICTAS:
-1) Usa SOLO la información presente en los fragmentos listados en `evidence` y en el subgrafo.
-2) No inventes hechos, números, ni citas. Si algo no puede probarse, deja `epistemic_labels.is_inference=true` y explica breve en `epistemic_labels.unsupported_claims`.
-3) No incluyas texto fuera del objeto JSON. Si no puedes cumplir el esquema, devuelve un objeto JSON con `epistemic_labels.is_inference=true` y `evidence: []`.
-
-NOTA: Las citas en `evidence[].citation` deben ser del tipo "[1]" correlacionadas con el orden de `evidence`.
-"""
+    # Calcular score máximo para decisión de modo
+    max_score = max([f.get("score", 0) for f in fragments]) if fragments else 0
     
-    user_content_parts = [f"PREGUNTA: {query}", ""]
+    # Lógica de Auto-Switch (Smart Fallback)
+    # Default: Deep Scan si hay buena señal, sino Exploratory, sino Abstain
+    scan_mode = "deep"
+    fallback_reason = None
+    
+    THRESHOLD_DEEP = 0.5
+    THRESHOLD_EXPLORATORY = 0.25
+    
+    if force_mode and force_mode in ["deep", "exploratory"]:
+        scan_mode = force_mode
+        if force_mode == "deep" and max_score < THRESHOLD_DEEP:
+            fallback_reason = f"⚠️ ALERTA: Modo Deep forzado con señal débil ({max_score:.2f}). Riesgo de alucinación."
+    else:
+        if max_score < THRESHOLD_DEEP:
+            if max_score >= THRESHOLD_EXPLORATORY:
+                scan_mode = "exploratory"
+                fallback_reason = f"Señal insuficiente para Deep Scan (max_score {max_score:.2f} < {THRESHOLD_DEEP}). Cambiando a modo Exploratorio."
+                if settings.debug:
+                    print(f"[GraphRAG] Auto-switch a Exploratory: {fallback_reason}")
+            else:
+                scan_mode = "insufficient"
+                fallback_reason = f"Señal demasiado baja incluso para exploración ({max_score:.2f} < {THRESHOLD_EXPLORATORY})."
+    
+    # Si la señal es insuficiente, intentamos generar "Research Feedback" en lugar de fallar silenciosamente
+    if scan_mode == "insufficient":
+        # System Prompt para el Coach Metodológico
+        SYSTEM_RESEARCH_COACH = """Eres un EXPERTO COACH METODOLÓGICO en investigación cualitativa (Grounded Theory).
+El usuario intentó buscar evidencia para una pregunta, pero la recuperación vectorial falló (scores muy bajos).
+Tu trabajo NO es responder la pregunta, sino DIAGNOSTICAR por qué falló y sugerir ACCIONES INVESTIGATIVAS.
+
+ENTRADA:
+- Query: Pregunta exacta del usuario.
+- Evidencia Débil: Fragmentos recuperados pero con bajo score (irrelevantes semánticamente).
+- Contexto de Grafo: Nodos visibles (si los hay).
+
+OBJETIVO JSON:
+Genera un objeto JSON con:
+1. "diagnosis": Análisis de la brecha. Ejemplo: "La pregunta usa términos teóricos ('gobernanza') que no aparecen en las entrevistas ('reuniones de vecinos')."
+2. "actionable_suggestions": Lista de 3 cosas concretas que el investigador puede hacer. Ejemplo: "Codificar incidentes de toma de decisiones", "Buscar sinónimos locales para 'infraestructura'".
+3. "suggested_questions": 2 preguntas alternativas usando lenguaje más cercano a los fragmentos visibles.
+
+OUTPUT FORMATO JSON ÚNICO.
+"""
+        # Solo ejecutamos el coach si hay ALGO de evidencia (aunque sea mala > 0.15)
+        # Si no hay nada de nada, retornamos error simple.
+        if fragments:
+            user_content_parts = [f"QUERY: {query}", "EVIDENCIA DÉBIL RECUPERADA:"]
+            for f in fragments[:5]:
+                user_content_parts.append(f"- [{f.get('score',0):.2f}] {f.get('fragmento',' ')[:150]}...")
+            
+            try:
+                coach_response = clients.aoai.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_RESEARCH_COACH},
+                        {"role": "user", "content": "\n".join(user_content_parts)}
+                    ],
+                    temperature=0.3,
+                    max_tokens=500,
+                    response_format={ "type": "json_object" }
+                )
+                feedback_json = json.loads(coach_response.choices[0].message.content)
+            except Exception as e:
+                _logger.error(f"Error generando research feedback: {e}")
+                feedback_json = None
+        else:
+            feedback_json = None
+
+        return {
+            "query": query,
+            "answer": "⚠️ No se encontró evidencia suficiente para responder con rigor. (Score < 0.25).",
+            "mode": "insufficient",
+            "relevance_score": max_score,
+            "fallback_reason": fallback_reason,
+            "evidence": [],
+            "graph_summary": "Sin datos suficientes.",
+            "confidence": "baja",
+            "confidence_reason": fallback_reason,
+            "research_feedback": feedback_json, # Nuevo campo
+            "recommendations": feedback_json.get("actionable_suggestions", []) if feedback_json else ["Intenta usar términos más específicos del dominio."]
+        }
+
+    # SELECCIÓN DE PROMPT SEGÚN MODO
+    if scan_mode == "deep":
+        # Prompt Deep Scan (Causal/Hipótesis) - El original mejorado
+        system_prompt = """Eres un asistente que resume un subgrafo Neo4j y genera evidencia trazable para investigación cualitativa (Teoría Fundamentada).
+Responde ÚNICAMENTE con un objeto JSON válido (sin texto adicional, sin markdown). Debes cumplir estrictamente el esquema solicitado.
+
+CONTEXTO Y ENTRADA (no inventes nada que no esté en los datos):
+- query: pregunta del usuario.
+- project_id: identificador del proyecto.
+- view_nodes, graph_metrics, graph_edges, communities_detected, evidence_candidates, filters, max_central.
+
+OBJETIVO (DEEP SCAN):
+Generar un resumen breve y verificable del subgrafo, destacando RELACIONES CAUSALES, TENSIONES y COHERENCIA ESTRUCTURAL, soportado por:
+(a) nodos centrales listados con métrica y score,
+(b) 3 fragmentos textuales (snippet) de ALTA RELEVANCIA,
+(c) nota explícita de filtros aplicados.
+
+REGLAS EPISTEMOLÓGICAS:
+- OBSERVATION: debe estar sustentada por fragmentos.
+- INTERPRETATION: inferencias razonables.
+- HYPOTHESIS: proposiciones tentativas sobre causalidad ("A podría influir en B").
+- No inventes fragmentos ni snippets.
+
+REGLAS ANTI-PLACEHOLDER:
+- Si communities_detected vacío -> communities: [].
+- graph_summary describe estructura y causalidad observada.
+
+SALIDA JSON REQUERIDA:
+{
+  "graph_summary": string,
+  "central_nodes": [{"code_id": string, "label": string, "metric_name": "pagerank|degree|betweenness", "score": number}],
+  "bridges": [{"code_id": string, "label": string, "metric_name": "betweenness", "score": number, "connects": [string, string]}],
+  "communities": [{"community_id": string, "label_hint": string, "top_nodes": [string]}],
+  "paths": [{"from": string, "to": string, "path_nodes": [string], "rationale": string}],
+  "evidence": [{"fragment_id": string, "doc_id": string, "snippet": string, "score": number, "evidence_source": "qdrant_topk", "supports": "OBSERVATION|INTERPRETATION|HYPOTHESIS"}],
+  "filters_applied": object,
+  "epistemic_labels": object,
+  "confidence": {"level": "alta|media|baja", "reason": string, "evidence_counts": number},
+  "questions": [string],
+  "recommendations": [string]
+}
+"""
+    else:
+        # Prompt Exploratory Scan (Descriptivo/No Causal)
+        system_prompt = """Eres un asistente de investigación que realiza un ESCANEO EXPLORATORIO de un subgrafo Neo4j.
+La relevancia de la evidencia es BAJA/MEDIA. TU OBJETIVO ES DESCRIBIR, NO EXPLICAR NI INFERIR CAUSALIDAD.
+
+Responde ÚNICAMENTE con un objeto JSON válido.
+
+OBJETIVO (EXPLORATORY SCAN):
+Generar un mapa descriptivo de "qué hay" y "qué falta".
+- Describir temas visibles sin asumir relaciones fuertes.
+- Identificar nodos centrales solo por topología (grado).
+- Generar PREGUNTAS SUGERIDAS para profundizar, en lugar de hipótesis.
+
+REGLAS ESTRICTAS (MODO EXPLORATORIO):
+1. PROHIBIDO usar lenguaje causal ("provoca", "causa", "se debe a"). Usa lenguaje descriptivo ("aparece junto a", "coexiste con").
+2. En `evidence`, etiqueta el soporte como "OBSERVATION" (nunca HYPOTHESIS fuerte).
+3. `confidence.level` debe ser "baja" o "media".
+4. `graph_summary` debe enfatizar la naturaleza preliminar de los hallazgos.
+
+SALIDA JSON REQUERIDA (Compatible):
+{
+  "graph_summary": string (descripción tentativa),
+  "central_nodes": [{"code_id": string, "label": string, "metric_name": "degree", "score": number}],
+  "bridges": [],
+  "communities": [],
+  "paths": [], 
+  "evidence": [{"fragment_id": string, "doc_id": string, "snippet": string, "score": number, "evidence_source": "qdrant_topk", "supports": "OBSERVATION"}],
+  "filters_applied": object,
+  "epistemic_labels": {"observation": "low_signal", "interpretation": "tentative", "hypothesis": "none"},
+  "confidence": {"level": "baja", "reason": string, "evidence_counts": number},
+  "questions": [string] (preguntas clave para guiar investigación futura),
+  "recommendations": [string] (acciones para mejorar la señal, ej. densificar códigos)
+}
+"""
+
+    user_content_parts = [f"PREGUNTA: {query}", f"MODO: {scan_mode.upper()} (Relevancia max: {max_score:.2f})", ""]
     
     # Agregar contexto del grafo
     if subgraph["context"]:
         user_content_parts.append(subgraph["context"])
         user_content_parts.append("")
     
-    # Agregar fragmentos relevantes
+    # Agregar datos estructurados para el prompt
+    import json as json_module
+    
+    # view_nodes: nodos del subgrafo con métricas
+    view_nodes = []
+    for n in (subgraph.get("nodes") or []):
+        view_nodes.append({
+            "code_id": n.get("id"),
+            "label": n.get("id"),
+            "type": n.get("type"),
+            "pagerank": float(n.get("centralidad") or 0),
+            "community": n.get("comunidad"),
+        })
+    if view_nodes:
+        user_content_parts.append("VIEW_NODES (nodos visibles con métricas):")
+        user_content_parts.append(json_module.dumps(view_nodes[:20], ensure_ascii=False, indent=None))
+        user_content_parts.append("")
+    
+    # graph_edges: relaciones del subgrafo
+    graph_edges = []
+    for r in (subgraph.get("relationships") or []):
+        graph_edges.append({
+            "from": r.get("from"),
+            "to": r.get("to"),
+            "type": r.get("type"),
+        })
+    if graph_edges:
+        user_content_parts.append("GRAPH_EDGES (relaciones):")
+        user_content_parts.append(json_module.dumps(graph_edges[:30], ensure_ascii=False, indent=None))
+        user_content_parts.append("")
+    
+    # communities_detected (solo para deep, o si hay muy buena estructura)
+    communities_detected = []
+    if scan_mode == "deep":
+        comm_map: Dict[str, List[str]] = {}
+        for n in view_nodes:
+            comm = n.get("community")
+            if comm is not None and str(comm) not in ("", "None", "-"):
+                comm_key = str(comm)
+                if comm_key not in comm_map:
+                    comm_map[comm_key] = []
+                comm_map[comm_key].append(n.get("code_id"))
+        for comm_id, members in comm_map.items():
+            communities_detected.append({
+                "community_id": comm_id,
+                "top_nodes": members[:5],
+            })
+        if communities_detected:
+            user_content_parts.append("COMMUNITIES_DETECTED (comunidades reales):")
+            user_content_parts.append(json_module.dumps(communities_detected, ensure_ascii=False, indent=None))
+            user_content_parts.append("")
+    
+    # evidence_candidates: fragmentos con snippets
     if include_fragments and fragments:
-        user_content_parts.append("FRAGMENTOS DE EVIDENCIA:")
-        for i, frag in enumerate(fragments, 1):
-            text = frag.get("fragmento", "")[:300]
+        user_content_parts.append("EVIDENCE_CANDIDATES (fragmentos ordenados por score):")
+        evidence_candidates = []
+        # En exploratory permitimos ver un poco más abajo para dar contexto
+        limit_ev = 5 if scan_mode == "deep" else 5
+        for i, frag in enumerate(fragments[:limit_ev], 1):
+            text = (frag.get("fragmento", "") or "").strip()
             archivo = frag.get("archivo", "desconocido")
             score = frag.get("score", 0)
-            user_content_parts.append(f"\n[{i}] Fuente: {archivo} (relevancia: {score:.2f})")
-            user_content_parts.append(f"    \"{text}...\"")
+            frag_id = frag.get("fragmento_id", frag.get("id", ""))
+            snippet = (text[:200] + "...") if len(text) > 200 else text
+            source = frag.get("source", frag.get("evidence_source", "qdrant_topk"))
+            evidence_candidates.append({
+                "fragment_id": frag_id,
+                "doc_id": archivo,
+                "snippet": snippet,
+                "score": round(score, 3),
+                "evidence_source": source,
+            })
+        user_content_parts.append(json_module.dumps(evidence_candidates, ensure_ascii=False, indent=2))
+        user_content_parts.append("")
+
+    # Agregar filtros aplicados (si vienen de la UI)
+    user_content_parts.append("FILTERS:")
+    filters_dict = filters_applied if isinstance(filters_applied, dict) else {}
+    filters_dict["project_id"] = project_id
+    filters_dict.setdefault("scope", "proyecto")
+    filters_dict.setdefault("k_qdrant", 5)
+    filters_dict.setdefault("include_discovery", False)
+    user_content_parts.append(json_module.dumps(filters_dict, ensure_ascii=False, indent=None))
+    user_content_parts.append("")
     
     user_content = "\n".join(user_content_parts)
     
@@ -526,10 +754,8 @@ NOTA: Las citas en `evidence[].citation` deben ser del tipo "[1]" correlacionada
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
+            "max_completion_tokens": 1000
         }
-
-        # gpt-5.x models no soportan temperature != 1, no enviar el parámetro
-        kwargs["max_completion_tokens"] = 1000
 
         response = clients.aoai.chat.completions.create(**kwargs)
         llm_raw = response.choices[0].message.content or ""
@@ -546,36 +772,93 @@ NOTA: Las citas en `evidence[].citation` deben ser del tipo "[1]" correlacionada
             raise ValueError("No JSON encontrado en la respuesta del modelo.")
 
         parsed = json.loads(json_text)
+        
+        # Inyectar metadatos de modo en la respuesta parseada
+        parsed["mode"] = scan_mode
+        parsed["relevance_score"] = max_score
+        if fallback_reason:
+            parsed["fallback_reason"] = fallback_reason
+            
     except Exception as e:
         _logger.error("graphrag.llm_error_or_parse", error=str(e))
         parse_error = str(e)
         parsed = None
     
     # 6. Formatear evidencia estructurada (Sprint 15 - E3)
-    evidence = format_evidence_block(fragments)
+    # Limitamos a 3 citas por defecto para la UI (puede ajustarse)
+    evidence = format_evidence_block(fragments, max_items=3)
     
     _logger.info(
         "graphrag.query_complete",
         query=query[:50],
         nodes=len(subgraph.get("nodes") or []),
-        answer_len=len(answer or ""),
+        answer_len=len(llm_raw or ""),
         confidence=confidence,
         is_grounded=True,
     )
     
     # CONTRATO DE RESPUESTA (Sprint 15 - E3)
     # Construir resultado final basado en JSON parseado del LLM si está disponible
+    # Pre-calcualte fallback structured fields from subgraph so UI has deterministic data
+    # Central nodes (top by centralidad)
+    central_nodes_calc: List[Dict[str, Any]] = []
+    try:
+        codigo_nodes = [n for n in (subgraph.get("nodes") or []) if n.get("type") == "Codigo"]
+        codigo_sorted = sorted(codigo_nodes, key=lambda x: float(x.get("centralidad") or 0), reverse=True)
+        for n in codigo_sorted[: min(10, len(codigo_sorted))]:
+            central_nodes_calc.append({
+                "code_id": n.get("id"),
+                "label": n.get("id"),
+                "metric": "pagerank",
+                "score": float(n.get("centralidad") or 0),
+            })
+    except Exception:
+        central_nodes_calc = []
+
+    # Communities
+    communities_calc: List[Dict[str, Any]] = []
+    try:
+        comm_map: Dict[str, List[Dict[str, Any]]] = {}
+        for n in (subgraph.get("nodes") or []):
+            comm = n.get("comunidad", "-")
+            if comm not in comm_map:
+                comm_map[comm] = []
+            comm_map[comm].append({"id": n.get("id"), "centralidad": float(n.get("centralidad") or 0)})
+        for comm_k, members in comm_map.items():
+            top_nodes = [m["id"] for m in sorted(members, key=lambda x: x.get("centralidad", 0), reverse=True)[:5]]
+            communities_calc.append({"community_id": comm_k, "label_hint": str(comm_k), "top_nodes": top_nodes})
+    except Exception:
+        communities_calc = []
+
+    # Bridges (relationships connecting different communities)
+    bridges_calc: List[Dict[str, Any]] = []
+    try:
+        node_comm = {n.get("id"): n.get("comunidad") for n in (subgraph.get("nodes") or [])}
+        for rel in (subgraph.get("relationships") or []):
+            f = rel.get("from")
+            t = rel.get("to")
+            if f in node_comm and t in node_comm and node_comm.get(f) != node_comm.get(t):
+                bridges_calc.append({
+                    "from": f,
+                    "to": t,
+                    "metric": "community_bridge",
+                    "score": 1.0,
+                    "connects": [str(node_comm.get(f)), str(node_comm.get(t))],
+                })
+    except Exception:
+        bridges_calc = []
+
     if parsed and isinstance(parsed, dict):
         # Merge: asegurar campos obligatorios y fallback
         parsed_result = {
             "query": query,
             "graph_summary": parsed.get("graph_summary", ""),
-            "central_nodes": parsed.get("central_nodes", []),
-            "bridges": parsed.get("bridges", []),
-            "communities": parsed.get("communities", []),
+            "central_nodes": parsed.get("central_nodes", central_nodes_calc),
+            "bridges": parsed.get("bridges", bridges_calc),
+            "communities": parsed.get("communities", communities_calc),
             "paths": parsed.get("paths", []),
             "evidence": parsed.get("evidence", evidence),
-            "filters_applied": parsed.get("filters_applied", {}),
+            "filters_applied": parsed.get("filters_applied", filters_applied or {}),
             "epistemic_labels": parsed.get("epistemic_labels", {"is_inference": False, "unsupported_claims": []}),
             "confidence": parsed.get("confidence", confidence),
             "confidence_reason": parsed.get("confidence_reason", confidence_reason),

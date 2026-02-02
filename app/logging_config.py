@@ -72,17 +72,25 @@ class ContextualFileHandler(logging.Handler):
         self._default_handler = self._build_handler(self.base_dir)
 
     def _build_handler(self, directory: Path) -> logging.Handler:
-        directory.mkdir(parents=True, exist_ok=True)
-        handler = logging.handlers.TimedRotatingFileHandler(
-            filename=directory / self.filename,
-            when=self.when,
-            interval=self.interval,
-            backupCount=self.backup_count,
-            encoding=self.encoding,
-        )
-        if self.formatter:
-            handler.setFormatter(self.formatter)
-        return handler
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.TimedRotatingFileHandler(
+                filename=directory / self.filename,
+                when=self.when,
+                interval=self.interval,
+                backupCount=self.backup_count,
+                encoding=self.encoding,
+            )
+            if self.formatter:
+                handler.setFormatter(self.formatter)
+            return handler
+        except OSError as exc:
+            # If file creation fails (e.g., ENOSPC), fallback to stderr stream handler
+            fallback = logging.StreamHandler(sys.stderr)
+            if self.formatter:
+                fallback.setFormatter(self.formatter)
+            fallback.handle = fallback.emit  # type: ignore[attr-defined]
+            return fallback
 
     @staticmethod
     def _sanitize(value: Optional[str], fallback: str) -> str:
@@ -115,7 +123,25 @@ class ContextualFileHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         handler = self._select_handler()
-        handler.emit(record)
+        try:
+            handler.emit(record)
+        except OSError as e:
+            # Disk full or other IO error when writing logs; degrade gracefully to stderr
+            try:
+                msg = self.format(record) if self.formatter else record.getMessage()
+                sys.stderr.write(f"[logging-fallback] {msg}\n")
+                sys.stderr.flush()
+            except Exception:
+                # Last resort: ignore to avoid crashing the application
+                pass
+        except Exception:
+            # Catch-all to ensure logging failures never bubble up
+            try:
+                msg = record.getMessage()
+                sys.stderr.write(f"[logging-error] {msg}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
 
     def setFormatter(self, fmt: logging.Formatter) -> None:  # type: ignore[override]
         super().setFormatter(fmt)

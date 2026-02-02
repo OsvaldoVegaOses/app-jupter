@@ -894,15 +894,24 @@ def confirm_hidden_relationship(
     target: str,
     relation_type: str = "partede",
     project: Optional[str] = None,
+    # New optional args for better audit trail
+    algorithm: str = "hidden_relationships",
+    score: float = 0.0,
+    memo: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Encola una relacion oculta como HIPOTESIS en PostgreSQL (ledger).
+    """Encola una relacion oculta como PENDIENTE en analisis_axial (ledger).
 
     Importante:
     - NO escribe en Neo4j.
-    - Solo debe sincronizarse a Neo4j cuando un humano la valide/aplique
-      (p.ej. via `link_predictions`).
+    - Persiste en `analisis_axial` con estado 'pendiente'.
+    - Crea un registro en `axial_ai_analyses` para auditoria si proviene de Discovery.
     """
     from .neo4j_block import ALLOWED_REL_TYPES
+    from .postgres_block import (
+        ensure_axial_table,
+        upsert_axial_relationships,
+        insert_axial_ai_analysis,
+    )
 
     project_id = project or "default"
     src = str(source or "").strip()
@@ -916,78 +925,65 @@ def confirm_hidden_relationship(
         return {"status": "error", "message": f"Tipo '{relation_type}' no valido"}
 
     try:
-        from app.postgres_block import ensure_link_predictions_table
+        ensure_axial_table(clients.postgres)
 
-        ensure_link_predictions_table(clients.postgres)
-
-        # Canonicalize as undirected pair (A,B) to avoid duplicates.
-        a, b = (src, tgt) if src <= tgt else (tgt, src)
-        algorithm = "hidden_relationships"
-        memo = "Descubierta (hidden_relationships): requiere validacion humana"
-
-        existed = False
-        with clients.postgres.cursor() as cur:
-            cur.execute(
-                """
-                SELECT 1
-                FROM link_predictions
-                WHERE project_id = %s AND source_code = %s AND target_code = %s AND algorithm = %s
-                LIMIT 1
-                """,
-                (project_id, a, b, algorithm),
+        # 1. Auditoría IA (Opcional pero recomendado para Discovery)
+        analysis_id = None
+        try:
+            analysis_id = insert_axial_ai_analysis(
+                clients.postgres,
+                project_id=project_id,
+                source_type="discovery_confirmation",
+                algorithm=algorithm,
+                algorithm_description="Confirmación manual de relación oculta descubierta",
+                suggestions_json=[{"source": src, "target": tgt, "rel": rel_type, "score": score}],
+                analysis_text=f"Relación propuesta entre {src} y {tgt} via discovery",
+                memo_statements=[],
+                structured=True,
+                estado="pendiente"
             )
-            existed = cur.fetchone() is not None
+        except Exception as ai_exc:
+            _logger.warning("confirm_relationship.audit_failed", error=str(ai_exc))
 
-            cur.execute(
-                """
-                INSERT INTO link_predictions (
-                    project_id, source_code, target_code, relation_type,
-                    algorithm, score, rank, memo
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (project_id, source_code, target_code, algorithm) DO UPDATE SET
-                    relation_type = EXCLUDED.relation_type,
-                    memo = COALESCE(EXCLUDED.memo, link_predictions.memo),
-                    score = GREATEST(link_predictions.score, EXCLUDED.score),
-                    updated_at = NOW()
-                RETURNING id, estado
-                """,
-                (project_id, a, b, rel_type, algorithm, 0.0, None, memo),
-            )
-            stored = cur.fetchone()
-        clients.postgres.commit()
+        # 2. Persistencia en analisis_axial (como PENDIENTE)
+        # Nota: La tabla analisis_axial usa (categoria, codigo) como clave.
+        # Si son dos códigos, usamos source como categoria y target como codigo.
+        final_memo = memo or f"Descubierta ({algorithm}) - Requiere validación humana"
+        if analysis_id:
+            final_memo += f" [AI-Ref:{analysis_id}]"
 
-        if not stored:
-            return {"status": "error", "message": "No se pudo registrar la hipotesis en link_predictions"}
+        # Necesitamos un 'archivo' para cumplir con la constraint NOT NULL
+        # Intentamos usar 'discovery' como origen estructural.
+        archivo = "discovery"
 
-        prediction_id = int(stored[0])
-        estado = str(stored[1] or "pendiente")
-        action = "updated" if existed else "created"
+        upsert_axial_relationships(
+            clients.postgres,
+            [(project_id, src, tgt, rel_type, archivo, final_memo, [])],
+            status="pendiente"
+        )
 
         _logger.info(
-            "hidden_relationship.queued",
+            "hidden_relationship.queued_ledger",
             project_id=project_id,
-            source=a,
-            target=b,
+            source=src,
+            target=tgt,
             tipo=rel_type,
-            prediction_id=prediction_id,
-            estado=estado,
-            action=action,
+            analysis_id=analysis_id,
+            estado="pendiente"
         )
         return {
             "status": "ok",
-            "action": action,
             "project": project_id,
-            "prediction_id": prediction_id,
-            "source": a,
-            "target": b,
+            "source": src,
+            "target": tgt,
             "relation_type": rel_type,
-            "estado": estado,
+            "estado": "pendiente",
+            "analysis_id": analysis_id,
         }
     except Exception as e:
         try:
             clients.postgres.rollback()
         except Exception:
             pass
-        _logger.error("hidden_relationship.queue_error", error=str(e)[:200])
+        _logger.error("hidden_relationship.ledger_error", error=str(e)[:200])
         return {"status": "error", "message": str(e)}

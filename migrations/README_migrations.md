@@ -49,6 +49,7 @@ Additional production migrations
 - `021_axial_ai_evidence.sql`
 - `022_link_predictions_neo4j_sync_status.sql`
 - `023_link_predictions_reopen.sql`
+- `024_axial_evidencia_text_array.sql`
 
 Helper script
 - `../scripts/apply_migrations_production.py` — Runs the production SQL migrations in order.

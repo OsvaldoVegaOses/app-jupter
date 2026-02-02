@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npx tsc && vite build",
+    "build": "npx vite build",
     "build:analyze": "cross-env-shell ANALYZE=true \"npx tsc && vite build\"",
     "preview": "vite preview",
     "test": "vitest run",

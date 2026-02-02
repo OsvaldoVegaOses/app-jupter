@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List
@@ -12,6 +13,30 @@ from typing import List
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+def _ensure_tempdir() -> None:
+    env_temp = os.getenv("TEMP") or os.getenv("TMP")
+    if env_temp and Path(env_temp).exists():
+        return
+
+    candidates: list[Path] = []
+    local_app = os.getenv("LOCALAPPDATA")
+    if local_app:
+        candidates.append(Path(local_app) / "Temp")
+    user_profile = os.getenv("USERPROFILE")
+    if user_profile:
+        candidates.append(Path(user_profile) / "Temp")
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            os.environ["TEMP"] = str(candidate)
+            os.environ["TMP"] = str(candidate)
+            return
+        except OSError:
+            continue
+
+_ensure_tempdir()
 
 from app.clients import build_service_clients  # noqa: E402
 from app.qdrant_block import ensure_payload_indexes  # noqa: E402

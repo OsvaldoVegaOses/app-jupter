@@ -1,13 +1,16 @@
 ﻿# Production Dockerfile for React/Vite frontend
 # Build: docker build -t qualitative-frontend -f Dockerfile.prod .
 
-FROM node:20-alpine AS builder
+FROM node:20 AS builder
 
 WORKDIR /app
 
 # Install dependencies first (better cache)
 COPY package*.json ./
 RUN npm ci
+
+# Fix permissions for binaries
+RUN chmod +x node_modules/.bin/*
 
 # Copy source and build
 COPY . .
