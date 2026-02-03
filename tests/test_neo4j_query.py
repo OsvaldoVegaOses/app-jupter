@@ -135,7 +135,8 @@ def test_run_cypher_provides_multi_view() -> None:
 
     result = queries.run_cypher(clients, "MATCH (c) RETURN c", params={"limit": 5}, database="neo4j")
 
-    assert driver.last_kwargs == {"database": "neo4j"}
+    assert driver.last_kwargs["database"] == "neo4j"
+    assert driver.last_kwargs["fetch_size"] == 100
     assert session.last_query == "CALL { MATCH (c) RETURN c } RETURN * LIMIT 500"
     assert session.last_params == {"limit": 5}
 

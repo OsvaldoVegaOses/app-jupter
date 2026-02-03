@@ -30,6 +30,8 @@ def test_async_workflow():
          patch('backend.app.load_fragments', return_value=["frag1"]), \
          patch('pathlib.Path.exists', return_value=True), \
          patch('backend.app.resolve_project', return_value="proj1"), \
+         patch('backend.app.stage0_require_ready_or_override', return_value=None), \
+         patch('app.postgres_block.count_pending_candidates', return_value=0), \
          patch('backend.app.AsyncResult') as mock_async_result:
         
         mock_worker_task.delay.return_value = mock_task
@@ -38,11 +40,24 @@ def test_async_workflow():
         payload = backend_app.AnalyzeRequest(
             project="default",
             docx_path="test.docx",
-            persist=False
+            persist=False,
+            sync=False,
         )
+        mock_clients = MagicMock()
+        mock_clients.postgres = MagicMock()
+        mock_user = MagicMock()
+        mock_user.user_id = "test-user"
+        mock_request = MagicMock()
+        mock_request.state = MagicMock(request_id="req-123")
         
         import asyncio
-        coro = backend_app.api_analyze(payload, settings=MagicMock(), user=MagicMock())
+        coro = backend_app.api_analyze(
+            payload,
+            request=mock_request,
+            settings=MagicMock(),
+            clients=mock_clients,
+            user=mock_user,
+        )
         resp = asyncio.run(coro)
         
         assert resp["task_id"] == "task-123"
@@ -53,7 +68,9 @@ def test_async_workflow():
         # Mock AsyncResult behavior
         mock_res_instance = MagicMock()
         mock_res_instance.status = "SUCCESS"
+        mock_res_instance.failed.return_value = False
         mock_res_instance.ready.return_value = True
+        mock_res_instance.successful.return_value = True
         mock_res_instance.result = {"analysis": "done"}
         mock_async_result.return_value = mock_res_instance
         

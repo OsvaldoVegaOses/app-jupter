@@ -48,6 +48,13 @@ from app.project_state import (
 )
 from app.metadata_ops import apply_metadata_entries, load_plan_from_csv, load_plan_from_json
 
+
+def _log_warn(logger: Any, event: str, **kwargs: Any) -> None:
+    warn_fn = getattr(logger, "warning", None) or getattr(logger, "warn", None)
+    if callable(warn_fn):
+        warn_fn(event, **kwargs)
+
+
 STAGE_DEFINITIONS: Dict[str, Dict[str, str]] = {
     "preparacion": {
         "label": "Etapa 0 - Preparacion y Reflexividad",
@@ -270,7 +277,7 @@ def cmd_ingest(args):
         if any(ch in item for ch in ("*", "?", "[", "]")):
             matches = sorted(glob.glob(item))
             if not matches:
-                logger.warning("ingest.pattern.empty", pattern=item)
+                _log_warn(logger, "ingest.pattern.empty", pattern=item)
             input_files.extend(matches)
         else:
             input_files.append(item)
@@ -1871,7 +1878,7 @@ def main(argv: list[str] | None = None) -> int:
                         subcommand=subcommand,
                     )
                 except Exception as exc:
-                    logger.warning("command.auto_mark_stage.error", error=str(exc))
+                    _log_warn(logger, "command.auto_mark_stage.error", error=str(exc))
                 finally:
                     clients.close()
         extra = {}

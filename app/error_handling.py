@@ -25,6 +25,12 @@ _logger = structlog.get_logger()
 T = TypeVar("T")
 
 
+def _log_warn(event: str, **kwargs: Any) -> None:
+    warn_fn = getattr(_logger, "warning", None) or getattr(_logger, "warn", None)
+    if callable(warn_fn):
+        warn_fn(event, **kwargs)
+
+
 # =============================================================================
 # CÓDIGOS DE ERROR ESTÁNDAR
 # =============================================================================
@@ -227,7 +233,7 @@ def with_retry(
                     last_error = e
                     if attempt < max_retries - 1:
                         wait = backoff * (2 ** attempt)
-                        _logger.warning(
+                        _log_warn(
                             "retry.attempt",
                             func=func.__name__,
                             attempt=attempt + 1,
@@ -282,7 +288,7 @@ def log_and_continue(service: str, default: Any = None):
             try:
                 return func(*args, **kwargs)
             except Exception as e:
-                _logger.warning(
+                _log_warn(
                     f"{service}.error_ignored",
                     func=func.__name__,
                     error=str(e),

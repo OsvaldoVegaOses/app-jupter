@@ -54,6 +54,12 @@ from .settings import AppSettings
 _logger = structlog.get_logger()
 
 
+def _log_warn(event: str, **kwargs: Any) -> None:
+    warn_fn = getattr(_logger, "warning", None) or getattr(_logger, "warn", None)
+    if callable(warn_fn):
+        warn_fn(event, **kwargs)
+
+
 def semantic_search(
     clients: ServiceClients,
     settings: AppSettings,
@@ -306,7 +312,11 @@ def run_cypher(
         session_kwargs["database"] = database
     
     with clients.neo4j.session(**session_kwargs) as session:
-        result = session.run(cypher, parameters=params or {}, timeout=30.0)
+        try:
+            result = session.run(cypher, parameters=params or {}, timeout=30.0)
+        except TypeError:
+            # Compat with simplified/fake sessions (tests) that don't accept timeout.
+            result = session.run(cypher, parameters=params or {})
         records = list(result)
 
     raw_rows = [_record_to_dict(record) for record in records]
@@ -329,7 +339,7 @@ def run_cypher(
     
     # Slow query detection
     if elapsed_ms > 500:
-        _logger.warning(
+        _log_warn(
             "neo4j.query.slow",
             cypher_preview=cypher[:120].replace("\n", " "),
             records=len(records),
@@ -783,4 +793,3 @@ def discover_search(
     )
     
     return results
-

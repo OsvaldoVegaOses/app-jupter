@@ -9,14 +9,20 @@ router = APIRouter(prefix="/nucleus", tags=["nucleus"])
 
 
 @router.get("/light/{project}/{categoria}")
-async def nucleus_light(project: str, categoria: str) -> Dict[str, Any]:
+async def nucleus_light(
+    project: str,
+    categoria: str,
+    clients: Any = None,
+    settings: Any = None,
+) -> Dict[str, Any]:
     """Light endpoint that returns llm_summary, storyline and audit_summary for UI.
 
     Note: this wrapper creates its own `ServiceClients` to avoid circular
     import issues when FastAPI builds dependency graphs at import time.
     """
-    settings = load_settings()
-    clients = build_service_clients(settings)
+    owns_clients = clients is None
+    settings = settings or load_settings()
+    clients = clients or build_service_clients(settings)
     try:
         try:
             report = nucleus_report(clients, settings, categoria=categoria, prompt=None, project=project, persist=False)
@@ -27,7 +33,9 @@ async def nucleus_light(project: str, categoria: str) -> Dict[str, Any]:
                 import structlog
 
                 _logger = structlog.get_logger("backend.nucleus.light")
-                _logger.warning("nucleus.light.error", error=str(e))
+                warn_fn = getattr(_logger, "warning", None) or getattr(_logger, "warn", None)
+                if callable(warn_fn):
+                    warn_fn("nucleus.light.error", error=str(e))
             except Exception:
                 pass
 
@@ -45,10 +53,11 @@ async def nucleus_light(project: str, categoria: str) -> Dict[str, Any]:
                 "summary_metrics": {"text_summary": None},
             }
     finally:
-        try:
-            clients.close()
-        except Exception:
-            pass
+        if owns_clients:
+            try:
+                clients.close()
+            except Exception:
+                pass
 
     return {
         "llm_summary": report.get("llm_summary") or "",

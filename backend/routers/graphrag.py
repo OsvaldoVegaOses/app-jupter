@@ -144,6 +144,16 @@ async def api_run_gds_analysis(
             rows=len(results),
         )
         return results
+    except AxialNotReadyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "axial_not_ready",
+                "message": str(exc),
+                "blocking_reasons": list(getattr(exc, "blocking_reasons", []) or []),
+                "project_id": getattr(exc, "project_id", payload.project),
+            },
+        ) from exc
     except AxialError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

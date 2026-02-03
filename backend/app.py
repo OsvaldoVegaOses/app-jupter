@@ -1226,6 +1226,14 @@ async def get_neo4j_clients(
 
 # End of deprecated Neo4j endpoints
 # =============================================================================
+def _validate_api_key(provided_api_key: Optional[str], expected_api_key: Optional[str]) -> None:
+    """Backward-compatible API-key validator used by lightweight tests/helpers."""
+    if not expected_api_key:
+        raise HTTPException(status_code=500, detail="API key del servidor no configurada.")
+    if provided_api_key != expected_api_key:
+        raise HTTPException(status_code=401, detail="X-API-Key inválida.")
+
+
 def _execute_cypher(
     payload: CypherRequest,
     settings: AppSettings,

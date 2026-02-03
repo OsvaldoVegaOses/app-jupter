@@ -43,16 +43,4 @@ jobs:
 
       - name: Run CLI regression tests
         run: |
-          # Keep CI green with the stable regression subset.
-          # Full integration coverage runs in CI Smoke.
-          python -m pytest -q tests \
-            --ignore=tests/test_api_neo4j.py \
-            --ignore=tests/test_async_analyze.py \
-            --ignore=tests/test_axial_gate_409.py \
-            --ignore=tests/test_backend_analyze_fix.py \
-            --ignore=tests/test_cli_citations.py \
-            --ignore=tests/test_epistemic_mode.py \
-            --ignore=tests/test_neo4j_query.py \
-            --ignore=tests/test_nucleus_light_endpoint.py \
-            --ignore=tests/test_project_isolation.py \
-            --ignore=tests/test_security_hardening.py
+          python -m pytest -q tests

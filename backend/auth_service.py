@@ -55,7 +55,11 @@ import structlog
 
 _logger = structlog.get_logger()
 
-APP_ENV = os.getenv("APP_ENV", "development")
+
+def _log_warn(event: str, **kwargs: Any) -> None:
+    warn_fn = getattr(_logger, "warning", None) or getattr(_logger, "warn", None)
+    if callable(warn_fn):
+        warn_fn(event, **kwargs)
 
 
 def _get_jwt_secret(*, strict: bool = False) -> str:
@@ -75,7 +79,9 @@ def _get_jwt_secret(*, strict: bool = False) -> str:
     """
     secret = os.getenv("JWT_SECRET_KEY")
     
-    if APP_ENV in ("production", "prod", "staging"):
+    app_env = os.getenv("APP_ENV", "development")
+
+    if app_env in ("production", "prod", "staging"):
         if not secret:
             message = (
                 "JWT_SECRET_KEY es requerido en producción. "
@@ -83,7 +89,7 @@ def _get_jwt_secret(*, strict: bool = False) -> str:
             )
             if strict:
                 raise RuntimeError(message)
-            _logger.error("auth.jwt_secret_missing", message=message, env=APP_ENV)
+            _logger.error("auth.jwt_secret_missing", message=message, env=app_env)
             return ""
         if len(secret) < 32:
             message = (
@@ -92,16 +98,16 @@ def _get_jwt_secret(*, strict: bool = False) -> str:
             )
             if strict:
                 raise RuntimeError(message)
-            _logger.error("auth.jwt_secret_short", message=message, env=APP_ENV)
+            _logger.error("auth.jwt_secret_short", message=message, env=app_env)
             return secret
         return secret
     
     # Desarrollo/test
     if not secret:
-        _logger.warning(
+        _log_warn(
             "auth.jwt_default_secret",
             message="Usando JWT secret por defecto. NO usar en producción.",
-            env=APP_ENV,
+            env=app_env,
         )
         return "unsafe-secret-for-dev-change-in-prod"
     

@@ -127,9 +127,9 @@ class TestHttpGate409:
     def test_gds_endpoint_handles_409(self):
         """Verifica que /api/axial/gds maneja AxialNotReadyError con 409."""
         from pathlib import Path
-        
-        app_path = Path(__file__).parent.parent / "backend" / "app.py"
-        source = app_path.read_text(encoding="utf-8")
+
+        router_path = Path(__file__).parent.parent / "backend" / "routers" / "graphrag.py"
+        source = router_path.read_text(encoding="utf-8")
         
         # Debe haber manejo de 409 para AxialNotReadyError
         assert "status_code=409" in source

@@ -25,10 +25,20 @@ def test_api_analyze_calls_with_list():
     # Mock dependencies
     mock_settings = MagicMock()
     mock_clients = MagicMock()
+    mock_clients.postgres = MagicMock()
+    mock_user = MagicMock()
+    mock_user.user_id = "test-user"
+    mock_request = MagicMock()
+    mock_request.state = MagicMock(request_id="req-1")
     
     # Mock internal functions
     with patch('backend.app.load_fragments') as mock_load, \
-         patch('backend.app.analyze_interview_text') as mock_analyze, \
+         patch('app.analysis.analyze_interview_text') as mock_analyze, \
+         patch('backend.app.stage0_require_ready_or_override', return_value=None), \
+         patch('app.postgres_block.count_pending_candidates', return_value=0), \
+         patch('app.coding.get_all_codes_for_project', return_value=[]), \
+         patch('app.reports.generate_interview_report', return_value=MagicMock(to_dict=lambda: {})), \
+         patch('app.reports.save_interview_report', return_value=None), \
          patch('pathlib.Path.exists', return_value=True):
         
         # Setup returns
@@ -50,16 +60,14 @@ def test_api_analyze_calls_with_list():
         # We need to bypass dependencies injection
         coroutine = backend_app.api_analyze(
             payload,
+            request=mock_request,
             settings=mock_settings,
+            clients=mock_clients,
+            user=mock_user,
         )
         
         # In a real test we'd use pytest-asyncio, here we manually drive it if simple
-        try:
-            asyncio.run(coroutine)
-        except Exception as e:
-            # We assume it might fail on 'build_clients_or_error' or similar if not fully mocked
-            # But we patched analyze_interview_text, so we check if that was called
-            pass
+        asyncio.run(coroutine)
 
         # Verification
         # The key check: Did we pass the list ["Fragment 1"] or the string "Fragment 1..."?

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from typing import List, Dict, Any
 import structlog
+import pytest
 
 _logger = structlog.get_logger()
 
@@ -31,6 +32,36 @@ _logger = structlog.get_logger()
 PROJECT_A = "isolation_test_project_A"
 PROJECT_B = "isolation_test_project_B"
 TEST_ARCHIVO = "Claudia_Cesfam.docx"
+
+
+@pytest.fixture(scope="module")
+def integration_context():
+    """Shared integration context. Opt-in to avoid flaky CI without infra."""
+    run_flag = os.getenv("RUN_PROJECT_ISOLATION_TESTS", "").strip().lower()
+    if run_flag not in {"1", "true", "yes"}:
+        pytest.skip("Set RUN_PROJECT_ISOLATION_TESTS=1 to run project-isolation integration tests.")
+    try:
+        clients, settings = setup_clients()
+    except Exception as exc:
+        pytest.skip(f"Integration services unavailable: {exc}")
+
+    try:
+        cleanup_test_projects(clients, settings)
+        ingest_test_file(clients, settings, PROJECT_A, TEST_ARCHIVO)
+        yield clients, settings
+    finally:
+        cleanup_test_projects(clients, settings)
+        clients.close()
+
+
+@pytest.fixture
+def clients(integration_context):
+    return integration_context[0]
+
+
+@pytest.fixture
+def settings(integration_context):
+    return integration_context[1]
 
 
 def setup_clients():
@@ -115,7 +146,7 @@ def ingest_test_file(clients, settings, project_id: str, archivo: str):
     return result
 
 
-def test_postgres_isolation(clients, settings) -> bool:
+def test_postgres_isolation(clients, settings) -> None:
     """Test PostgreSQL isolation."""
     print("\n--- PostgreSQL Isolation Test ---")
     
@@ -138,15 +169,10 @@ def test_postgres_isolation(clients, settings) -> bool:
         """, (PROJECT_B, TEST_ARCHIVO))
         cross_count = cur.fetchone()[0]
     
-    if cross_count == 0:
-        print("[OK] PASS: Project B cannot see Project A's file")
-        return True
-    else:
-        print(f"[FAIL] Project B saw {cross_count} fragments from Project A!")
-        return False
+    assert cross_count == 0, f"Project B saw {cross_count} fragments from Project A"
 
 
-def test_qdrant_isolation(clients, settings) -> bool:
+def test_qdrant_isolation(clients, settings) -> None:
     """Test Qdrant isolation."""
     print("\n--- Qdrant Isolation Test ---")
     
@@ -184,13 +210,10 @@ def test_qdrant_isolation(clients, settings) -> bool:
             print(f"[FAIL] Wrong project_id: {r.payload.get('project_id')}")
             cross_contaminated = True
     
-    if not cross_contaminated:
-        print("[OK] PASS: Qdrant properly isolates by project_id")
-        return True
-    return False
+    assert not cross_contaminated, "Qdrant results leaked fragments from another project"
 
 
-def test_neo4j_isolation(clients, settings) -> bool:
+def test_neo4j_isolation(clients, settings) -> None:
     """Test Neo4j isolation."""
     print("\n--- Neo4j Isolation Test ---")
     
@@ -212,12 +235,7 @@ def test_neo4j_isolation(clients, settings) -> bool:
         """, project_id=PROJECT_B, archivo=TEST_ARCHIVO)
         cross_count = result.single()["count"]
     
-    if cross_count == 0:
-        print("[OK] PASS: Neo4j properly isolates by project_id")
-        return True
-    else:
-        print(f"[FAIL] Project B saw {cross_count} entrevistas!")
-        return False
+    assert cross_count == 0, f"Project B saw {cross_count} entrevistas from another project"
 
 
 def run_all_tests():

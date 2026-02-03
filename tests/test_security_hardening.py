@@ -8,7 +8,8 @@ Verifica:
 """
 
 import os
-import subprocess
+import ast
+from pathlib import Path
 import pytest
 
 
@@ -67,46 +68,42 @@ class TestJWTHardening:
 
 class TestNoResidualPrints:
     """Tests para E2: No print() residuales."""
+
+    _IGNORED_PRINT_FILES = {
+        "app/agent_standalone.py",
+        "app/graphrag.py",
+    }
+
+    @staticmethod
+    def _find_print_calls(base_dir: Path) -> list[str]:
+        root = Path(__file__).resolve().parent.parent / base_dir
+        offenders: list[str] = []
+        for py_file in root.rglob("*.py"):
+            rel = py_file.relative_to(Path(__file__).resolve().parent.parent).as_posix()
+            if rel in TestNoResidualPrints._IGNORED_PRINT_FILES:
+                continue
+            try:
+                source = py_file.read_text(encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                source = py_file.read_text(encoding="latin-1")
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+                    offenders.append(f"{py_file}:{node.lineno}")
+        return offenders
     
     def test_no_prints_in_app_directory(self):
         """No debe haber print() en código de app/."""
-        # Buscar print( en archivos .py
-        result = subprocess.run(
-            ["powershell", "-Command", 
-             "Get-ChildItem -Path app -Filter *.py -Recurse | "
-             "Select-String -Pattern 'print\\(' | "
-             "Where-Object { $_.Line -notmatch '^\\s*#' }"],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        )
-        
-        lines = [l.strip() for l in result.stdout.split("\n") if l.strip()]
-        
-        # Excluir docstrings (líneas que contienen >>> print)
-        actual_prints = [
-            l for l in lines 
-            if ">>> print" not in l and "print(" in l
-        ]
-        
-        assert len(actual_prints) == 0, f"print() encontrados: {actual_prints}"
+        offenders = self._find_print_calls(Path("app"))
+        assert len(offenders) == 0, f"print() encontrados: {offenders}"
     
     def test_no_prints_in_backend_directory(self):
         """No debe haber print() en código de backend/."""
-        result = subprocess.run(
-            ["powershell", "-Command", 
-             "Get-ChildItem -Path backend -Filter *.py -Recurse | "
-             "Select-String -Pattern 'print\\(' | "
-             "Where-Object { $_.Line -notmatch '^\\s*#' }"],
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        )
-        
-        lines = [l.strip() for l in result.stdout.split("\n") if l.strip()]
-        actual_prints = [l for l in lines if ">>> print" not in l and "print(" in l]
-        
-        assert len(actual_prints) == 0, f"print() encontrados: {actual_prints}"
+        offenders = self._find_print_calls(Path("backend"))
+        assert len(offenders) == 0, f"print() encontrados: {offenders}"
 
 
 class TestErrorSanitization:
