@@ -42,4 +42,4 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Run CLI regression tests
-        run: python -m pytest -q
+        run: python -m pytest -q tests
