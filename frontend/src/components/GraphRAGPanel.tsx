@@ -29,7 +29,7 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<GraphRAGResponse | null>(null);
 
-  // Sprint: CÃ³digos a bandeja de candidatos
+  // Sprint: Codigos a bandeja de candidatos
   const [sendingCodes, setSendingCodes] = useState(false);
   const [showDedupModal, setShowDedupModal] = useState(false);
   const [dedupResults, setDedupResults] = useState<BatchCheckResult[]>([]);
@@ -291,7 +291,7 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
                     marginLeft: "0.5rem",
                   }}
                 >
-                  {sendingCodes ? "Enviando..." : `ðŸ“‹ Enviar ${extractedCodes.length} CÃ³digos a Bandeja`}
+                  {sendingCodes ? "Enviando..." : `Enviar ${extractedCodes.length} Codigos a Bandeja`}
                 </button>
               )}
             </div>
@@ -456,7 +456,7 @@ export function GraphRAGPanel({ project }: GraphRAGPanelProps) {
             boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)',
           }}>
             <h3 style={{ margin: '0 0 1rem', color: '#7c3aed' }}>
-              âš ï¸ CÃ³digos Similares Detectados
+              Codigos Similares Detectados
             </h3>
             <p style={{ fontSize: '0.9rem', color: '#64748b', marginBottom: '1rem' }}>
               Algunos cÃ³digos del grafo son similares a cÃ³digos existentes.

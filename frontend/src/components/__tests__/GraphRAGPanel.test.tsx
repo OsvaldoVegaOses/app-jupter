@@ -292,7 +292,7 @@ describe("GraphRAGPanel", () => {
 
         // Should show button for sending 2 codes
         await waitFor(() => {
-            expect(screen.getByRole("button", { name: /enviar 2 códigos/i })).toBeInTheDocument();
+            expect(screen.getByRole("button", { name: /enviar 2 codigos/i })).toBeInTheDocument();
         });
     });
 });
