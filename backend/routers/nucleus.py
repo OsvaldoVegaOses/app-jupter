@@ -20,9 +20,15 @@ async def nucleus_light(
     Note: this wrapper creates its own `ServiceClients` to avoid circular
     import issues when FastAPI builds dependency graphs at import time.
     """
-    owns_clients = clients is None
-    settings = settings or load_settings()
-    clients = clients or build_service_clients(settings)
+    owns_clients = False
+    if settings is None:
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = None
+    if clients is None and settings is not None:
+        clients = build_service_clients(settings)
+        owns_clients = True
     try:
         try:
             report = nucleus_report(clients, settings, categoria=categoria, prompt=None, project=project, persist=False)
