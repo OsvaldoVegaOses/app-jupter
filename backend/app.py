@@ -5378,6 +5378,7 @@ async def api_sync_postgres_to_neo4j(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    log = api_logger.bind(endpoint="sync.neo4j", project=project_id)
     clients = build_clients_or_error(settings)
     try:
         # 1. Obtener códigos únicos de PostgreSQL con fragmento_id válido
