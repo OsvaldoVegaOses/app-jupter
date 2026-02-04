@@ -22,13 +22,13 @@ import structlog
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-from app.clients import ServiceClients
-from app.postgres_block import (
+from .clients import ServiceClients
+from .postgres_block import (
     insert_discovery_run,
     list_interviews_summary,
     calculate_landing_rate,  # NUEVO: Landing rate real
 )
-from app.settings import AppSettings
+from .settings import AppSettings
 
 _logger = structlog.get_logger()
 
@@ -66,7 +66,7 @@ def _compute_overlap(prev_ids: List[str], current_ids: List[str]) -> float:
     return round(inter / union, 4) if union else 0.0
 
 
-def _embed_query_with_retry(
+async def _embed_query_with_retry(
     clients: ServiceClients,
     settings: AppSettings,
     text: str,
@@ -94,8 +94,7 @@ def _embed_query_with_retry(
                 error=str(e),
             )
             if attempt < max_retries:
-                import time
-                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+                await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
             else:
                 _logger.error("discovery.embed.failed", error=str(e))
                 return (False, [])
@@ -103,7 +102,7 @@ def _embed_query_with_retry(
     return (False, [])
 
 
-def _search_qdrant_with_retry(
+async def _search_qdrant_with_retry(
     client: QdrantClient,
     collection: str,
     vector: Sequence[float],
@@ -147,8 +146,7 @@ def _search_qdrant_with_retry(
                 error=str(e),
             )
             if attempt < max_retries:
-                import time
-                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+                await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
             else:
                 _logger.error("discovery.search.failed", error=str(e))
                 return (False, [])
@@ -234,7 +232,7 @@ async def run_discovery_iterations(
                 query_text, pos, neg = _iter_patterns(concepto, iter_idx)
                 
                 # Embedding con retry
-                embed_success, query_vec = _embed_query_with_retry(
+                embed_success, query_vec = await _embed_query_with_retry(
                     clients, settings, query_text
                 )
                 if not embed_success:
@@ -242,7 +240,7 @@ async def run_discovery_iterations(
                     continue
                 
                 # Search con retry
-                search_success, hits = _search_qdrant_with_retry(
+                search_success, hits = await _search_qdrant_with_retry(
                     clients.qdrant,
                     settings.qdrant.collection,
                     query_vec,
@@ -322,14 +320,14 @@ async def run_discovery_iterations(
         for iter_idx in range(global_iters):
             query_text, pos, neg = _iter_patterns(concepto, iter_idx)
             
-            embed_success, query_vec = _embed_query_with_retry(
+            embed_success, query_vec = await _embed_query_with_retry(
                 clients, settings, query_text
             )
             if not embed_success:
                 errors.append(f"Embedding failed: {concepto}/global/iter{iter_idx}")
                 continue
             
-            search_success, hits = _search_qdrant_with_retry(
+            search_success, hits = await _search_qdrant_with_retry(
                 clients.qdrant,
                 settings.qdrant.collection,
                 query_vec,

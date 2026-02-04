@@ -415,10 +415,19 @@ def transcribe_audio(
                     data[f"known_speaker_references[{i}]"] = speaker_data_urls[i]
                 logger.info("transcription.speaker_refs_added", count=len(speaker_names))
         
-        # Azure usa Authorization: Bearer, NO api-key header
-        headers = {
-            "Authorization": f"Bearer {settings.azure.api_key or ''}",
-        }
+        # Azure OpenAI with API key authenticates via `api-key`.
+        headers: Dict[str, str] = {}
+        if settings.azure.api_key:
+            headers["api-key"] = settings.azure.api_key
+        else:
+            access_token = (os.getenv("AZURE_OPENAI_ACCESS_TOKEN") or "").strip()
+            if access_token:
+                headers["Authorization"] = f"Bearer {access_token}"
+            else:
+                raise ValueError(
+                    "Missing Azure OpenAI credentials for transcription "
+                    "(AZURE_OPENAI_API_KEY or AZURE_OPENAI_ACCESS_TOKEN)."
+                )
         
         # Llamar a la API con reintentos y backoff para uploads grandes
         timeout_config = httpx.Timeout(900.0, connect=60.0, read=600.0)
@@ -596,6 +605,7 @@ def transcribe_audio_chunked(
     speakers_seen: set = set()
     total_duration = 0.0
     model_name = "gpt-4o-transcribe-diarize" if diarize else "gpt-4o-transcribe"
+    successful_chunks = 0
     
     for i, chunk_path in enumerate(chunks):
         offset_seconds = i * chunk_duration_sec
@@ -622,6 +632,7 @@ def transcribe_audio_chunked(
             
             all_text_parts.append(chunk_result.text)
             total_duration = max(total_duration, chunk_result.duration_seconds + offset_seconds)
+            successful_chunks += 1
             
         except Exception as e:
             logger.error("transcribe_chunked.chunk_error", chunk=i, error=str(e))
@@ -631,8 +642,12 @@ def transcribe_audio_chunked(
     if chunks[0] != path:
         try:
             shutil.rmtree(chunks[0].parent)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(
+                "transcribe_chunked.cleanup_failed",
+                path=str(chunks[0].parent),
+                error=str(e),
+            )
     
     # Combinar resultados
     combined_text = "\n".join(all_text_parts)
@@ -658,7 +673,7 @@ def transcribe_audio_chunked(
         metadata={
             "chunked": True,
             "chunk_count": len(chunks),
-            "chunks_completed": len(chunks),
+            "chunks_completed": successful_chunks,
             "language": language,
             "segments_expanded": len(all_segments) > len(chunks),
         },
@@ -675,8 +690,12 @@ def transcribe_audio_chunked(
     if optimized_path and optimized_path != Path(file_path):
         try:
             optimized_path.unlink(missing_ok=True)
-        except Exception:
-            pass  # Ignorar errores de limpieza
+        except Exception as e:
+            logger.warning(
+                "transcribe_chunked.cleanup_optimized_failed",
+                path=str(optimized_path),
+                error=str(e),
+            )
     
     return result
 

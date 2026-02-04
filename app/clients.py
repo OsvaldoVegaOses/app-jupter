@@ -49,6 +49,10 @@ from .settings import AppSettings
 
 _pg_pool: Optional[pool.ThreadedConnectionPool] = None
 _pg_pool_lock = threading.Lock()
+_pool_stats_lock = threading.Lock()
+_pool_stats = {
+    "checked_out": 0,
+}
 _pool_health = {
     "slow_events": 0,
     "exhausted_events": 0,
@@ -77,6 +81,8 @@ def reset_pg_pool(*, reason: str) -> None:
             _pool_logger.error("pool.reset.failed", reason=reason, error=str(exc))
         finally:
             _pg_pool = None
+            with _pool_stats_lock:
+                _pool_stats["checked_out"] = 0
             _pool_health["last_reset_ts"] = perf_counter()
 
 
@@ -146,6 +152,8 @@ def get_pg_pool(settings: AppSettings) -> pool.ThreadedConnectionPool:
         _pool_health["slow_events"] = 0
         _pool_health["exhausted_events"] = 0
         _pool_health["last_event_ts"] = perf_counter()
+        with _pool_stats_lock:
+            _pool_stats["checked_out"] = 0
         return _pg_pool
 
 
@@ -155,10 +163,12 @@ def get_pg_connection(settings: AppSettings) -> PGConnection:
     _pool_logger = structlog.get_logger("app.pool")
     
     pg_pool = get_pg_pool(settings)
+
+    with _pool_stats_lock:
+        used = int(_pool_stats["checked_out"])
+    available = max(int(pg_pool.maxconn) - used, 0)
     
     # Log pool state for diagnostics - ALWAYS log as INFO
-    used = len(pg_pool._used) if hasattr(pg_pool, '_used') else -1
-    available = len(pg_pool._pool) if hasattr(pg_pool, '_pool') else -1
     _pool_logger.info("pool.getconn.request", used=used, available=available, maxconn=pg_pool.maxconn)
     
     if used >= pg_pool.maxconn - 10:  # Warning when pool is getting full
@@ -172,15 +182,18 @@ def get_pg_connection(settings: AppSettings) -> PGConnection:
         conn = pg_pool.getconn()
         wait_ms = (perf_counter() - wait_start) * 1000
         conn.set_client_encoding("UTF8")
+        with _pool_stats_lock:
+            _pool_stats["checked_out"] = int(_pool_stats["checked_out"]) + 1
+            used_after = int(_pool_stats["checked_out"])
         _pool_logger.info(
             "pool.getconn.success",
-            used=len(pg_pool._used) if hasattr(pg_pool, '_used') else -1,
+            used=used_after,
             wait_ms=round(wait_ms, 2),
         )
         if wait_ms >= 1000:
             _pool_logger.warning(
                 "pool.getconn.slow",
-                used=len(pg_pool._used) if hasattr(pg_pool, '_used') else -1,
+                used=used_after,
                 wait_ms=round(wait_ms, 2),
                 maxconn=pg_pool.maxconn,
             )
@@ -214,13 +227,17 @@ def return_pg_connection(conn: PGConnection) -> None:
                 _pool_logger.warning("pool.rollback_before_return", error=str(rb_err))
             
             _pg_pool.putconn(conn)
-            used = len(_pg_pool._used) if hasattr(_pg_pool, '_used') else -1
+            with _pool_stats_lock:
+                _pool_stats["checked_out"] = max(int(_pool_stats["checked_out"]) - 1, 0)
+                used = int(_pool_stats["checked_out"])
             _pool_logger.info("pool.putconn.success", used=used)
         except Exception as e:
             _pool_logger.error("pool.putconn.FAILED", error=str(e))
             # If putconn fails, try to close the connection directly
             try:
                 conn.close()
+                with _pool_stats_lock:
+                    _pool_stats["checked_out"] = max(int(_pool_stats["checked_out"]) - 1, 0)
                 _pool_logger.warning("pool.connection_closed_after_putconn_fail")
             except Exception:
                 pass

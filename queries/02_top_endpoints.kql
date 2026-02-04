@@ -1,0 +1,31 @@
+let appName = "{{APP_NAME}}";
+let window = 24h;
+let slow_ms = 5000.0;
+
+union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(window)
+| extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+| where AppName == appName
+| extend RawLog = tostring(coalesce(Log, Log_s))
+| extend j = parse_json(RawLog)
+| where tostring(j.event) in ("request.end", "request.slow")
+| extend
+    method = tostring(j.method),
+    route = tostring(j.route),
+    status = toint(j.status_code),
+    dur = todouble(j.duration_ms)
+| where isnotempty(method) and isnotempty(route) and isnotnull(dur)
+| summarize
+    req = count(),
+    errors_5xx = countif(status >= 500),
+    slow_over_5s = countif(dur > slow_ms),
+    p50 = percentile(dur, 50),
+    p95 = percentile(dur, 95),
+    p99 = percentile(dur, 99),
+    max_ms = max(dur)
+  by method, route
+| extend
+    error_rate = 100.0 * todouble(errors_5xx) / todouble(req),
+    slow_rate = 100.0 * todouble(slow_over_5s) / todouble(req)
+| order by p95 desc
+| take 20

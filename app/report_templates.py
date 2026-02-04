@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
-from app.reports import (
+from .reports import (
     get_interview_reports,
     generate_stage4_summary,
     identify_nucleus_candidates,

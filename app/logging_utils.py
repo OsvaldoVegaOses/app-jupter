@@ -23,40 +23,17 @@ Example:
 
 from __future__ import annotations
 
-import logging
-import sys
 from typing import Optional
 
 import structlog
 
+from .logging_config import configure_logging as configure_logging_core
+
 
 def configure_logging(level: str = "INFO") -> structlog.BoundLogger:
     """Configure structlog + stdlib logging and return a bound logger."""
-    logging_level = getattr(logging, level.upper(), logging.INFO)
-
-    logging.basicConfig(
-        level=logging_level,
-        format="%(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.TimeStamper(fmt="iso", key="timestamp"),
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
-        ],
-        context_class=dict,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        wrapper_class=structlog.stdlib.BoundLogger,
-        cache_logger_on_first_use=True,
-    )
-
-    logger = structlog.get_logger()
-    return logger
+    configure_logging_core(level)
+    return structlog.get_logger()
 
 
 def bind_run(logger: structlog.BoundLogger, run_id: str) -> structlog.BoundLogger:

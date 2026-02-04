@@ -25,6 +25,7 @@ Formato de logs JSONL:
 
 import logging
 import logging.handlers
+import os
 import re
 import sys
 import threading
@@ -189,31 +190,7 @@ def configure_logging(log_level: str = "INFO") -> None:
         encoding="utf-8",
     )
     
-    # We can use a simple formatter here, or rely on structlog's processor to format it before it gets here
-    # But usually standard logging integration with structlog is complex.
-    # Simpler approach: Standard logging goes to file as is, or we attach structlog to it.
-    
-    # Let's configure Structlog
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="iso"),
-            # Decide renderer based on output
-            structlog.processors.JSONRenderer() if False else structlog.dev.ConsoleRenderer(colors=True),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
-    )
-
-    # RE-CONFIGURATION for Hybrid Output (Console + File)
-    # The above valid configuration is for console-only or json-only.
-    # To split outputs, we need to use `structlog.stdlib`
-    
+    # Configure structlog once for hybrid output (console + file).
     shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
@@ -233,10 +210,15 @@ def configure_logging(log_level: str = "INFO") -> None:
         cache_logger_on_first_use=True,
     )
 
-    # Console Formatter (Colored)
+    console_json = os.getenv("LOG_CONSOLE_JSON", "").strip().lower() in {"1", "true", "yes"}
+    console_renderer = (
+        structlog.processors.JSONRenderer()
+        if console_json
+        else structlog.dev.ConsoleRenderer(colors=True)
+    )
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(structlog.stdlib.ProcessorFormatter(
-        processor=structlog.dev.ConsoleRenderer(colors=True),
+        processor=console_renderer,
     ))
 
     # File Formatter (JSON)

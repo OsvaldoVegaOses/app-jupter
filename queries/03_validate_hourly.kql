@@ -1,0 +1,23 @@
+let appName = "{{APP_NAME}}";
+let window = 24h;
+let validate_route = "/api/codes/candidates/{id}/validate";
+
+union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(window)
+| extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+| where AppName == appName
+| extend RawLog = tostring(coalesce(Log, Log_s))
+| extend j = parse_json(RawLog)
+| where tostring(j.event) in ("request.end", "request.slow")
+| extend
+    route = tostring(j.route),
+    dur = todouble(j.duration_ms),
+    status = toint(j.status_code)
+| where route == validate_route
+| summarize
+    req = count(),
+    errors = countif(status >= 500),
+    p95 = percentile(dur, 95),
+    max_ms = max(dur)
+  by bin(TimeGenerated, 1h)
+| order by TimeGenerated asc

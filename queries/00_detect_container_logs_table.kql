@@ -1,0 +1,8 @@
+union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(1h)
+| take 5
+| project
+    TimeGenerated,
+    TableName = $table,
+    AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s)),
+    RawLog = tostring(coalesce(Log, Log_s))

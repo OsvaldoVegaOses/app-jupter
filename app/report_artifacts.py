@@ -44,6 +44,19 @@ class ReportArtifact:
 	excerpt: Optional[str] = None
 
 
+def _require_org_for_report_artifacts(org_id: Optional[str]) -> None:
+	from .blob_storage import allow_orgless_tasks
+
+	if org_id:
+		return
+	if allow_orgless_tasks():
+		return
+	raise ValueError(
+		"org_id is required for report artifacts in tenant-scoped environments. "
+		"Set ALLOW_ORGLESS_TASKS=true for development only."
+	)
+
+
 def _safe_read_text_excerpt(path: Path, max_chars: int) -> str:
 	try:
 		text = path.read_text(encoding="utf-8", errors="ignore")
@@ -61,9 +74,11 @@ def _iter_recent_files(*, org_id: Optional[str], project_id: str, limit: int) ->
 	Primary: Azure Blob Storage (strict multi-tenant) under container "reports".
 	Fallback: local filesystem (legacy/dev).
 	"""
+	_require_org_for_report_artifacts(org_id)
+
 	def _blob_enabled() -> bool:
 		try:
-			from app import blob_storage  # local import to avoid hard dependency at import-time
+			from . import blob_storage  # local import to avoid hard dependency at import-time
 
 			conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
 			return bool(conn_str) and bool(getattr(blob_storage, "_AZURE_BLOB_AVAILABLE", False))
@@ -72,7 +87,7 @@ def _iter_recent_files(*, org_id: Optional[str], project_id: str, limit: int) ->
 
 	if _blob_enabled():
 		try:
-			from app.blob_storage import (
+			from .blob_storage import (
 				CONTAINER_REPORTS,
 				blob_name_to_logical_path,
 				download_file,

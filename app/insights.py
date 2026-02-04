@@ -24,7 +24,7 @@ import structlog
 
 from psycopg2.extensions import connection as PGConnection
 
-from app.postgres_block import save_insight, list_codes_summary, list_candidate_codes_summary
+from .postgres_block import save_insight, list_codes_summary, list_candidate_codes_summary
 
 _logger = structlog.get_logger(__name__)
 

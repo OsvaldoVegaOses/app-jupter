@@ -268,8 +268,7 @@ def task_transcribe_audio(
     log.info("task.transcribe.start")
     
     settings = load_settings()
-    from hashlib import sha256
-    from app.blob_storage import upload_local_path, upload_file, logical_path_to_blob_name, CONTAINER_INTERVIEWS, CONTAINER_AUDIO, tenant_upload
+    from app.blob_storage import CONTAINER_INTERVIEWS, CONTAINER_AUDIO, tenant_upload
 
     # Validate mode: XOR audio_base64 vs audio_blob
     if (audio_base64 is None) == (audio_blob is None):
@@ -302,41 +301,15 @@ def task_transcribe_audio(
                 logical_path=logical,
                 file_path=str(tmp_path),
                 content_type=content_type,
-                strict_tenant=False,
+                strict_tenant=True,
             )
             audio_url = audio_blob["url"]
             audio_hash = audio_blob["sha256"]
             blob_name = audio_blob["name"]
             audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
-        except Exception:
-            # Try tenant-aware non-strict upload as centralized fallback
-            try:
-                audio_blob = tenant_upload_file(
-                    org_id=org_id or None,
-                    project_id=project_id,
-                    container=CONTAINER_AUDIO,
-                    logical_path=logical,
-                    file_path=str(tmp_path),
-                    content_type=content_type,
-                    strict_tenant=False,
-                )
-                audio_url = audio_blob.get("url")
-                blob_name = audio_blob.get("name")
-                audio_hash = audio_blob.get("sha256")
-                audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
-            except Exception:
-                # fallback to legacy local upload
-                try:
-                    blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical)
-                except Exception:
-                    blob_name = f"{project_id}/{Path(filename).name if filename else tmp_path.name}"
-                audio_url = upload_local_path(container=CONTAINER_AUDIO, blob_name=blob_name, file_path=str(tmp_path), content_type=content_type)
-                h = sha256()
-                with open(tmp_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        h.update(chunk)
-                audio_hash = h.hexdigest()
-                audio_blob_info = {"container": CONTAINER_AUDIO, "name": blob_name, "url": audio_url, "content_type": content_type, "sha256": audio_hash}
+        except Exception as exc:
+            log.error("task.transcribe.audio_upload_failed", error=str(exc))
+            raise
 
     else:
         # audio_blob expected to be {"container":..., "name":...}
@@ -386,11 +359,6 @@ def task_transcribe_audio(
         # Build logical path relative to project
         docx_logical = f"interviews/{project_id}/audio/transcriptions/{tmp_doc_path.name}"
         try:
-            docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=docx_logical)
-        except Exception:
-            docx_blob_name = f"{project_id}/{tmp_doc_path.name}"
-
-        try:
             docx_blob = tenant_upload(
                 container=CONTAINER_INTERVIEWS,
                 org_id=org_id,
@@ -398,33 +366,14 @@ def task_transcribe_audio(
                 logical_path=docx_logical,
                 file_path=str(tmp_doc_path),
                 content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                strict_tenant=False,
+                strict_tenant=True,
             )
             docx_url = docx_blob["url"]
             docx_hash = docx_blob["sha256"]
             docx_blob_name = docx_blob["name"]
-        except Exception:
-            # Try tenant-upload non-strict as fallback first
-            try:
-                docx_blob = tenant_upload_file(
-                    org_id=org_id or None,
-                    project_id=project_id,
-                    container=CONTAINER_INTERVIEWS,
-                    logical_path=docx_logical,
-                    file_path=str(tmp_doc_path),
-                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    strict_tenant=False,
-                )
-                docx_url = docx_blob.get("url")
-                docx_hash = docx_blob.get("sha256")
-                docx_blob_name = docx_blob.get("name")
-            except Exception:
-                docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_doc_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                hdoc = sha256()
-                with open(tmp_doc_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        hdoc.update(chunk)
-                docx_hash = hdoc.hexdigest()
+        except Exception as exc:
+            log.error("task.transcribe.docx_upload_failed", error=str(exc))
+            raise
 
         log.info("task.transcribe.saved_blob", blob=docx_blob_name, url=docx_url)
         
@@ -447,9 +396,10 @@ def task_transcribe_audio(
                     max_chars=max_chars,
                     logger=log,
                     project=project_id,
+                    org_id=org_id,
                 )
                 totals = ingest_result.get("totals", {})
-                total_fragments_ingested = totals.get("fragments_total", 0)
+                total_fragments_ingested = totals.get("fragments", 0)
                 log.info("task.transcribe.ingested", fragments=total_fragments_ingested)
             finally:
                 clients.close()

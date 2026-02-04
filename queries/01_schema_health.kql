@@ -1,9 +1,5 @@
 let appName = "{{APP_NAME}}";
-let window = 1h;
-let min_pct_request = 95.0;
-let min_pct_json = 99.0;
-let min_n = 50;
-
+let window = 24h;
 let raw =
     union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
     | where TimeGenerated > ago(window)
@@ -14,6 +10,7 @@ let raw =
 
 raw
 | extend event = tostring(j.event)
+| extend is_event = isnotempty(event)
 | extend is_request = event in ("request.end", "request.slow")
 | extend has_schema = isnotempty(tostring(j.schema_version))
 | extend has_request_id = isnotempty(tostring(j.request_id))
@@ -26,6 +23,7 @@ raw
 | summarize
     total_lines = count(),
     json_parseable = countif(isnotnull(j)),
+    event_lines = countif(is_event),
     request_events = countif(is_request),
     request_with_min_fields = countif(
         is_request
@@ -39,9 +37,5 @@ raw
         and has_build
     )
 | extend
-    pct_json = 100.0 * todouble(json_parseable) / todouble(iif(total_lines == 0, 1, total_lines)),
+    pct_json = 100.0 * todouble(json_parseable) / todouble(total_lines),
     pct_request_min = 100.0 * todouble(request_with_min_fields) / todouble(iif(request_events == 0, 1, request_events))
-| where
-    (request_events >= min_n and pct_request_min < min_pct_request)
-    or (total_lines >= min_n and pct_json < min_pct_json)
-| project pct_request_min, pct_json, request_events, total_lines, json_parseable

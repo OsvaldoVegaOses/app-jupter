@@ -280,43 +280,58 @@ def suggest_similar_fragments(
         exclusions.update(list_coded_fragment_ids(clients.postgres, project_id))
     exclusions.add(fragment_id)
 
-    limit = top_k + len(exclusions)
-    try:
-        response = clients.qdrant.query_points(
-            collection_name=settings.qdrant.collection,
-            query=vector,
-            limit=limit,
-            with_payload=True,
-            query_filter=q_filter,
-        )
-    except UnexpectedResponse as exc:
-        error_message = str(exc)
-        if "Index required" in error_message:
-            raise CodingError(
-                "Qdrant requiere un índice para los filtros aplicados. Ejecuta `python scripts/healthcheck.py` "
-                "o reejecuta la ingesta para reconstruir los índices (archivo, área temática, actor principal)."
-            ) from exc
-        raise CodingError(f"No se pudo consultar Qdrant ({error_message})") from exc
     suggestions: List[Dict[str, Any]] = []
-    for point in response.points:
-        point_id = str(point.id)
-        if point_id in exclusions:
-            continue
-        payload = point.payload or {}
-        suggestions.append(
-            {
-                "fragmento_id": point_id,
-                "score": point.score,
-                "archivo": payload.get("archivo"),
-                "par_idx": payload.get("par_idx"),
-                "fragmento": payload.get("fragmento"),
-                "area_tematica": payload.get("area_tematica"),
-                "actor_principal": payload.get("actor_principal"),
-                "requiere_protocolo_lluvia": payload.get("requiere_protocolo_lluvia"),
-                "speaker": payload.get("speaker"),
-            }
-        )
-        if len(suggestions) >= top_k:
+    page_size = min(max(20, top_k * 2), 40)
+    max_candidates = 100
+    max_pages = max(1, max_candidates // page_size)
+    offset = 0
+
+    for _ in range(max_pages):
+        try:
+            response = clients.qdrant.query_points(
+                collection_name=settings.qdrant.collection,
+                query=vector,
+                limit=page_size,
+                offset=offset,
+                with_payload=True,
+                query_filter=q_filter,
+            )
+        except UnexpectedResponse as exc:
+            error_message = str(exc)
+            if "Index required" in error_message:
+                raise CodingError(
+                    "Qdrant requiere un indice para los filtros aplicados. Ejecuta `python scripts/healthcheck.py` "
+                    "o reejecuta la ingesta para reconstruir los indices (archivo, area tematica, actor principal)."
+                ) from exc
+            raise CodingError(f"No se pudo consultar Qdrant ({error_message})") from exc
+
+        points = list(response.points or [])
+        if not points:
+            break
+        offset += len(points)
+
+        for point in points:
+            point_id = str(point.id)
+            if point_id in exclusions:
+                continue
+            payload = point.payload or {}
+            suggestions.append(
+                {
+                    "fragmento_id": point_id,
+                    "score": point.score,
+                    "archivo": payload.get("archivo"),
+                    "par_idx": payload.get("par_idx"),
+                    "fragmento": payload.get("fragmento"),
+                    "area_tematica": payload.get("area_tematica"),
+                    "actor_principal": payload.get("actor_principal"),
+                    "requiere_protocolo_lluvia": payload.get("requiere_protocolo_lluvia"),
+                    "speaker": payload.get("speaker"),
+                }
+            )
+            if len(suggestions) >= top_k:
+                break
+
+        if len(suggestions) >= top_k or len(points) < page_size:
             break
 
     llm_summary: Optional[str] = None

@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from psycopg2.extensions import connection as PGConnection
 
 # Import PostgreSQL functions for cloud storage
-from app.postgres_block import (
+from .postgres_block import (
     list_projects_db,
     get_project_db,
     resolve_project_db,
@@ -37,7 +37,7 @@ from app.postgres_block import (
     add_project_member,
     log_project_action,
 )
-from app.tenant_context import get_current_user_context
+from .tenant_context import get_current_user_context
 
 _logger = logging.getLogger(__name__)
 
@@ -195,12 +195,13 @@ def resolve_project(
         slug = f"default-{org_id}"
         identifier = slug
     
+    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
+
     if pg is None:
         # Auto-connect using connection pool
         try:
-            from app.clients import get_pg_connection, return_pg_connection
-            from app.settings import load_settings
-            import os
+            from .clients import get_pg_connection, return_pg_connection
+            from .settings import load_settings
             
             settings = load_settings(os.getenv("APP_ENV_FILE"))
             auto_pg = get_pg_connection(settings)
@@ -214,12 +215,17 @@ def resolve_project(
             finally:
                 return_pg_connection(auto_pg)
         except Exception as e:
-            # If connection pool fails, fallback to slug
-            _logger.debug(
-                "resolve_project auto-connect failed, using slug fallback",
-                extra={"identifier": identifier, "slug": slug, "error": str(e)}
+            if allow_orgless:
+                _logger.debug(
+                    "resolve_project auto-connect failed, using slug fallback (orgless mode)",
+                    extra={"identifier": identifier, "slug": slug, "error": str(e)},
+                )
+                return slug
+            _logger.error(
+                "resolve_project auto-connect failed in strict mode",
+                extra={"identifier": identifier, "slug": slug, "error": str(e)},
             )
-            return slug
+            raise RuntimeError("Project resolution unavailable: PostgreSQL connection required") from e
     
     resolved = _resolve_project_with_pg(
         identifier, slug, pg, allow_create, org_id=org_id, owner_id=owner_id

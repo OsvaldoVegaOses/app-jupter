@@ -59,6 +59,23 @@ CONTAINER_REPORTS = "reports"
 _SAFE_COMPONENT_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
 
+def allow_orgless_tasks() -> bool:
+    """Return whether orgless mode is explicitly enabled (development only)."""
+    return os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
+
+
+def require_org_id(org_id: Optional[str], *, operation: str) -> None:
+    """Enforce tenant identity unless orgless mode is explicitly enabled."""
+    if org_id:
+        return
+    if allow_orgless_tasks():
+        return
+    raise TenantRequiredError(
+        f"org_id is required for {operation}. "
+        "Set ALLOW_ORGLESS_TASKS=true for development only."
+    )
+
+
 def _safe_blob_component(value: Optional[str], *, default: str) -> str:
     """Normalize a user/org/project identifier into a safe blob path component."""
     raw = (value or "").strip()
@@ -70,6 +87,7 @@ def _safe_blob_component(value: Optional[str], *, default: str) -> str:
 
 def tenant_prefix(*, org_id: Optional[str], project_id: str) -> str:
     """Tenant-scoped prefix for strict multi-tenant storage paths."""
+    require_org_id(org_id, operation="tenant-scoped blob paths")
     org = _safe_blob_component(org_id, default="unknown_org")
     proj = _safe_blob_component(project_id, default="unknown_project")
     return f"org/{org}/projects/{proj}"
@@ -89,14 +107,7 @@ def logical_path_to_blob_name(*, org_id: Optional[str], project_id: str, logical
     if not norm:
         raise ValueError("logical_path is empty")
 
-    # Enforce tenant scoping by default. In development you can opt-out
-    # by setting ALLOW_ORGLESS_TASKS=true in the environment.
-    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
-    if not org_id and not allow_orgless:
-        raise ValueError(
-            "org_id is required for tenant-scoped blob mapping. "
-            "Set ALLOW_ORGLESS_TASKS=true for development only."
-        )
+    require_org_id(org_id, operation="tenant-scoped blob mapping")
 
     prefix = tenant_prefix(org_id=org_id, project_id=project_id)
 
@@ -322,7 +333,7 @@ def tenant_upload_file(
 
 def tenant_upload_bytes(
     *,
-    org_id: str,
+    org_id: Optional[str],
     project_id: str,
     container: str,
     logical_path: str,
@@ -349,7 +360,7 @@ def tenant_upload_bytes(
 
 def tenant_upload_text(
     *,
-    org_id: str,
+    org_id: Optional[str],
     project_id: str,
     container: str,
     logical_path: str,
@@ -584,9 +595,8 @@ def tenant_upload(
     if data is None and file_path is None:
         raise ValueError("Either data or file_path must be provided to tenant_upload")
 
-    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
-    if strict_tenant and not org_id and not allow_orgless:
-        raise TenantRequiredError("org_id is required for tenant-scoped uploads")
+    if strict_tenant:
+        require_org_id(org_id, operation="tenant-scoped uploads")
 
     # Resolve blob name (may raise ValueError if logical_path invalid)
     blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical_path)

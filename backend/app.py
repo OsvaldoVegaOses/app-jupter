@@ -409,9 +409,10 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 # REQUEST ID MIDDLEWARE (Observability)
 # =============================================================================
 
-import uuid
-import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
+
+LOG_SCHEMA_VERSION = "1.0"
+BUILD_VERSION = os.getenv("BUILD_VERSION") or os.getenv("GIT_SHA") or "unknown"
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
     """Adds unique request_id to each request for tracing/debugging."""
@@ -424,15 +425,25 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             or request.query_params.get("project")
             or request.query_params.get("project_id")
         )
+        test_run_id = request.headers.get("X-Test-Run-Id") or request.query_params.get("test_run_id")
+        route = request.scope.get("route")
+        route_template = getattr(route, "path", None) if route else None
+        sample_rate = 1.0
         start = perf_counter()
         
         # Bind request_id to structlog context
         structlog.contextvars.clear_contextvars()
-        bind_payload = {"request_id": request_id}
+        bind_payload = {
+            "request_id": request_id,
+            "schema_version": LOG_SCHEMA_VERSION,
+            "build_version": BUILD_VERSION,
+        }
         if session_id:
             bind_payload["session_id"] = session_id
         if project_id:
             bind_payload["project_id"] = project_id
+        if test_run_id:
+            bind_payload["test_run_id"] = test_run_id
         structlog.contextvars.bind_contextvars(**bind_payload)
         
         # Store in request state for endpoint access
@@ -441,13 +452,21 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             request.state.session_id = session_id
         if project_id:
             request.state.project_id = project_id
+        if test_run_id:
+            request.state.test_run_id = test_run_id
+        request.state.route_template = route_template
         
         # Log request start
         api_logger.info(
             "request.start",
+            schema_version=LOG_SCHEMA_VERSION,
+            build_version=BUILD_VERSION,
             method=request.method,
             path=str(request.url.path),
+            route=route_template or str(request.url.path),
             request_id=request_id,
+            test_run_id=test_run_id,
+            sample_rate=sample_rate,
         )
         
         response = await call_next(request)
@@ -460,20 +479,30 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         # Log request end
         api_logger.info(
             "request.end",
+            schema_version=LOG_SCHEMA_VERSION,
+            build_version=BUILD_VERSION,
             method=request.method,
             path=str(request.url.path),
+            route=route_template or str(request.url.path),
             status_code=response.status_code,
             request_id=request_id,
+            test_run_id=test_run_id,
             duration_ms=round(duration_ms, 2),
+            sample_rate=sample_rate,
         )
 
         if duration_ms >= 5000:
             api_logger.warning(
                 "request.slow",
+                schema_version=LOG_SCHEMA_VERSION,
+                build_version=BUILD_VERSION,
                 method=request.method,
                 path=str(request.url.path),
+                route=route_template or str(request.url.path),
                 request_id=request_id,
+                test_run_id=test_run_id,
                 duration_ms=round(duration_ms, 2),
+                sample_rate=sample_rate,
             )
         
         return response
@@ -2454,6 +2483,7 @@ async def api_ingest(
             run_id=payload.run_id,
             logger=log,
             project=project_id,
+            org_id=str(getattr(user, "organization_id", None) or ""),
         )
     except Exception as exc:  # noqa: BLE001
         log.error("api.ingest.error", error=str(exc))
@@ -2690,9 +2720,10 @@ async def api_transcribe(
                     max_chars=payload.max_chars,
                     logger=log,
                     project=project_id,
+                    org_id=str(getattr(user, "organization_id", None) or ""),
                 )
                 totals = ingest_result.get("totals", {})
-                response_data["fragments_ingested"] = totals.get("fragments_total", 0)
+                response_data["fragments_ingested"] = totals.get("fragments", 0)
                 log.info(
                     "api.transcribe.ingested",
                     fragments=response_data["fragments_ingested"],

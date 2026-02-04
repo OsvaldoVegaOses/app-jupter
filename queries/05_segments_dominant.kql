@@ -1,0 +1,51 @@
+let appName = "{{APP_NAME}}";
+let window = 24h;
+let validate_route = "/api/codes/candidates/{id}/validate";
+
+let reqs =
+    union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+    | where TimeGenerated > ago(window)
+    | extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+    | where AppName == appName
+    | extend j = parse_json(tostring(coalesce(Log, Log_s)))
+    | where tostring(j.event) in ("request.end", "request.slow")
+    | project
+        request_id = tostring(j.request_id),
+        route = tostring(j.route),
+        total_ms = todouble(j.duration_ms),
+        build = tostring(j.build_version),
+        TimeGenerated;
+
+let segs =
+    union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+    | where TimeGenerated > ago(window)
+    | extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+    | where AppName == appName
+    | extend j = parse_json(tostring(coalesce(Log, Log_s)))
+    | where tostring(j.event) startswith "segment."
+    | project
+        request_id = tostring(j.request_id),
+        seg = tostring(j.event),
+        seg_ms = todouble(j.duration_ms);
+
+reqs
+| join kind=leftouter segs on request_id
+| where route == validate_route
+| summarize seg_ms_sum = sum(seg_ms) by request_id, route, total_ms, build, seg
+| summarize
+    total_ms = any(total_ms),
+    build = any(build),
+    db_ms = sumif(seg_ms_sum, seg == "segment.db"),
+    neo4j_ms = sumif(seg_ms_sum, seg == "segment.neo4j"),
+    qdrant_ms = sumif(seg_ms_sum, seg == "segment.qdrant"),
+    llm_ms = sumif(seg_ms_sum, seg == "segment.llm")
+  by request_id, route
+| extend dominant =
+    case(
+        db_ms >= neo4j_ms and db_ms >= qdrant_ms and db_ms >= llm_ms, "db",
+        neo4j_ms >= db_ms and neo4j_ms >= qdrant_ms and neo4j_ms >= llm_ms, "neo4j",
+        qdrant_ms >= db_ms and qdrant_ms >= neo4j_ms and qdrant_ms >= llm_ms, "qdrant",
+        "llm"
+    )
+| top 50 by total_ms desc
+| project request_id, total_ms, db_ms, neo4j_ms, qdrant_ms, llm_ms, dominant, build

@@ -366,6 +366,7 @@ async def api_upload_and_ingest(
             max_chars=max_chars,
             logger=log,
             project=project_id,
+            org_id=str(getattr(user, "organization_id", None) or ""),
         )
 
         log.info(
@@ -547,16 +548,6 @@ async def api_upload_and_transcribe(
         docx_url = docx_blob["url"]
         docx_hash = docx_blob["sha256"]
 
-        # Clean local docx and audio temp files
-        try:
-            docx_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            saved_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
         # Ingestar (opcional)
         if ingest:
             clients = _build_clients_or_error(settings)
@@ -570,11 +561,22 @@ async def api_upload_and_transcribe(
                     max_chars=max_chars,
                     logger=log,
                     project=project_id,
+                    org_id=str(getattr(user, "organization_id", None) or ""),
                 )
                 totals = ingest_result.get("totals", {})
-                response_data["fragments_ingested"] = totals.get("fragments_total", 0)
+                response_data["fragments_ingested"] = totals.get("fragments", 0)
             finally:
                 clients.close()
+
+        # Clean local docx and audio temp files after optional ingestion
+        try:
+            docx_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            saved_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         # Return standardized artifact contract
         return {
             "artifact_version": 1,
@@ -653,6 +655,7 @@ async def api_ingest(
             run_id=payload.run_id,
             logger=log,
             project=project_id,
+            org_id=str(getattr(user, "organization_id", None) or ""),
         )
     except Exception as exc:
         log.error("api.ingest.error", error=str(exc))
@@ -843,9 +846,10 @@ async def api_transcribe(
                     max_chars=payload.max_chars,
                     logger=log,
                     project=project_id,
+                    org_id=str(getattr(user, "organization_id", None) or ""),
                 )
                 totals = ingest_result.get("totals", {})
-                response_data["fragments_ingested"] = totals.get("fragments_total", 0)
+                response_data["fragments_ingested"] = totals.get("fragments", 0)
             finally:
                 clients.close()
         # Return standardized artifact contract

@@ -36,7 +36,7 @@ Example:
     ...     files=["entrevista1.docx", "entrevista2.docx"],
     ...     project="mi_proyecto"
     ... )
-    >>> print(f"Fragmentos procesados: {result['fragments_total']}")
+    >>> print(f"Fragmentos procesados: {result['totals']['fragments']}")
 
 Eventos de logging:
     - ingest.fragment: Fragmento procesado
@@ -110,10 +110,19 @@ def ingest_documents(
     run_id: Optional[str] = None,
     logger: Optional[structlog.BoundLogger] = None,
     project: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     metadata_map = metadata or {}
     log = logger or _logger
     project_id = project or "default"
+    from .blob_storage import allow_orgless_tasks
+    allow_orgless = allow_orgless_tasks()
+
+    if not org_id and not allow_orgless:
+        raise ValueError(
+            "org_id is required for ingest_documents in tenant-scoped environments. "
+            "Set ALLOW_ORGLESS_TASKS=true for development only."
+        )
     
     # Validar que el proyecto existe antes de ingestar
     from .project_state import get_project
@@ -169,32 +178,28 @@ def ingest_documents(
         blob_url: Optional[str] = None
         blob_path: Optional[str] = None
         try:
-                from .blob_storage import CONTAINER_INTERVIEWS, tenant_upload_bytes
+            from .blob_storage import CONTAINER_INTERVIEWS, tenant_upload_bytes
+            import os
 
-                conn_str = __import__("os").environ.get("AZURE_STORAGE_CONNECTION_STRING")
-                if conn_str and path.exists() and path.is_file():
-                    # Use tenant-aware upload for archival; fall back to orgless transition mode
-                    logical_path = f"interviews/{project_id}/{path.name}"
-                    try:
-                        blob_info = tenant_upload_bytes(
-                            org_id=None,
-                            project_id=project_id,
-                            container=CONTAINER_INTERVIEWS,
-                            logical_path=logical_path,
-                            data=path.read_bytes(),
-                            content_type=(
-                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                            ),
-                            strict_tenant=False,
-                        )
-                        blob_url = blob_info.get("url")
-                        blob_path = blob_info.get("name")
-                    except Exception:
-                        # Non-blocking: if tenant upload fails, skip archival
-                        blob_url = None
-                        blob_path = None
-                totals["files_archived"] += 1
-                log.info("ingest.file.archived", file=path.name, blob_path=blob_path)
+            conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+            if conn_str and path.exists() and path.is_file():
+                logical_path = f"interviews/{project_id}/{path.name}"
+                blob_info = tenant_upload_bytes(
+                    org_id=org_id,
+                    project_id=project_id,
+                    container=CONTAINER_INTERVIEWS,
+                    logical_path=logical_path,
+                    data=path.read_bytes(),
+                    content_type=(
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    ),
+                    strict_tenant=True,
+                )
+                blob_url = blob_info.get("url")
+                blob_path = blob_info.get("name")
+                if blob_url and blob_path:
+                    totals["files_archived"] += 1
+                    log.info("ingest.file.archived", file=path.name, blob_path=blob_path)
         except Exception as exc:
             # Do not block ingestion on storage issues.
             log.warning(

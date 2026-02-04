@@ -44,13 +44,25 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _require_org_for_artifacts(org_id: Optional[str]) -> None:
+    from .blob_storage import allow_orgless_tasks
+
+    if org_id:
+        return
+    if allow_orgless_tasks():
+        return
+    raise ValueError(
+        "org_id is required for product artifacts in tenant-scoped environments. "
+        "Set ALLOW_ORGLESS_TASKS=true for development only."
+    )
+
+
 def _write_text(*, org_id: Optional[str], project_id: str, logical_path: str, text: str) -> GeneratedArtifact:
     """Write a text artifact to Blob Storage under the strict multi-tenant prefix."""
-    from app.blob_storage import CONTAINER_REPORTS, tenant_upload_text
+    from .blob_storage import CONTAINER_REPORTS, tenant_upload_text
 
+    _require_org_for_artifacts(org_id)
     data = (text or "").encode("utf-8")
-    strict = bool(org_id)
-    # Use tenant-aware wrapper; allow transition when org_id is missing
     tenant_upload_text(
         org_id=org_id or None,
         project_id=project_id,
@@ -58,7 +70,7 @@ def _write_text(*, org_id: Optional[str], project_id: str, logical_path: str, te
         logical_path=logical_path,
         text=text,
         content_type="text/markdown; charset=utf-8",
-        strict_tenant=strict,
+        strict_tenant=True,
     )
     name = logical_path.replace("\\", "/").split("/")[-1] or "artifact.md"
     return GeneratedArtifact(name=name, path=logical_path, sha256=_sha256_bytes(data), bytes=len(data))
@@ -66,10 +78,10 @@ def _write_text(*, org_id: Optional[str], project_id: str, logical_path: str, te
 
 def _write_json(*, org_id: Optional[str], project_id: str, logical_path: str, payload: Any) -> GeneratedArtifact:
     """Write a JSON artifact to Blob Storage under the strict multi-tenant prefix."""
-    from app.blob_storage import CONTAINER_REPORTS, tenant_upload_bytes
+    from .blob_storage import CONTAINER_REPORTS, tenant_upload_bytes
 
+    _require_org_for_artifacts(org_id)
     data = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    strict = bool(org_id)
     tenant_upload_bytes(
         org_id=org_id or None,
         project_id=project_id,
@@ -77,7 +89,7 @@ def _write_json(*, org_id: Optional[str], project_id: str, logical_path: str, pa
         logical_path=logical_path,
         data=data,
         content_type="application/json",
-        strict_tenant=strict,
+        strict_tenant=True,
     )
     name = logical_path.replace("\\", "/").split("/")[-1] or "artifact.json"
     return GeneratedArtifact(name=name, path=logical_path, sha256=_sha256_bytes(data), bytes=len(data))
@@ -85,8 +97,9 @@ def _write_json(*, org_id: Optional[str], project_id: str, logical_path: str, pa
 
 def _count_note_files(*, org_id: Optional[str], project_id: str) -> int:
     """Best-effort note count for product summaries (Blob Storage)."""
+    _require_org_for_artifacts(org_id)
     try:
-        from app.blob_storage import CONTAINER_REPORTS, list_files, tenant_prefix
+        from .blob_storage import CONTAINER_REPORTS, list_files, tenant_prefix
 
         prefix = tenant_prefix(org_id=org_id, project_id=project_id).rstrip("/") + "/notes/"
         names = list_files(CONTAINER_REPORTS, prefix=prefix)
@@ -111,7 +124,7 @@ def _fetch_insights(
 ) -> List[Dict[str, Any]]:
     """Fetch insights from analysis_insights table if available."""
     try:
-        from app.postgres_block import ensure_insights_table
+        from .postgres_block import ensure_insights_table
 
         ensure_insights_table(pg_conn)
     except Exception:
@@ -184,7 +197,7 @@ def _generate_executive_summary_md(
 
     # Snapshot (Postgres only)
     try:
-        from app.reporting import analysis_snapshot
+        from .reporting import analysis_snapshot
 
         snapshot = analysis_snapshot(clients, project=project_id)
     except Exception as e:
@@ -193,7 +206,7 @@ def _generate_executive_summary_md(
 
     # Saturation (Postgres only)
     try:
-        from app.validation import saturation_curve
+        from .validation import saturation_curve
 
         sat = saturation_curve(clients.postgres, project=project_id)
         plateau = sat.get("plateau") or {}
@@ -207,7 +220,7 @@ def _generate_executive_summary_md(
     # Nucleus candidates (Neo4j best-effort)
     candidates: List[Dict[str, Any]] = []
     try:
-        from app.reports import identify_nucleus_candidates
+        from .reports import identify_nucleus_candidates
 
         candidates = identify_nucleus_candidates(clients.neo4j, settings.neo4j.database, project_id, top_k=5)
     except Exception as e:
@@ -347,6 +360,7 @@ def generate_and_write_product_artifacts(
     changed_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate and persist product-facing artifacts (Blob Storage, multi-tenant)."""
+    _require_org_for_artifacts(org_id)
     logger = _logger.bind(action="product_artifacts.generate", project=project_id)
 
     top_insights = _fetch_insights(clients.postgres, project_id, limit=10)
@@ -369,7 +383,7 @@ def generate_and_write_product_artifacts(
 
     # Hard validation: ensure product insights are actionable and structurally sound.
     try:
-        from app.schemas import TopInsightsArtifact
+        from .schemas import TopInsightsArtifact
 
         validated = TopInsightsArtifact(**top_json_payload)
         top_json_payload = validated.model_dump()

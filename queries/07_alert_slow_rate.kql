@@ -1,0 +1,24 @@
+let appName = "{{APP_NAME}}";
+let window = 10m;
+let slow_ms = 5000.0;
+let validate_route = "/api/codes/candidates/{id}/validate";
+let min_req = 20;
+let slow_threshold = 0.30;
+
+union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(window)
+| extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+| where AppName == appName
+| extend j = parse_json(tostring(coalesce(Log, Log_s)))
+| where tostring(j.event) in ("request.end", "request.slow")
+| extend
+    route = tostring(j.route),
+    dur = todouble(j.duration_ms)
+| where route == validate_route
+| summarize
+    req = count(),
+    slow_over = countif(dur > slow_ms)
+  by _ResourceId
+| extend slow_rate = todouble(slow_over) / todouble(req)
+| where req >= min_req and slow_rate > slow_threshold
+| project _ResourceId, req, slow_rate

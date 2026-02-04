@@ -11,6 +11,7 @@ numpy
 # AI/ML
 openai
 azure-identity
+azure-monitor-query
 
 # Databases
 qdrant-client

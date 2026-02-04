@@ -8,9 +8,9 @@ import tempfile
 import base64
 import os
 
-from app.celery_app import celery_app
-from app.settings import load_settings
-from app.transcription import (
+from .celery_app import celery_app
+from .settings import load_settings
+from .transcription import (
     transcribe_audio_chunked,
     save_transcription_docx,
     TranscriptionResult,
@@ -58,7 +58,7 @@ def transcribe_audio_task(
     
     settings = load_settings()
     # Enforce tenant scoping: org_id must be provided in production.
-    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "true").lower() in ("1", "true", "yes")
+    allow_orgless = os.getenv("ALLOW_ORGLESS_TASKS", "false").lower() in ("1", "true", "yes")
     if not org_id:
         if allow_orgless:
             logger.warning("task.transcribe.org_missing.allow_fallback", task_id=getattr(self.request, "id", None))
@@ -100,10 +100,8 @@ def transcribe_audio_task(
         )
         
         # Save to a temp docx, upload to Blob Storage (tenant-scoped), and optionally ingest
-        from datetime import datetime
         import tempfile
-        from hashlib import sha256
-        from app.blob_storage import upload_local_path, logical_path_to_blob_name, CONTAINER_INTERVIEWS, CONTAINER_AUDIO, tenant_upload
+        from .blob_storage import CONTAINER_INTERVIEWS, tenant_upload
 
         # Create temp docx and save
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmpdoc:
@@ -124,33 +122,9 @@ def transcribe_audio_task(
             docx_url = docx_blob["url"]
             docx_blob_name = docx_blob["name"]
             docx_hash = docx_blob["sha256"]
-        except Exception:
-            # Fallback to tenant_upload_file in non-strict mode to centralize behavior
-            try:
-                docx_blob = tenant_upload_file(
-                    org_id=org_id or None,
-                    project_id=project_id,
-                    container=CONTAINER_INTERVIEWS,
-                    logical_path=logical,
-                    file_path=str(tmp_doc_path),
-                    content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    strict_tenant=False,
-                )
-                docx_url = docx_blob.get("url")
-                docx_blob_name = docx_blob.get("name")
-                docx_hash = docx_blob.get("sha256")
-            except Exception:
-                # Legacy fallback: compute name and upload locally
-                try:
-                    docx_blob_name = logical_path_to_blob_name(org_id=org_id, project_id=project_id, logical_path=logical)
-                except Exception:
-                    docx_blob_name = f"{project_id}/{tmp_doc_path.name}"
-                docx_url = upload_local_path(container=CONTAINER_INTERVIEWS, blob_name=docx_blob_name, file_path=str(tmp_doc_path), content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-                hdoc = sha256()
-                with open(tmp_doc_path, "rb") as f:
-                    for chunk in iter(lambda: f.read(8192), b""):
-                        hdoc.update(chunk)
-                docx_hash = hdoc.hexdigest()
+        except Exception as exc:
+            log.error("task.transcribe.upload_docx_failed", error=str(exc))
+            raise
 
         log.info("task.transcribe.saved_blob", blob=docx_blob_name)
 
@@ -158,8 +132,8 @@ def transcribe_audio_task(
         fragments_ingested = None
         if ingest:
             self.update_state(state="PROCESSING", meta={"stage": "ingesting"})
-            from app.clients import build_service_clients
-            from app.ingestion import ingest_documents
+            from .clients import build_service_clients
+            from .ingestion import ingest_documents
 
             clients = build_service_clients(settings)
             try:
@@ -172,9 +146,10 @@ def transcribe_audio_task(
                     max_chars=max_chars,
                     logger=log,
                     project=project_id,
+                    org_id=org_id,
                 )
                 totals = ingest_result.get("totals", {})
-                fragments_ingested = totals.get("fragments_total", 0)
+                fragments_ingested = totals.get("fragments", 0)
                 log.info("task.transcribe.ingested", fragments=fragments_ingested)
             finally:
                 clients.close()
@@ -216,7 +191,7 @@ def transcribe_audio_task(
 @celery_app.task(name="app.tasks.batch_status")
 def batch_status(batch_id: str) -> Dict[str, Any]:
     """Get status of all tasks in a batch."""
-    from app.celery_app import celery_app
+    from .celery_app import celery_app
     
     # This is a placeholder - actual implementation would track batch
     return {"batch_id": batch_id, "status": "checking"}
@@ -266,7 +241,7 @@ def task_run_agent(
     
     try:
         # Run agent with callback to update task state
-        from app.agent_standalone import run_agent_with_real_functions
+        from .agent_standalone import run_agent_with_real_functions
         
         def update_progress(state: dict):
             self.update_state(

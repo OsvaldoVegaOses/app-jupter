@@ -237,6 +237,7 @@ def process_interview(
                 settings,
                 files=[tmp_path],
                 project=project_id,
+                org_id=str(getattr(user, "organization_id", None) or ""),
                 logger=logger
             )
             

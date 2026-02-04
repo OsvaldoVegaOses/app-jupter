@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import structlog
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, HasIdCondition, MatchValue
 
 from .clients import ServiceClients
 from .postgres_block import (
@@ -57,7 +57,7 @@ def saturation_curve(pg_conn, *, project: Optional[str] = None, window: int = 3,
 
 def _build_exclusion_filter(fragment_id: str, project_id: str, speaker: Optional[str]) -> Filter:
     must = [FieldCondition(key="project_id", match=MatchValue(value=project_id))]
-    must_not = [FieldCondition(key="id", match=MatchValue(value=fragment_id))]
+    must_not = [HasIdCondition(has_id=[str(fragment_id)])]
     if speaker:
         must.append(FieldCondition(key="speaker", match=MatchValue(value=speaker)))
     else:

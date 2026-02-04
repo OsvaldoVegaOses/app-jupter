@@ -1,0 +1,23 @@
+let appName = "{{APP_NAME}}";
+let window = 10m;
+let validate_route = "/api/codes/candidates/{id}/validate";
+let min_req = 20;
+let error_threshold = 0.05;
+
+union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+| where TimeGenerated > ago(window)
+| extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+| where AppName == appName
+| extend j = parse_json(tostring(coalesce(Log, Log_s)))
+| where tostring(j.event) in ("request.end", "request.slow")
+| extend
+    route = tostring(j.route),
+    status = toint(j.status_code)
+| where route == validate_route
+| summarize
+    req = count(),
+    errors_5xx = countif(status >= 500)
+  by _ResourceId
+| extend error_rate = todouble(errors_5xx) / todouble(req)
+| where req >= min_req and error_rate > error_threshold
+| project _ResourceId, req, error_rate
