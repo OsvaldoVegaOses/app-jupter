@@ -1,0 +1,40 @@
+let appName = "{{APP_NAME}}";
+let window = 1h;
+let min_pct = 95.0;
+
+let raw =
+    union isfuzzy=true ContainerAppConsoleLogs, ContainerAppConsoleLogs_CL
+    | where TimeGenerated > ago(window)
+    | extend AppName = tostring(coalesce(ContainerAppName, ContainerAppName_s))
+    | where AppName == appName
+    | extend RawLog = tostring(coalesce(Log, Log_s))
+    | extend j = parse_json(RawLog);
+
+raw
+| extend event = tostring(j.event)
+| extend is_request = event in ("request.end", "request.slow")
+| extend has_schema = isnotempty(tostring(j.schema_version))
+| extend has_request_id = isnotempty(tostring(j.request_id))
+| extend has_method = isnotempty(tostring(j.method))
+| extend has_path = isnotempty(tostring(j.path))
+| extend has_route = isnotempty(tostring(j.route))
+| extend has_status = isnotempty(tostring(j.status_code))
+| extend has_duration = isnotempty(tostring(j.duration_ms))
+| extend has_build = isnotempty(tostring(j.build_version))
+| summarize
+    total_lines = count(),
+    request_events = countif(is_request),
+    request_with_min_fields = countif(
+        is_request
+        and has_schema
+        and has_request_id
+        and has_method
+        and has_path
+        and has_route
+        and has_status
+        and has_duration
+        and has_build
+    )
+| extend pct_request_min = 100.0 * todouble(request_with_min_fields) / todouble(iif(request_events == 0, 1, request_events))
+| where pct_request_min < min_pct
+| project pct_request_min, request_events
