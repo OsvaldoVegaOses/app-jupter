@@ -78,7 +78,12 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "unsafe-secret-for-dev")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 # Tiempo de expiración de tokens (minutos)
-ACCESS_TOKEN_EXPIRE_MINUTES = 240  # 4 horas para desarrollo
+try:
+    ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRATION_MINUTES", "240"))
+    if ACCESS_TOKEN_EXPIRE_MINUTES <= 0:
+        ACCESS_TOKEN_EXPIRE_MINUTES = 240
+except Exception:
+    ACCESS_TOKEN_EXPIRE_MINUTES = 240
 
 def _get_api_key_config() -> tuple[Optional[str], Optional[str], str, List[str]]:
     """Lee configuración de API key desde el entorno (runtime).

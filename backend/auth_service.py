@@ -116,7 +116,28 @@ def _get_jwt_secret(*, strict: bool = False) -> str:
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY") or ""
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = 240  # 4 horas para desarrollo (15 min en producción)
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+        if parsed <= 0:
+            raise ValueError("must be > 0")
+        return parsed
+    except Exception:
+        _log_warn(
+            "auth.invalid_int_env",
+            var=name,
+            value=raw,
+            fallback=default,
+        )
+        return default
+
+
+ACCESS_TOKEN_EXPIRE_MINUTES = _read_positive_int_env("JWT_EXPIRATION_MINUTES", 240)
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 BCRYPT_COST = 12
 
