@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
@@ -54,19 +56,14 @@ def test_valid_json():
     mock_settings = MagicMock()
     mock_settings.azure.deployment_chat = "test-model"
     
-    try:
-        result = call_llm_chat_json(
-            clients=mock_clients,
-            settings=mock_settings,
-            system_prompt="test",
-            user_prompt="test",
-        )
-        assert "etapa3_matriz_abierta" in result
-        print("✓ PASS: Valid JSON parsed correctly")
-        return True
-    except Exception as e:
-        print(f"✗ FAIL: {e}")
-        return False
+    result = call_llm_chat_json(
+        clients=mock_clients,
+        settings=mock_settings,
+        system_prompt="test",
+        user_prompt="test",
+    )
+    assert "etapa3_matriz_abierta" in result
+    print("✓ PASS: Valid JSON parsed correctly")
 
 
 def test_json_with_extra_text():
@@ -91,19 +88,14 @@ def test_json_with_extra_text():
     mock_settings = MagicMock()
     mock_settings.azure.deployment_chat = "test-model"
     
-    try:
-        result = call_llm_chat_json(
-            clients=mock_clients,
-            settings=mock_settings,
-            system_prompt="test",
-            user_prompt="test",
-        )
-        assert "etapa3_matriz_abierta" in result
-        print("✓ PASS: JSON extracted from text")
-        return True
-    except Exception as e:
-        print(f"✗ FAIL: {e}")
-        return False
+    result = call_llm_chat_json(
+        clients=mock_clients,
+        settings=mock_settings,
+        system_prompt="test",
+        user_prompt="test",
+    )
+    assert "etapa3_matriz_abierta" in result
+    print("✓ PASS: JSON extracted from text")
 
 
 def test_missing_required_keys():
@@ -125,20 +117,15 @@ def test_missing_required_keys():
     mock_settings = MagicMock()
     mock_settings.azure.deployment_chat = "test-model"
     
-    try:
-        result = call_llm_chat_json(
-            clients=mock_clients,
-            settings=mock_settings,
-            system_prompt="test",
-            user_prompt="test",
-        )
-        # Should have retried
-        assert mock_clients.aoai.chat.completions.create.call_count >= 2
-        print("✓ PASS: Retry triggered for missing keys")
-        return True
-    except Exception as e:
-        print(f"✗ FAIL: {e}")
-        return False
+    call_llm_chat_json(
+        clients=mock_clients,
+        settings=mock_settings,
+        system_prompt="test",
+        user_prompt="test",
+    )
+    # Should have retried
+    assert mock_clients.aoai.chat.completions.create.call_count >= 2
+    print("✓ PASS: Retry triggered for missing keys")
 
 
 def test_malformed_json():
@@ -155,22 +142,15 @@ def test_malformed_json():
     mock_settings = MagicMock()
     mock_settings.azure.deployment_chat = "test-model"
     
-    try:
-        result = call_llm_chat_json(
+    with pytest.raises((json.JSONDecodeError, ValueError)) as excinfo:
+        call_llm_chat_json(
             clients=mock_clients,
             settings=mock_settings,
             system_prompt="test",
             user_prompt="test",
             max_retries=2,
         )
-        print("✗ FAIL: Should have raised exception")
-        return False
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"✓ PASS: Properly raised exception: {type(e).__name__}")
-        return True
-    except Exception as e:
-        print(f"✗ FAIL: Wrong exception type: {type(e).__name__}")
-        return False
+    print(f"✓ PASS: Properly raised exception: {type(excinfo.value).__name__}")
 
 
 def test_oversized_response():
@@ -187,8 +167,8 @@ def test_oversized_response():
     
     # This would be truncated, potentially breaking the JSON
     # The function should handle this gracefully
+    assert MAX_LLM_RESPONSE_SIZE > 0
     print("✓ PASS: MAX_LLM_RESPONSE_SIZE constant exists")
-    return True
 
 
 def run_all_tests():

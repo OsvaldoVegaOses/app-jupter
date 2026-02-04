@@ -47,6 +47,9 @@ if "structlog" not in sys.modules:
         def error(self, *args, **kwargs):
             return None
 
+        def warning(self, *args, **kwargs):
+            return None
+
         def exception(self, *args, **kwargs):
             return None
 
@@ -128,72 +131,6 @@ if "neo4j" not in sys.modules:
     sys.modules["neo4j.exceptions"] = exceptions
     sys.modules["neo4j.graph"] = types.ModuleType("neo4j.graph")
 
-
-if "psycopg2" not in sys.modules:
-    psycopg2 = types.ModuleType("psycopg2")
-
-    class _StubCursor:
-        def execute(self, *args, **kwargs):
-            return None
-
-        def fetchall(self):
-            return []
-
-        def close(self):
-            return None
-
-    class _StubConnection:
-        def close(self):
-            return None
-
-        def cursor(self):
-            return _StubCursor()
-
-        def set_client_encoding(self, *_args, **_kwargs):
-            return None
-
-    psycopg2.connect = lambda *args, **kwargs: _StubConnection()  # type: ignore
-    extensions = types.ModuleType("psycopg2.extensions")
-    extensions.connection = object  # type: ignore[attr-defined]
-    psycopg2.extensions = extensions
-
-    # Add pool module stub for connection pooling
-    pool_module = types.ModuleType("psycopg2.pool")
-
-    class ThreadedConnectionPool:  # type: ignore
-        def __init__(self, minconn, maxconn, *args, **kwargs):
-            self.minconn = minconn
-            self.maxconn = maxconn
-
-        def getconn(self):
-            return _StubConnection()
-
-        def putconn(self, conn, close=False):
-            return None
-
-        def closeall(self):
-            return None
-
-    pool_module.ThreadedConnectionPool = ThreadedConnectionPool  # type: ignore[attr-defined]
-    psycopg2.pool = pool_module  # type: ignore[attr-defined]
-
-    sys.modules["psycopg2"] = psycopg2
-    sys.modules["psycopg2.extensions"] = extensions
-    sys.modules["psycopg2.pool"] = pool_module
-
-    extras = types.ModuleType("psycopg2.extras")
-
-    def execute_values(*args, **kwargs):
-        return None
-
-    class Json:  # type: ignore
-        def __init__(self, value):
-            self.value = value
-
-    extras.execute_values = execute_values  # type: ignore[attr-defined]
-    extras.Json = Json  # type: ignore[attr-defined]
-    psycopg2.extras = extras  # type: ignore[attr-defined]
-    sys.modules["psycopg2.extras"] = extras
 
 
 if "azure" not in sys.modules:
