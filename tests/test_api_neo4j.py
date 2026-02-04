@@ -14,6 +14,16 @@ from app.settings import (
 from backend import app as backend_app
 
 
+@pytest.fixture(autouse=True)
+def _mock_project_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _resolve(identifier: str | None, *, allow_create: bool = False, pg: Any = None) -> str:
+        if not identifier:
+            return "default"
+        return identifier
+
+    monkeypatch.setattr(backend_app, "resolve_project", _resolve)
+
+
 def _settings(database: str = "neo4j", api_key: str = "test-key") -> AppSettings:
     return AppSettings(
         azure=AzureSettings(
