@@ -24,14 +24,12 @@ import type { CodingNextResponse } from "../types";
 
 // IMPORTANTE:
 // - VITE_API_BASE: URL base explícita (si se quiere llamada directa).
-// - VITE_BACKEND_URL: target del proxy de Vite. Si no hay proxy disponible (p.ej. build estático),
-//   se usa como fallback directo.
+// - VITE_BACKEND_URL: target del proxy de Vite (solo DEV).
 // - En DEV sin variables, usamos http://localhost:8000 (default del proxy en vite.config).
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 const BACKEND_PROXY = import.meta.env.VITE_BACKEND_URL || "";
 const DEFAULT_DEV_BACKEND = "http://localhost:8000";
-const EFFECTIVE_API_BASE =
-  API_BASE || BACKEND_PROXY || (import.meta.env.DEV ? DEFAULT_DEV_BACKEND : "");
+const EFFECTIVE_API_BASE = API_BASE || (import.meta.env.DEV ? (BACKEND_PROXY || DEFAULT_DEV_BACKEND) : "");
 // Support both VITE_NEO4J_API_KEY (explicit) and legacy VITE_API_KEY
 const API_KEY = import.meta.env.VITE_NEO4J_API_KEY || import.meta.env.VITE_API_KEY;
 // Session ID único por sesión de navegador (para logs por sesión)
@@ -123,6 +121,31 @@ function isAbortError(err: unknown): boolean {
   );
 }
 
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2 || !parts[1]) {
+      return null;
+    }
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const json = atob(padded);
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function isJwtExpired(token: string, skewSeconds = 30): boolean {
+  const payload = decodeJwtPayload(token);
+  const exp = payload?.exp;
+  if (typeof exp !== "number") {
+    return false;
+  }
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return exp <= nowSeconds + skewSeconds;
+}
+
 // =============================================================================
 // Token Refresh Singleton (Sprint 31 - Fix race condition)
 // =============================================================================
@@ -209,10 +232,18 @@ export async function apiFetch(
 ): Promise<Response> {
   const url = buildUrl(path);
   const headers: Record<string, string> = {};
+  let usedBearerToken = false;
 
   // Priority 1: JWT Bearer token from localStorage (Sprint 20: fixed key name)
-  const authToken = localStorage.getItem("access_token");
+  let authToken = localStorage.getItem("access_token");
+  if (authToken && isJwtExpired(authToken)) {
+    console.log("[API] Access token expired locally, refreshing before request...");
+    const refreshSuccess = await refreshTokenSingleton();
+    authToken = refreshSuccess ? localStorage.getItem("access_token") : null;
+  }
+
   if (authToken) {
+    usedBearerToken = true;
     headers["Authorization"] = `Bearer ${authToken}`;
   }
   // Priority 2: API Key (fallback for scripts/integrations)
@@ -246,7 +277,7 @@ export async function apiFetch(
       }
 
       // Sprint 20/31: Handle 401 with automatic token refresh (using singleton)
-      if (response.status === 401 && !_isRefreshRetry) {
+      if (response.status === 401 && usedBearerToken && !_isRefreshRetry) {
         console.log("[API] Access token expired, attempting refresh...");
         const refreshSuccess = await refreshTokenSingleton();
         if (refreshSuccess) {

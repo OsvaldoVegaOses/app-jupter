@@ -59,9 +59,36 @@ interface AuthContextType extends AuthState {
 
 const AUTH_STORAGE_KEY = "access_token";
 const USER_STORAGE_KEY = "qualy-auth-user";
+const REFRESH_STORAGE_KEY = "refresh_token";
 // IMPORTANTE: VITE_BACKEND_URL es para el proxy de Vite (server-side), NO para el navegador.
 // API_BASE puede estar vacío (usa proxy) o ser una URL absoluta (llamada directa al backend).
 const API_BASE = import.meta.env.VITE_API_BASE || "";
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+    try {
+        const parts = token.split(".");
+        if (parts.length < 2 || !parts[1]) return null;
+        const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+        const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+        return JSON.parse(atob(padded)) as Record<string, unknown>;
+    } catch {
+        return null;
+    }
+}
+
+function isTokenExpired(token: string, skewSeconds = 30): boolean {
+    const payload = decodeJwtPayload(token);
+    const exp = payload?.exp;
+    if (typeof exp !== "number") return false;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    return exp <= nowSeconds + skewSeconds;
+}
+
+function clearAuthStorage() {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(USER_STORAGE_KEY);
+    localStorage.removeItem(REFRESH_STORAGE_KEY);
+}
 
 // =============================================================================
 // Context
@@ -88,6 +115,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         if (storedToken && storedUser) {
             try {
+                if (isTokenExpired(storedToken)) {
+                    clearAuthStorage();
+                    setState((prev) => ({ ...prev, isLoading: false }));
+                    return;
+                }
                 const user = JSON.parse(storedUser) as AuthUser;
                 if (!user.roles || !user.roles.length) {
                     user.roles = user.role ? [user.role] : [];
@@ -100,13 +132,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 });
             } catch {
                 // Invalid stored data, clear it
-                localStorage.removeItem(AUTH_STORAGE_KEY);
-                localStorage.removeItem(USER_STORAGE_KEY);
+                clearAuthStorage();
                 setState((prev) => ({ ...prev, isLoading: false }));
             }
         } else {
             setState((prev) => ({ ...prev, isLoading: false }));
         }
+    }, []);
+
+    useEffect(() => {
+        const handleSessionExpired = () => {
+            clearAuthStorage();
+            setState({
+                user: null,
+                token: null,
+                isAuthenticated: false,
+                isLoading: false,
+            });
+        };
+
+        window.addEventListener("auth-session-expired", handleSessionExpired);
+        return () => window.removeEventListener("auth-session-expired", handleSessionExpired);
     }, []);
 
     const login = useCallback(async (credentials: LoginCredentials): Promise<boolean> => {
@@ -158,7 +204,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
             // Guardar refresh token para renovación
             if (data.refresh_token) {
-                localStorage.setItem("refresh_token", data.refresh_token);
+                localStorage.setItem(REFRESH_STORAGE_KEY, data.refresh_token);
             }
 
             setState({
@@ -216,7 +262,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 localStorage.setItem(AUTH_STORAGE_KEY, responseData.access_token);
                 localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
                 if (responseData.refresh_token) {
-                    localStorage.setItem("refresh_token", responseData.refresh_token);
+                    localStorage.setItem(REFRESH_STORAGE_KEY, responseData.refresh_token);
                 }
 
                 setState({
@@ -239,8 +285,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     );
 
     const logout = useCallback(() => {
-        localStorage.removeItem(AUTH_STORAGE_KEY);
-        localStorage.removeItem(USER_STORAGE_KEY);
+        clearAuthStorage();
         setState({
             user: null,
             token: null,

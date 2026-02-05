@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="App Jupter">
+  <rect width="64" height="64" rx="14" fill="#0f766e" />
+  <path d="M18 18h8v20c0 5.5-3.9 9-9.5 9H13v-7h2.7c1.5 0 2.3-.7 2.3-2.4V18Z" fill="#fff" />
+  <path d="M35 18h7l9 28h-7.5l-1.4-4.8h-8.3L32.3 46H25l10-28Zm.8 17.2h4.7l-2.3-8-2.4 8Z" fill="#d1fae5" />
+</svg>

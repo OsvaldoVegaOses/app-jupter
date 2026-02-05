@@ -49,9 +49,11 @@ Este documento detalla el proceso de resolución de problemas y despliegue exito
 ### Configuración de Entorno
 - Crear `frontend/.env.production` con:
   ```
-  VITE_API_BASE=https://axial-api.blackplant-ffb9e37f.eastus2.azurecontainerapps.io
-  VITE_BACKEND_URL=https://axial-api.blackplant-ffb9e37f.eastus2.azurecontainerapps.io
+  VITE_API_BASE=
+  VITE_BACKEND_URL=
   ```
+
+> Recomendado: **same-origin** en producción. El `nginx.conf` del frontend ya proxea `/api` al backend usando `BACKEND_URL` en runtime, evitando CORS/cookies cross-site.
 
 ### Script de Automatización
 Se creó `fix_and_deploy_frontend.ps1` que:
