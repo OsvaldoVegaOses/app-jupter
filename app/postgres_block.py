@@ -6140,7 +6140,7 @@ def validate_candidate(
     
     with pg.cursor() as cur:
         cur.execute(
-            "SELECT codigo, memo FROM codigos_candidatos WHERE project_id = %s AND id = %s",
+            "SELECT codigo, memo, estado, validado_en, validado_por FROM codigos_candidatos WHERE project_id = %s AND id = %s",
             (project_id, candidate_id),
         )
         before_row = cur.fetchone()
@@ -6149,18 +6149,27 @@ def validate_candidate(
         pg.commit()
         return False
 
-    before_codigo, before_memo = before_row[0], before_row[1]
+    before_codigo, before_memo, before_estado, before_validado_en, before_validado_por = before_row
+    already_validated = (before_estado == "validado" and before_validado_en is not None)
+    memo_in = (memo or "").strip()
+
+    # Idempotencia real: si ya esta validado y no hay memo nuevo, no tocar DB.
+    if already_validated and not memo_in:
+        pg.commit()
+        return True
+
+    memo_for_update = memo_in if memo_in else None
     sql = """
     UPDATE codigos_candidatos
        SET estado = 'validado',
-           validado_por = %s,
-           validado_en = NOW(),
+           validado_por = COALESCE(validado_por, %s),
+           validado_en = COALESCE(validado_en, NOW()),
            memo = COALESCE(%s, memo),
            updated_at = NOW()
      WHERE project_id = %s AND id = %s
     """
     with pg.cursor() as cur:
-        cur.execute(sql, (validated_by, memo, project_id, candidate_id))
+        cur.execute(sql, (validated_by, memo_for_update, project_id, candidate_id))
         affected = cur.rowcount
 
     # If it was already validated, treat as success (idempotent).
@@ -6179,15 +6188,19 @@ def validate_candidate(
     # rolling back a successful validation if logging fails.
     pg.commit()
 
+    if already_validated and memo_in and (before_memo or "").strip() == memo_in:
+        return True
+
     try:
+        action = "candidate_validate_memo_update" if already_validated else "candidate_validate"
         log_code_version(
             pg,
             project=project_id,
             codigo=str(before_codigo),
-            accion="candidate_validate",
+            accion=action,
             memo_anterior=before_memo,
-            memo_nuevo=_candidate_audit_memo("validado", candidate_id, memo),
-            changed_by=validated_by,
+            memo_nuevo=_candidate_audit_memo("validado", candidate_id, memo_for_update),
+            changed_by=validated_by or before_validado_por,
         )
     except Exception:
         # Never break the UX flow if auditing fails; reset transaction state.
