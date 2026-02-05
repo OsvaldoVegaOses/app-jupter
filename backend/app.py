@@ -3815,13 +3815,29 @@ async def api_validate_candidate(
         # Pre-validación robusta: evitar falsos positivos antes de validar
         with clients.postgres.cursor() as cur:
             cur.execute(
-                "SELECT codigo, estado FROM codigos_candidatos WHERE project_id = %s AND id = %s",
+                "SELECT codigo, estado, fragmento_id, fuente_origen FROM codigos_candidatos WHERE project_id = %s AND id = %s",
                 (project_id, candidate_id),
             )
             row = cur.fetchone()
 
         if row:
-            candidate_code, candidate_state = row[0], row[1]
+            candidate_code, candidate_state, fragmento_id, fuente_origen = row
+            fid = str(fragmento_id or "").strip()
+            if candidate_state != "validado" and (not fid or len(fid) <= 10):
+                api_logger.warning(
+                    "codes.candidates.validate_blocked_no_evidence",
+                    project_id=project_id,
+                    candidate_id=candidate_id,
+                    fuente_origen=fuente_origen,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "No se puede validar este candidato porque no tiene evidencia (fragmento_id). "
+                        "Si proviene de link_prediction, trátalo como hipótesis (muestreo teórico) "
+                        "o crea/selecciona evidencia (fragmento/cita) antes de validar."
+                    ),
+                )
             if candidate_code and candidate_state != "validado":
                 norm_candidate = _normalize_text(candidate_code)
                 threshold_pre = float(os.getenv("PREVALIDATE_DUPLICATE_THRESHOLD", "0.9"))

@@ -276,12 +276,21 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
         }
     }, [filterEstado, filterPromovido]);
 
+    const hasEvidence = (candidate?: CandidateCode | null): boolean => {
+        const fid = (candidate?.fragmento_id || "").trim();
+        return fid.length > 10;
+    };
+
     const handleValidate = async (id: number) => {
+        const candidate = candidates.find(c => c.id === id);
+        if (!hasEvidence(candidate)) {
+            alert("Sin evidencia: falta fragmento_id valido para validar este candidato.");
+            return;
+        }
         try {
             await validateCandidate(id, project);
             // E3-1.2: Log validation action
             try {
-                const candidate = candidates.find(c => c.id === id);
                 await logDiscoveryNavigation({
                     project,
                     positivos: candidate ? [candidate.codigo] : [],
@@ -325,20 +334,26 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
     const handleBatchValidate = async () => {
         if (selected.size === 0) return;
-        // E3-4.1: Confirmación antes de batch validate
-        if (!confirm(`¿Validar ${selected.size} candidato(s) seleccionado(s)?\n\nEsta acción marca los candidatos como listos para promoción.`)) {
+        const selectedCandidates = candidates.filter(c => selected.has(c.id));
+        const eligibleCandidates = selectedCandidates.filter(c => hasEvidence(c));
+        const skippedCount = selectedCandidates.length - eligibleCandidates.length;
+        if (eligibleCandidates.length === 0) {
+            alert("No hay candidatos seleccionados con evidencia (fragmento_id valido).");
+            return;
+        }
+        // E3-4.1: Confirmacion antes de batch validate
+        if (!confirm(`Validar ${eligibleCandidates.length} candidato(s) seleccionados?\n\nEsta accion marca los candidatos como listos para promocion.${skippedCount > 0 ? `\n\nSe omitiran ${skippedCount} sin evidencia.` : ""}`)) {
             return;
         }
         let successCount = 0;
         const validatedCodes: string[] = [];
-        for (const id of selected) {
+        for (const candidate of eligibleCandidates) {
             try {
-                await validateCandidate(id, project);
-                const candidate = candidates.find(c => c.id === id);
-                if (candidate) validatedCodes.push(candidate.codigo);
+                await validateCandidate(candidate.id, project);
+                validatedCodes.push(candidate.codigo);
                 successCount++;
             } catch (err) {
-                console.error(`Error validating ${id}:`, err);
+                console.error(`Error validating ${candidate.id}:`, err);
             }
         }
         // E3-1.2: Log batch validation
@@ -1394,7 +1409,12 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
 
                         <div className="modal-actions">
                             <button onClick={() => { setShowExamples(false); setSelectedCandidate(null); }}>Cerrar</button>
-                            <button onClick={() => handleValidate(selectedCandidate.id)} className="btn btn--validate">
+                            <button
+                                onClick={() => handleValidate(selectedCandidate.id)}
+                                className="btn btn--validate"
+                                disabled={!hasEvidence(selectedCandidate)}
+                                title={!hasEvidence(selectedCandidate) ? "Sin evidencia: falta fragmento_id (candidato tipo hipotesis/link_prediction)" : ""}
+                            >
                                 ✅ Validar este código
                             </button>
                         </div>
@@ -2188,7 +2208,14 @@ export function CodeValidationPanel({ project }: CodeValidationPanelProps) {
                                     {c.estado === "pendiente" && (
                                         <>
                                             <button onClick={() => handleShowExamples(c)} className="btn-sm btn--examples" title="Ver ejemplos canónicos">📋</button>
-                                            <button onClick={() => handleValidate(c.id)} className="btn-sm btn--validate">✅</button>
+                                            <button
+                                                onClick={() => handleValidate(c.id)}
+                                                className="btn-sm btn--validate"
+                                                disabled={!hasEvidence(c)}
+                                                title={!hasEvidence(c) ? "Sin evidencia: falta fragmento_id (candidato tipo hipotesis/link_prediction)" : ""}
+                                            >
+                                                ✅
+                                            </button>
                                             <button onClick={() => handleReject(c.id)} className="btn-sm btn--reject">❌</button>
                                         </>
                                     )}
